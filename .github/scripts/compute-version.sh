@@ -29,12 +29,20 @@ bump_version() {
 }
 
 latest_stable_tag() {
-  git tag --list 'v[0-9]*.[0-9]*.[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | semver_sort | tail -n 1 || true
+  git tag --merged HEAD --list 'v[0-9]*.[0-9]*.[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | semver_sort | tail -n 1 || true
 }
 
 latest_channel_tag() {
   local channel="$1"
-  git tag --list "v[0-9]*.[0-9]*.[0-9]*-$channel.*" | semver_sort | tail -n 1 || true
+  git tag --merged HEAD --list "v[0-9]*.[0-9]*.[0-9]*-$channel.*" | semver_sort | tail -n 1 || true
+}
+
+latest_prerelease_base() {
+  git tag --merged HEAD --list 'v[0-9]*.[0-9]*.[0-9]*-*' \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-(dev|alpha|beta|rc|canary)\.[0-9]+$' \
+    | sed -E 's/^v([0-9]+\.[0-9]+\.[0-9]+)-.*/\1/' \
+    | semver_sort \
+    | tail -n 1 || true
 }
 
 conventional_bump_since() {
@@ -120,6 +128,7 @@ case "$version_bump" in
 esac
 
 stable_tag="$(latest_stable_tag)"
+prerelease_line="$(latest_prerelease_base)"
 stable_version="0.0.0"
 if [ -n "$stable_tag" ]; then
   stable_version="${stable_tag#v}"
@@ -131,12 +140,15 @@ else
   bump="$version_bump"
 fi
 
-stable_candidate="$(semver_max "$intent_version" "$(bump_version "$stable_version" "$bump")")"
+# Stable releases promote the highest prerelease base. If dev published
+# 0.5.0-dev.N, merging dev to main must release at least 0.5.0 even if the
+# merge commit range would otherwise infer a smaller conventional-commit bump.
+stable_candidate="$(semver_max "$intent_version" "$prerelease_line" "$(bump_version "$stable_version" "$bump")")"
 prerelease_default_bump="minor"
 if [ "$bump" = "major" ]; then
   prerelease_default_bump="major"
 fi
-prerelease_base="$(semver_max "$intent_version" "$(bump_version "$stable_version" "$prerelease_default_bump")")"
+prerelease_base="$(semver_max "$intent_version" "$prerelease_line" "$(bump_version "$stable_version" "$prerelease_default_bump")")"
 
 force_release="${FORCE_RELEASE:-false}"
 if [ -n "$target_version" ]; then
@@ -179,6 +191,7 @@ fi
   echo "base_version=$base_version"
   echo "tag=$tag"
   echo "previous_tag=$previous_tag"
+  echo "prerelease_line=$prerelease_line"
   echo "prerelease=$prerelease"
   echo "latest=$latest"
   echo "should_release=$should_release"

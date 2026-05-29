@@ -31,6 +31,13 @@ This is the first release for this channel.
 EOF
 }
 
+normalize_changelog() {
+  # Stable releases compare from the latest stable tag, so prerelease tags can
+  # appear inside the range. Keep their commits, but remove the prerelease
+  # subheadings so the stable release notes read as one coherent release.
+  sed -i -E '/^## Changes in v[0-9]+\.[0-9]+\.[0-9]+-(dev|alpha|beta|rc|canary)\.[0-9]+$/d' changes.md
+}
+
 resolve_author_placeholders() {
   if ! grep -qE '\[\[[a-f0-9]{40}\|' changes.md 2>/dev/null; then
     return
@@ -115,6 +122,7 @@ generate_community_section() {
 }
 
 generate_changelog
+normalize_changelog
 resolve_author_placeholders
 generate_community_section
 
