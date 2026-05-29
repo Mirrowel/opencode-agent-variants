@@ -8,6 +8,15 @@ on:
       - alpha
       - beta
       - rc
+    paths:
+      - src/**
+      - docs/CONFIG.md
+      - README.md
+      - LICENSE
+      - agent-variants.example.jsonc
+      - package.json
+      - package-lock.json
+      - tsconfig*.json
   workflow_dispatch:
     inputs:
       channel:
