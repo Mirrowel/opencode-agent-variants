@@ -89,7 +89,9 @@ next_prerelease_number() {
   local package_name="$1"
   local base_version="$2"
   local channel="$3"
-  npm view "$package_name" versions --json 2>/dev/null | node -e '
+  local npm_latest
+  local git_latest
+  npm_latest="$(npm view "$package_name" versions --json 2>/dev/null | node -e '
     const fs = require("node:fs")
     const versions = JSON.parse(fs.readFileSync(0, "utf8") || "[]")
     const base = process.argv[1]
@@ -102,8 +104,14 @@ next_prerelease_number() {
       .map(Number)
       .sort((a, b) => a - b)
       .at(-1)
-    console.log((latest ?? 0) + 1)
-  ' "$base_version" "$channel"
+    console.log(latest ?? 0)
+  ' "$base_version" "$channel")"
+  git_latest="$(git tag --merged HEAD --list "v$base_version-$channel.*" \
+    | sed -E "s/^v${base_version//./\.}-$channel\.([0-9]+)$/\1/" \
+    | grep -E '^[0-9]+$' \
+    | sort -n \
+    | tail -n 1 || true)"
+  echo "$(( (${npm_latest:-0} > ${git_latest:-0} ? ${npm_latest:-0} : ${git_latest:-0}) + 1 ))"
 }
 
 validate_stable_version() {

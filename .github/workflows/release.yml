@@ -122,7 +122,7 @@ jobs:
         if: steps.version.outputs.should_release == 'true'
         id: npm-version
         run: |
-          if npm view "opencode-agent-variants@${{ steps.version.outputs.version }}" version >/dev/null 2>&1; then
+          if npm view "$(node -p "require('./package.json').name")@${{ steps.version.outputs.version }}" version >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"

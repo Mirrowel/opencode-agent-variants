@@ -126,9 +126,10 @@ normalize_changelog
 resolve_author_placeholders
 generate_community_section
 
-install="opencode plugin opencode-agent-variants --global"
+package_name="$(node -p "require('./package.json').name")"
+install="opencode plugin ${package_name}@latest --global"
 if [ "$npm_tag" != "latest" ]; then
-  install="opencode plugin opencode-agent-variants@$npm_tag --global"
+  install="opencode plugin ${package_name}@$npm_tag --global"
 fi
 
 experimental_note=""
@@ -182,7 +183,7 @@ fi
 cat >> release-notes.md <<EOF
 ## Links
 
-- [npm package](https://www.npmjs.com/package/opencode-agent-variants)
+- [npm package](https://www.npmjs.com/package/${package_name})
 - [Repository](https://github.com/$repo)
 - [Issues](https://github.com/$repo/issues)
 EOF
