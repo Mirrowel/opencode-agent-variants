@@ -6,10 +6,12 @@ import {
   defaultConfigDir,
   defaultSidecarPath,
   diagnoseConfig,
+  isSubagentCapableMode,
   loadSidecar,
   saveSidecar,
   variantName,
   type AgentPatch,
+  type AgentMode,
   type SidecarConfig,
   type VariantConfig,
 } from "./config.js"
@@ -19,9 +21,20 @@ import {
 type AgentEntry = SidecarConfig["agents"][string]
 type ModelEntry = SidecarConfig["models"][string]
 
+type WizardSettings = {
+  subagentCapableOnly: boolean
+}
+
 // Constants.
 
 const BUILTIN_AGENT_KEYS = Object.keys(BUILTIN_AGENT_DESCRIPTIONS)
+const BUILTIN_AGENT_MODES: Record<string, AgentMode> = {
+  build: "primary",
+  plan: "primary",
+  general: "subagent",
+  explore: "subagent",
+  scout: "subagent",
+}
 const THEME_COLORS = ["primary", "secondary", "accent", "success", "warning", "error", "info"] as const
 
 interface FieldDef {
@@ -51,6 +64,21 @@ function agentsFromState(api: TuiPluginApi): string[] {
   const configured = Object.keys(api.state.config.agent ?? {})
   const merged = new Set([...BUILTIN_AGENT_KEYS, ...configured])
   return [...merged].sort()
+}
+
+function agentMode(api: TuiPluginApi, agent: string): AgentMode {
+  return (api.state.config.agent?.[agent]?.mode as AgentMode | undefined) ?? BUILTIN_AGENT_MODES[agent] ?? "all"
+}
+
+function agentModes(api: TuiPluginApi) {
+  return Object.fromEntries(agentsFromState(api).map((agent) => [agent, agentMode(api, agent)]))
+}
+
+function selectableParentAgents(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings) {
+  const aliases = generatedAliasSet(config)
+  return agentsFromState(api)
+    .filter((agent) => !aliases.has(agent))
+    .filter((agent) => !settings.subagentCapableOnly || isSubagentCapableMode(agentMode(api, agent)))
 }
 
 function modelOptions(api: TuiPluginApi, config: SidecarConfig): TuiDialogSelectOption<string>[] {
@@ -232,21 +260,33 @@ function showAlert(ui: UI, props: { title: string; message: string }): Promise<v
 
 // Main wizard flows.
 
-async function addVariant(api: TuiPluginApi, config: SidecarConfig): Promise<SidecarConfig> {
-  const aliases = generatedAliasSet(config)
-  const agents = agentsFromState(api).filter((agent) => !aliases.has(agent))
+async function addVariant(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings): Promise<SidecarConfig> {
+  const agents = selectableParentAgents(api, config, settings)
   if (agents.length === 0) {
-    await showAlert(api.ui, { title: "No agents", message: "No agents available to add a variant to." })
+    await showAlert(api.ui, {
+      title: "No agents",
+      message: settings.subagentCapableOnly
+        ? "No subagent-capable agents are available. Open Debug & advanced and disable the parent filter only if you need to inspect or repair existing config."
+        : "No agents available to add a variant to.",
+    })
     return config
   }
 
   const agentOpts: TuiDialogSelectOption<string>[] = agents.map((a) => ({
     title: a,
     value: a,
-    description: BUILTIN_AGENT_DESCRIPTIONS[a] ?? api.state.config.agent?.[a]?.description,
+    description: `${agentMode(api, a)} - ${BUILTIN_AGENT_DESCRIPTIONS[a] ?? api.state.config.agent?.[a]?.description ?? "Configured agent"}`,
   }))
   const agent = await showSelect(api.ui, { title: "Add variant - pick parent agent", options: agentOpts })
   if (!agent) return config
+  if (settings.subagentCapableOnly && !isSubagentCapableMode(agentMode(api, agent))) {
+    await showAlert(api.ui, {
+      title: "Primary-only agent",
+      message: `"${agent}" is primary-only and cannot be used by the task tool. Agent Variants are intended for subagents.`,
+    })
+    api.ui.toast({ variant: "warning", title: "Variant not added", message: `${agent} is primary-only.` })
+    return config
+  }
 
   const existingKeys = Object.keys(config.agents[agent]?.variants ?? {})
   const defaultKey = existingKeys.length === 0 ? "light" : undefined
@@ -684,6 +724,7 @@ async function runDiagnostics(api: TuiPluginApi, config: SidecarConfig): Promise
     agents: agentsFromState(api).filter((agent) => !generatedAliases.has(agent)),
     providers: api.state.provider,
     pluginEntries: api.state.config.plugin as unknown[] | undefined,
+    agentModes: agentModes(api),
   })
   const errors = diagnostics.filter((item) => item.level === "error").length
   const warnings = diagnostics.filter((item) => item.level === "warning").length
@@ -836,7 +877,7 @@ function formatInputValue(value: unknown): string | undefined {
 
 // Main menu loop.
 
-async function mainMenu(api: TuiPluginApi, config: SidecarConfig): Promise<SidecarConfig> {
+async function mainMenu(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings): Promise<SidecarConfig> {
   const agentCount = Object.keys(config.agents).length
   const vCount = variantCount(config)
 
@@ -845,15 +886,9 @@ async function mainMenu(api: TuiPluginApi, config: SidecarConfig): Promise<Sidec
     { title: "Edit parent fields...", value: "edit-parent", description: "Override fields on an agent parent" },
     { title: "Edit variant...", value: "edit-variant", description: "Change fields on an existing variant" },
     { title: "Toggle disable...", value: "toggle", description: "Enable or disable agents/variants" },
-    { title: "Run diagnostics", value: "diagnostics", description: "Check models, conflicts, plugin install, and disabled variants" },
-    {
-      title: `Debug mode: ${config.debug ? "on" : "off"}`,
-      value: "debug",
-      description: "Toggle routing/model diagnostic toasts immediately",
-    },
-    { title: "View debug log", value: "view-log", description: "Show recent agent-variants.debug.log entries" },
-    { title: "Clear debug log", value: "clear-log", description: "Empty agent-variants.debug.log" },
     { title: "Delete variant...", value: "delete", description: "Remove a variant" },
+    { title: "Run diagnostics", value: "diagnostics", description: "Check models, conflicts, plugin install, and task-callability" },
+    { title: "Debug & advanced...", value: "advanced", description: "Debug mode, logs, and wizard-only parent filter" },
     { title: "Preview configuration", value: "preview", description: `View current config (${agentCount} agents, ${vCount} variants)` },
     { title: "Save & exit", value: "save", description: "Write to disk with backup" },
   ]
@@ -866,29 +901,23 @@ async function mainMenu(api: TuiPluginApi, config: SidecarConfig): Promise<Sidec
 
   switch (action) {
     case "add":
-      return mainMenu(api, await addVariant(api, config))
+      return mainMenu(api, await addVariant(api, config, settings), settings)
     case "edit-parent":
-      return editParentFlow(api, config)
+      return editParentFlow(api, config, settings)
     case "edit-variant":
-      return mainMenu(api, await editVariant(api, config))
+      return mainMenu(api, await editVariant(api, config), settings)
     case "toggle":
-      return mainMenu(api, await toggleDisable(api, config))
+      return mainMenu(api, await toggleDisable(api, config), settings)
     case "diagnostics":
       await runDiagnostics(api, config)
-      return mainMenu(api, config)
-    case "debug":
-      return mainMenu(api, await toggleDebug(api, config))
-    case "view-log":
-      await viewDebugLog(api)
-      return mainMenu(api, config)
-    case "clear-log":
-      await clearDebugLog(api)
-      return mainMenu(api, config)
+      return mainMenu(api, config, settings)
+    case "advanced":
+      return mainMenu(api, await debugAdvancedMenu(api, config, settings), settings)
     case "delete":
-      return mainMenu(api, await deleteVariant(api, config))
+      return mainMenu(api, await deleteVariant(api, config), settings)
     case "preview":
       await previewConfig(api, config)
-      return mainMenu(api, config)
+      return mainMenu(api, config, settings)
     case "save":
       await saveConfig(api, config)
       return config
@@ -897,16 +926,15 @@ async function mainMenu(api: TuiPluginApi, config: SidecarConfig): Promise<Sidec
   }
 }
 
-async function editParentFlow(api: TuiPluginApi, config: SidecarConfig): Promise<SidecarConfig> {
-  const aliases = generatedAliasSet(config)
-  const agents = agentsFromState(api).filter((agent) => !aliases.has(agent))
+async function editParentFlow(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings): Promise<SidecarConfig> {
+  const agents = selectableParentAgents(api, config, settings)
   const opts: TuiDialogSelectOption<string>[] = agents.map((a) => {
     const entry = config.agents[a] as AgentEntry | undefined
     const overrides = entry ? Object.keys(entry.parent).length : 0
     return {
       title: a,
       value: a,
-      description: overrides > 0 ? `${overrides} parent override(s)` : "No overrides",
+      description: `${agentMode(api, a)} - ${overrides > 0 ? `${overrides} parent override(s)` : "No overrides"}`,
     }
   })
   opts.push({
@@ -916,10 +944,50 @@ async function editParentFlow(api: TuiPluginApi, config: SidecarConfig): Promise
   })
 
   const agent = await showSelect(api.ui, { title: "Edit parent fields - pick agent", options: opts })
-  if (!agent || agent === "__back__") return mainMenu(api, config)
+  if (!agent || agent === "__back__") return mainMenu(api, config, settings)
 
   const updated = await editParentFields(api, config, agent)
-  return mainMenu(api, updated)
+  return mainMenu(api, updated, settings)
+}
+
+async function debugAdvancedMenu(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings): Promise<SidecarConfig> {
+  const opts: TuiDialogSelectOption<string>[] = [
+    {
+      title: `Debug mode: ${config.debug ? "on" : "off"}`,
+      value: "debug",
+      description: "Toggle routing/model diagnostic toasts immediately",
+    },
+    { title: "View debug log", value: "view-log", description: "Show recent agent-variants.debug.log entries" },
+    { title: "Clear debug log", value: "clear-log", description: "Empty agent-variants.debug.log" },
+    {
+      title: `Parent picker filter: ${settings.subagentCapableOnly ? "subagent-capable only" : "all agents"}`,
+      value: "filter",
+      description: "Wizard-only filter for adding/editing parent entries",
+    },
+    { title: "< Back", value: "__back__", description: "Return to main menu" },
+  ]
+
+  const action = await showSelect(api.ui, { title: "Debug & advanced", options: opts })
+  switch (action) {
+    case "debug":
+      return debugAdvancedMenu(api, await toggleDebug(api, config), settings)
+    case "view-log":
+      await viewDebugLog(api)
+      return debugAdvancedMenu(api, config, settings)
+    case "clear-log":
+      await clearDebugLog(api)
+      return debugAdvancedMenu(api, config, settings)
+    case "filter":
+      settings.subagentCapableOnly = !settings.subagentCapableOnly
+      api.ui.toast({
+        variant: "info",
+        title: "Parent filter updated",
+        message: settings.subagentCapableOnly ? "Showing subagent-capable parents only." : "Showing all parent agents.",
+      })
+      return debugAdvancedMenu(api, config, settings)
+    default:
+      return config
+  }
 }
 
 // Plugin entrypoint.
@@ -959,7 +1027,7 @@ function registerConfigureCommand(api: TuiPluginApi, run: () => Promise<void>) {
 const tui: TuiPlugin = async (api) => {
   const unregister = registerConfigureCommand(api, async () => {
     const config = loadSidecar(defaultSidecarPath())
-    await mainMenu(api, config)
+    await mainMenu(api, config, { subagentCapableOnly: true })
   })
 
   api.lifecycle.onDispose(() => {

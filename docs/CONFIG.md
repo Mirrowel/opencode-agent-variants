@@ -67,6 +67,8 @@ Variants also support:
 
 The sidecar intentionally does not configure `permission`, `tools`, or `mode`. Those come from the parent.
 
+Agent Variants are intended for agents callable by OpenCode's `task` tool. The wizard defaults to a subagent-capable parent filter (`mode: "subagent"` or `mode: "all"`) and hides primary-only agents from add/edit parent pickers. This is a wizard-only setting, not a sidecar field. Existing sidecar entries for primary-only parents still appear in edit/delete/toggle flows so they can be repaired.
+
 ## Description Generation
 
 If a variant does not set `description`, the plugin generates:
@@ -119,7 +121,8 @@ The plugin skips problematic variants instead of producing ambiguous agents:
 - variant alias equals parent name,
 - two variants generate the same alias,
 - generated alias conflicts with an existing agent,
-- variant model is definitely missing.
+- variant model is definitely missing,
+- parent is primary-only and will not be callable by `task`.
 
 Run `Agent Variants: Configure` -> `Run diagnostics` to inspect these issues.
 

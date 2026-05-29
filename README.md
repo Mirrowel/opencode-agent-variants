@@ -75,14 +75,15 @@ The wizard supports:
 - editing parent overrides
 - editing variant overrides
 - enabling or disabling parents and variants
-- toggling debug mode
-- running diagnostics
-- viewing and clearing the debug log
 - deleting variants
+- running diagnostics
+- opening `Debug & advanced` to toggle debug mode, view/clear logs, and change wizard-only filters
 - previewing the generated config
 - saving changes with timestamped backups
 
 Agent/variant list changes take effect after restarting OpenCode because agents and plugins are assembled at startup. Debug mode is hot-read and takes effect immediately after the wizard saves it.
+
+The wizard defaults to showing only subagent-capable parent agents when adding or editing parent entries. Agent Variants are meant for agents callable through OpenCode's `task` tool. You can temporarily show all agents from `Debug & advanced` if you need to inspect or repair existing config.
 
 ## Config File
 
@@ -187,11 +188,11 @@ Agents defined in `opencode.json`, `.opencode/agent/*.md`, or global agent markd
 - If a variant resolves to a definitely missing model, it is skipped for that run and a warning toast is shown.
 - Conflicting aliases are skipped instead of overwriting existing agents.
 
-Use the wizard's `Run diagnostics` action to inspect model validation, alias conflicts, disabled parents, and plugin installation state.
+Use the wizard's `Run diagnostics` action to inspect model validation, alias conflicts, disabled parents, task-callability, and plugin installation state.
 
 ## Debug Mode
 
-Debug mode is off by default. Enable it from the wizard with `Debug mode: off`.
+Debug mode is off by default. Enable it from the wizard through `Debug & advanced`.
 
 When enabled, the server plugin emits diagnostic log lines and TUI toast notifications for built-in virtual variants:
 
@@ -202,7 +203,7 @@ When enabled, the server plugin emits diagnostic log lines and TUI toast notific
 
 Logs are written to `~/.config/opencode/agent-variants.debug.log`. The plugin does not write debug lines to stdout, because that can corrupt the terminal UI.
 
-Debug mode is stored in `agent-variants.jsonc` and takes effect immediately for future variant calls. The wizard can also view and clear the debug log.
+Debug mode is stored in `agent-variants.jsonc` and takes effect immediately for future variant calls. The wizard can also view and clear the debug log from `Debug & advanced`.
 
 ## Development
 
