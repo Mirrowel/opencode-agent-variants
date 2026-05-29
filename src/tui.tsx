@@ -6,14 +6,21 @@ import {
   defaultConfigDir,
   defaultSidecarPath,
   diagnoseConfig,
+  effectiveVariantPatch,
+  inheritanceEnabled,
+  inheritedPatch,
+  isHotReloadField,
   isSubagentCapableMode,
   loadSidecar,
+  patchHasValue,
+  PATCH_FIELDS,
+  propagationEnabled,
   saveSidecar,
   variantName,
-  type AgentPatch,
   type AgentMode,
   type SidecarConfig,
   type VariantConfig,
+  type PatchField,
 } from "./config.js"
 
 // Types for sidecar entries.
@@ -23,6 +30,8 @@ type ModelEntry = SidecarConfig["models"][string]
 
 type WizardSettings = {
   subagentCapableOnly: boolean
+  hotChanges: boolean
+  restartReasons: string[]
 }
 
 // Constants.
@@ -38,7 +47,7 @@ const BUILTIN_AGENT_MODES: Record<string, AgentMode> = {
 const THEME_COLORS = ["primary", "secondary", "accent", "success", "warning", "error", "info"] as const
 
 interface FieldDef {
-  key: string
+  key: PatchField
   label: string
   type: "string" | "number" | "json"
 }
@@ -57,6 +66,7 @@ const EDITABLE_FIELDS: FieldDef[] = [
   { key: "options", label: "Options (JSON)", type: "json" },
   { key: "color", label: "Color", type: "string" },
 ]
+const EDITABLE_FIELD_KEYS = new Set(EDITABLE_FIELDS.map((field) => field.key))
 
 // Helpers.
 
@@ -160,6 +170,80 @@ function generatedAliasSet(config: SidecarConfig) {
   return aliases
 }
 
+function fieldDef(key: string) {
+  return EDITABLE_FIELDS.find((field) => field.key === key)
+}
+
+function markHot(settings: WizardSettings) {
+  settings.hotChanges = true
+}
+
+function markRestart(settings: WizardSettings, reason: string) {
+  settings.restartReasons.push(reason)
+}
+
+function uniqueReasons(settings: WizardSettings) {
+  return [...new Set(settings.restartReasons)]
+}
+
+function setField(target: Record<string, unknown>, field: string, value: unknown) {
+  if (value === "") {
+    delete target[field]
+    return
+  }
+  target[field] = value
+}
+
+function markFieldChange(settings: WizardSettings, field: string, reason: string) {
+  if (isHotReloadField(field)) {
+    markHot(settings)
+    return
+  }
+  markRestart(settings, reason)
+}
+
+async function warnRestartField(api: TuiPluginApi, label: string, reason: string) {
+  await showAlert(api.ui, {
+    title: "Restart required",
+    message: `${label} changes are saved, but OpenCode must be restarted before the task list/UI reflects them.\n\n${reason}`,
+  })
+}
+
+function sourceLabel(input: {
+  parent?: AgentEntry["parent"]
+  variant?: VariantConfig
+  field: PatchField
+  mode: "parent" | "variant"
+}) {
+  if (input.mode === "parent") return patchHasValue(input.parent, input.field) ? "SRC:local" : "SRC:none"
+  if (patchHasValue(input.variant, input.field)) return "SRC:local"
+  if (input.parent && input.variant && patchHasValue(inheritedPatch(input.parent, input.variant), input.field)) return "SRC:inherit"
+  return "SRC:none"
+}
+
+function fieldResult(input: { parent?: AgentEntry["parent"]; variant?: VariantConfig; field: PatchField; mode: "parent" | "variant" }) {
+  if (input.mode === "parent") return input.parent?.[input.field]
+  if (!input.parent || !input.variant) return input.variant?.[input.field]
+  return effectiveVariantPatch(input.parent, input.variant)[input.field]
+}
+
+function fieldOption(api: TuiPluginApi, input: { field: FieldDef; parent?: AgentEntry["parent"]; variant?: VariantConfig; mode: "parent" | "variant" }): TuiDialogSelectOption<string> {
+  const source = sourceLabel({ parent: input.parent, variant: input.variant, field: input.field.key, mode: input.mode })
+  const value = fieldResult({ parent: input.parent, variant: input.variant, field: input.field.key, mode: input.mode })
+  const restart = !isHotReloadField(input.field.key)
+  const inherited = source === "SRC:inherit"
+  const status = input.mode === "parent"
+    ? propagationEnabled(input.parent ?? {}, input.field.key)
+    : inheritanceEnabled(input.variant ?? {}, input.field.key)
+  const footer = restart ? "restart" : input.mode === "parent" ? `prop ${status ? "on" : "off"}` : `inherit ${status ? "on" : "off"}`
+  return {
+    title: input.field.label,
+    value: input.field.key,
+    description: value !== undefined ? `${inherited ? "inherited: " : ""}${truncate(formatInputValue(value) ?? String(value), 70)}` : "not set",
+    footer,
+  }
+}
+
 // Dialog wrappers. No JSX; component functions are called directly.
 
 type UI = TuiPluginApi["ui"]
@@ -174,6 +258,12 @@ function showSelect<Value>(
   },
 ): Promise<Value | undefined> {
   return new Promise((resolve) => {
+    let settled = false
+    const done = (value: Value | undefined) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
     ui.dialog.replace(() =>
       ui.DialogSelect<Value>({
         title: props.title,
@@ -182,10 +272,11 @@ function showSelect<Value>(
         current: props.current,
         flat: props.options.length < 15,
         onSelect: (opt) => {
+          done(opt.value)
           ui.dialog.clear()
-          resolve(opt.value)
         },
       }),
+      () => done(undefined),
     )
   })
 }
@@ -200,20 +291,27 @@ function showPrompt(
   },
 ): Promise<string | undefined> {
   return new Promise((resolve) => {
+    let settled = false
+    const done = (value: string | undefined) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
     ui.dialog.replace(() =>
       ui.DialogPrompt({
         title: props.title,
         placeholder: props.placeholder,
         value: props.value ?? "",
         onConfirm: (val) => {
+          done(val)
           ui.dialog.clear()
-          resolve(val || undefined)
         },
         onCancel: () => {
+          done(undefined)
           ui.dialog.clear()
-          resolve(undefined)
         },
       }),
+      () => done(undefined),
     )
   })
 }
@@ -226,36 +324,100 @@ function showConfirm(
   },
 ): Promise<boolean> {
   return new Promise((resolve) => {
+    let settled = false
+    const done = (value: boolean) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
     ui.dialog.replace(() =>
       ui.DialogConfirm({
         title: props.title,
         message: props.message,
         onConfirm: () => {
+          done(true)
           ui.dialog.clear()
-          resolve(true)
         },
         onCancel: () => {
+          done(false)
           ui.dialog.clear()
-          resolve(false)
         },
       }),
+      () => done(false),
     )
   })
 }
 
 function showAlert(ui: UI, props: { title: string; message: string }): Promise<void> {
   return new Promise((resolve) => {
+    let settled = false
+    const done = () => {
+      if (settled) return
+      settled = true
+      resolve()
+    }
     ui.dialog.replace(() =>
       ui.DialogAlert({
         title: props.title,
         message: props.message,
         onConfirm: () => {
+          done()
           ui.dialog.clear()
-          resolve()
         },
       }),
+      done,
     )
   })
+}
+
+function showFieldAction(
+  api: TuiPluginApi,
+  props: { title: string; inspect: () => string; toggleLabel: string },
+): Promise<"set" | "toggle" | "inspect" | "back" | undefined> {
+  return showSelect(api.ui, {
+    title: props.title,
+    options: [
+      { title: "Set/edit value", value: "set", description: "Submit an empty value to remove the local override" },
+      { title: props.toggleLabel, value: "toggle", description: "Change inheritance/propagation for this field" },
+      { title: "Inspect field", value: "inspect", description: truncate(props.inspect().replace(/\n/g, "  "), 120) },
+      { title: "< Back", value: "back", description: "Return to field list" },
+    ],
+  }) as Promise<"set" | "toggle" | "inspect" | "back" | undefined>
+}
+
+function inspectParentField(agent: string, parent: AgentEntry["parent"], field: PatchField) {
+  const def = fieldDef(field)
+  const value = parent[field]
+  return [
+    `${def?.label ?? field} (${agent} parent)`,
+    "",
+    `Hot reload: ${isHotReloadField(field) ? "yes" : "no, restart required"}`,
+    `Local value: ${value === undefined ? "not set" : formatInputValue(value)}`,
+    `Propagates to variants: ${propagationEnabled(parent, field) ? "yes" : "no"}`,
+    `Resulting parent value: ${value === undefined ? "not set" : formatInputValue(value)}`,
+    "",
+    "Submitting an empty value in the editor removes the local override.",
+  ].join("\n")
+}
+
+function inspectVariantField(agent: string, key: string, parent: AgentEntry["parent"], variant: VariantConfig, field: PatchField) {
+  const def = fieldDef(field)
+  const inherited = inheritedPatch(parent, variant)[field]
+  const local = variant[field]
+  const result = effectiveVariantPatch(parent, variant)[field]
+  return [
+    `${def?.label ?? field} (${variantName(agent, key, variant)})`,
+    "",
+    `Hot reload: ${isHotReloadField(field) ? "yes" : "no, restart required"}`,
+    `Local value: ${local === undefined ? "not set" : formatInputValue(local)}`,
+    `Variant accepts inheritance: ${inheritanceEnabled(variant, field) ? "yes" : "no"}`,
+    `Parent propagates this field: ${propagationEnabled(parent, field) ? "yes" : "no"}`,
+    `Inherited value: ${inherited === undefined ? "not available" : formatInputValue(inherited)}`,
+    `Resulting value: ${result === undefined ? "not set" : formatInputValue(result)}`,
+    `Source: ${local !== undefined ? "local variant override" : inherited !== undefined ? "inherited parent override" : "none"}`,
+    "",
+    "Submitting an empty value in the editor removes the local override.",
+  ].join("\n")
 }
 
 // Main wizard flows.
@@ -311,7 +473,8 @@ async function addVariant(api: TuiPluginApi, config: SidecarConfig, settings: Wi
   next.agents[agent].variants[key] = variant
 
   const name = variantName(agent, key, variant)
-  api.ui.toast({ variant: "success", title: "Variant added", message: name })
+  markRestart(settings, `${name}: added variant requires restart before it appears in the task list.`)
+  await warnRestartField(api, "Variant added", "New variants are added to OpenCode's cached task list only at startup.")
   return next
 }
 
@@ -319,45 +482,56 @@ async function editParentFields(
   api: TuiPluginApi,
   config: SidecarConfig,
   agent: string,
+  settings: WizardSettings,
 ): Promise<SidecarConfig> {
   const next = structuredClone(config)
-  if (!next.agents[agent]) {
-    next.agents[agent] = { parent: {}, variants: {} }
-  }
-  const parent = (next.agents[agent] as AgentEntry).parent as Record<string, unknown>
+  if (!next.agents[agent]) next.agents[agent] = { parent: {}, variants: {} }
 
-  const fieldOpts: TuiDialogSelectOption<string>[] = EDITABLE_FIELDS.map((f) => {
-    const current = parent[f.key]
-    return {
-      title: f.label,
-      value: f.key,
-      description: current !== undefined ? `Current: ${truncate(String(current), 60)}` : "(not set)",
+  while (true) {
+    const parent = (next.agents[agent] as AgentEntry).parent
+    const fieldOpts: TuiDialogSelectOption<string>[] = [
+      ...EDITABLE_FIELDS.map((field) => fieldOption(api, { field, parent, mode: "parent" })),
+      { title: "Propagation: enable all", value: "__propagate_all__", description: "Allow parent values to flow to variants that accept inheritance" },
+      { title: "Propagation: disable all", value: "__propagate_none__", description: "Keep parent overrides local to the parent" },
+      { title: "< Back", value: "__back__", description: "Return to main menu" },
+    ]
+
+    const field = await showSelect(api.ui, { title: `Edit parent fields - ${agent}`, options: fieldOpts })
+    if (!field || field === "__back__") return next
+
+    if (field === "__propagate_all__" || field === "__propagate_none__") {
+      parent.propagate = Object.fromEntries(PATCH_FIELDS.map((key) => [key, field === "__propagate_all__"]))
+      markHot(settings)
+      markRestart(settings, `${agent}: restart-required fields changed propagation status.`)
+      await warnRestartField(api, "Bulk propagation", "Hot fields apply on the next matching variant call; description/color propagation changes require restart.")
+      continue
     }
-  })
-  fieldOpts.push({
-    title: "< Back",
-    value: "__back__",
-    description: "Return to main menu",
-  })
 
-  const field = await showSelect(api.ui, {
-    title: `Edit parent fields - ${agent}`,
-    options: fieldOpts,
-  })
-  if (!field || field === "__back__") return config
+    const picked = fieldDef(field)
+    if (!picked) continue
+    const action = await showFieldAction(api, {
+      title: `${picked.label} - ${agent}`,
+      inspect: () => inspectParentField(agent, parent, picked.key),
+      toggleLabel: `Toggle propagation (${propagationEnabled(parent, picked.key) ? "on" : "off"})`,
+    })
+    if (!action || action === "back") continue
+    if (action === "inspect") {
+      await showAlert(api.ui, { title: picked.label, message: inspectParentField(agent, parent, picked.key) })
+      continue
+    }
+    if (action === "toggle") {
+      parent.propagate = { ...(parent.propagate ?? {}), [picked.key]: !propagationEnabled(parent, picked.key) }
+      markFieldChange(settings, picked.key, `${agent}: ${picked.label} propagation requires restart.`)
+      if (!isHotReloadField(picked.key)) await warnRestartField(api, picked.label, "Propagation for this field affects cached task-list/UI metadata.")
+      continue
+    }
 
-  const currentValue = formatInputValue(parent[field])
-  const value = await promptForField(api, field, currentValue)
-  if (value === undefined) return config
-
-  if (value === "") {
-    delete parent[field]
-  } else {
-    parent[field] = value
+    const value = await promptForField(api, field, formatInputValue(parent[picked.key]))
+    if (value === undefined) continue
+    setField(parent as Record<string, unknown>, picked.key, value)
+    markFieldChange(settings, picked.key, `${agent}: ${picked.label} requires restart.`)
+    if (!isHotReloadField(picked.key)) await warnRestartField(api, picked.label, "This field is stored in OpenCode's cached agent/task-list metadata.")
   }
-
-  api.ui.toast({ variant: "success", title: "Field updated", message: `${field} for ${agent}` })
-  return next
 }
 
 async function editVariantFields(
@@ -444,7 +618,7 @@ async function editVariantFields(
   return variant as VariantConfig
 }
 
-async function editVariant(api: TuiPluginApi, config: SidecarConfig): Promise<SidecarConfig> {
+async function editVariant(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings): Promise<SidecarConfig> {
   const agentsWithVariants = agentEntries(config).filter(([, e]) => Object.keys(e.variants).length > 0)
   if (agentsWithVariants.length === 0) {
     await showAlert(api.ui, { title: "No variants", message: "Add a variant first." })
@@ -468,77 +642,73 @@ async function editVariant(api: TuiPluginApi, config: SidecarConfig): Promise<Si
   const key = await showSelect(api.ui, { title: `Edit variant of "${agent}"`, options: varOpts })
   if (!key) return config
 
-  const existing = (config.agents[agent] as AgentEntry).variants[key] as VariantConfig
-  const existingRec = existing as Record<string, unknown>
-
-  const fieldOpts: TuiDialogSelectOption<string>[] = EDITABLE_FIELDS.map((f) => ({
-    title: f.label,
-    value: f.key,
-    description: existingRec[f.key] !== undefined ? `Current: ${truncate(String(existingRec[f.key]), 60)}` : "(not set)",
-  }))
-  fieldOpts.push({
-    title: "Display name",
-    value: "name",
-    description: existing.name ? `Current: ${existing.name}` : `Default: ${agent}-${key}`,
-  })
-  fieldOpts.push({
-    title: "< Back",
-    value: "__back__",
-    description: "Return to main menu",
-  })
-
-  const field = await showSelect(api.ui, {
-    title: `Edit field - ${variantName(agent, key, existing)}`,
-    options: fieldOpts,
-  })
-  if (!field || field === "__back__") return config
-
   const next = structuredClone(config)
-  const target = (next.agents[agent] as AgentEntry).variants[key] as Record<string, unknown>
+  while (true) {
+    const nextEntry = next.agents[agent] as AgentEntry
+    const parent = nextEntry.parent
+    const target = nextEntry.variants[key] as VariantConfig & Record<string, unknown>
+    const fieldOpts: TuiDialogSelectOption<string>[] = [
+      ...EDITABLE_FIELDS.map((field) => fieldOption(api, { field, parent, variant: target, mode: "variant" })),
+      {
+        title: "Display name",
+        value: "name",
+        description: target.name ? String(target.name) : `default: ${agent}-${key}`,
+        footer: "restart",
+      },
+      { title: "Inheritance: enable all", value: "__inherit_all__", description: "Accept all propagated parent overrides when no local value is set" },
+      { title: "Inheritance: disable all", value: "__inherit_none__", description: "Use only this variant's local values" },
+      { title: "< Back", value: "__back__", description: "Return to variant picker" },
+    ]
 
-  if (field === "name") {
-    const val = await showPrompt(api.ui, {
-      title: "Display name",
-      value: target.name as string | undefined,
-      placeholder: `${agent}-${key}`,
+    const field = await showSelect(api.ui, { title: `Edit field - ${variantName(agent, key, target)}`, options: fieldOpts })
+    if (!field || field === "__back__") return next
+
+    if (field === "__inherit_all__" || field === "__inherit_none__") {
+      target.inherit = Object.fromEntries(PATCH_FIELDS.map((patchField) => [patchField, field === "__inherit_all__"]))
+      markHot(settings)
+      markRestart(settings, `${variantName(agent, key, target)}: restart-required fields changed inheritance status.`)
+      await warnRestartField(api, "Bulk inheritance", "Hot fields apply on the next matching variant call; description/color inheritance changes require restart.")
+      continue
+    }
+
+    if (field === "name") {
+      const val = await showPrompt(api.ui, { title: "Display name", value: target.name as string | undefined, placeholder: `${agent}-${key}` })
+      if (val === undefined) continue
+      if (val === "") delete target.name
+      if (val !== "") target.name = val
+      markRestart(settings, `${agent}.${key}: display name requires restart.`)
+      await warnRestartField(api, "Display name", "Generated agent names are cached by OpenCode's task list.")
+      continue
+    }
+
+    if (!EDITABLE_FIELD_KEYS.has(field as PatchField)) continue
+    const picked = fieldDef(field)
+    if (!picked) continue
+    const action = await showFieldAction(api, {
+      title: `${picked.label} - ${variantName(agent, key, target)}`,
+      inspect: () => inspectVariantField(agent, key, nextEntry.parent, target, picked.key),
+      toggleLabel: `Toggle inheritance (${inheritanceEnabled(target, picked.key) ? "on" : "off"})`,
     })
-    if (val === undefined) return config
-    target.name = val || undefined
-  } else if (field === "model") {
-    const models = modelOptions(api, next)
-    const picked = await showSelect(api.ui, { title: "Select model", options: models, current: existing.model })
-    if (!picked) return config
-    if (picked === "__custom__") {
-      const custom = await showPrompt(api.ui, { title: "Custom model ID", placeholder: "provider/model-id" })
-      if (custom) target.model = custom
-    } else {
-      target.model = picked
+    if (!action || action === "back") continue
+    if (action === "inspect") {
+      await showAlert(api.ui, { title: picked.label, message: inspectVariantField(agent, key, nextEntry.parent, target, picked.key) })
+      continue
     }
-  } else if (field === "color") {
-    const picked = await showSelect(api.ui, { title: "Pick color", options: colorOptions() })
-    if (picked === "__custom__") {
-      const hex = await showPrompt(api.ui, { title: "Hex color", placeholder: "#FF5733" })
-      if (hex) target.color = hex
-    } else if (picked) {
-      target.color = picked
+    if (action === "toggle") {
+      target.inherit = { ...(target.inherit ?? {}), [picked.key]: !inheritanceEnabled(target, picked.key) }
+      markFieldChange(settings, picked.key, `${variantName(agent, key, target)}: ${picked.label} inheritance requires restart.`)
+      if (!isHotReloadField(picked.key)) await warnRestartField(api, picked.label, "Inheritance for this field affects cached task-list/UI metadata.")
+      continue
     }
-  } else {
-    const val = await promptForField(api, field, formatInputValue(existingRec[field]))
-    if (val === undefined) return config
-    if (val === "") {
-      delete target[field]
-    } else {
-      target[field] = val
-    }
+    const val = await promptForField(api, field, formatInputValue(target[picked.key]))
+    if (val === undefined) continue
+    setField(target, picked.key, val)
+    markFieldChange(settings, picked.key, `${variantName(agent, key, target)}: ${picked.label} requires restart.`)
+    if (!isHotReloadField(picked.key)) await warnRestartField(api, picked.label, "This field is stored in OpenCode's cached agent/task-list metadata.")
   }
-
-  const updated = next.agents[agent] as AgentEntry
-  const updatedVariant = updated.variants[key] as VariantConfig
-  api.ui.toast({ variant: "success", title: "Variant updated", message: variantName(agent, key, updatedVariant) })
-  return next
 }
 
-async function toggleDisable(api: TuiPluginApi, config: SidecarConfig): Promise<SidecarConfig> {
+async function toggleDisable(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings): Promise<SidecarConfig> {
   const items: TuiDialogSelectOption<{ agent: string; variant?: string }>[] = []
 
   for (const [agent, raw] of agentEntries(config)) {
@@ -585,21 +755,23 @@ async function toggleDisable(api: TuiPluginApi, config: SidecarConfig): Promise<
     const entry = next.agents[picked.agent] as AgentEntry
     entry.disable = !entry.disable
     const state = entry.disable ? "disabled" : "enabled"
-    api.ui.toast({ variant: "info", title: `${picked.agent} ${state}`, message: `Parent ${state}` })
+    markRestart(settings, `${picked.agent}: parent ${state} requires restart.`)
+    await warnRestartField(api, "Parent disable", `Parent ${state}; restart OpenCode to update task-list visibility.`)
   } else {
     const entry = next.agents[picked.agent] as AgentEntry | undefined
     const variant = entry?.variants[picked.variant] as VariantConfig | undefined
     if (variant) {
       variant.disable = !variant.disable
       const state = variant.disable ? "disabled" : "enabled"
-      api.ui.toast({ variant: "info", title: `${variantName(picked.agent, picked.variant, variant)} ${state}`, message: `Variant ${state}` })
+      markRestart(settings, `${variantName(picked.agent, picked.variant, variant)}: variant ${state} requires restart.`)
+      await warnRestartField(api, "Variant disable", `Variant ${state}; restart OpenCode to update task-list visibility.`)
     }
   }
 
   return next
 }
 
-async function deleteVariant(api: TuiPluginApi, config: SidecarConfig): Promise<SidecarConfig> {
+async function deleteVariant(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings): Promise<SidecarConfig> {
   const agentsWithVariants = agentEntries(config).filter(([, e]) => Object.keys(e.variants).length > 0)
   if (agentsWithVariants.length === 0) {
     await showAlert(api.ui, { title: "No variants", message: "Nothing to delete." })
@@ -634,7 +806,8 @@ async function deleteVariant(api: TuiPluginApi, config: SidecarConfig): Promise<
   const entry = next.agents[agent] as AgentEntry
   delete entry.variants[key]
 
-  api.ui.toast({ variant: "success", title: "Variant deleted", message: name })
+  markRestart(settings, `${name}: deleted variant requires restart to disappear from the task list.`)
+  await warnRestartField(api, "Variant deleted", `"${name}" may remain visible until restart, but calls will be blocked by the server plugin.`)
   return next
 }
 
@@ -770,13 +943,43 @@ async function clearDebugLog(api: TuiPluginApi): Promise<void> {
   api.ui.toast({ variant: "success", title: "Debug log cleared", message: file })
 }
 
-async function saveConfig(api: TuiPluginApi, config: SidecarConfig): Promise<void> {
+async function showWizardInfo(api: TuiPluginApi): Promise<void> {
+  await showAlert(api.ui, {
+    title: "Agent Variants Info",
+    message: [
+      "Hot reload applies to existing variant aliases only. Model, model variant, temperature, top_p, options, and prompt fields apply on the next matching variant call.",
+      "",
+      "Restart-required changes affect OpenCode's cached task list or UI metadata: add/delete/disable, display name, description fields, and color.",
+      "",
+      "Parent propagation is off per field by default. Variant inheritance is on per field by default. A variant receives a parent field only when the parent propagates it, the variant accepts it, and the variant has no local value.",
+      "",
+      "Built-in variants route through their native parent agent, so the footer may show the parent. Task output and expanded inputs show selected_alias/agent_variant, routed_agent, and effective_model.",
+      "",
+      "Submit an empty value while editing a field to remove that local override. Escape cancels without changes.",
+    ].join("\n"),
+  })
+}
+
+async function saveConfig(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings): Promise<void> {
   try {
     saveSidecar(config, defaultSidecarPath())
+    const reasons = uniqueReasons(settings)
+    const message = reasons.length > 0
+      ? [
+          "Saved with restart-required changes.",
+          "",
+          ...reasons.map((reason) => `- ${reason}`),
+          "",
+          settings.hotChanges ? "Hot-reloadable runtime fields still apply on the next matching variant call." : "Restart OpenCode before relying on the changed task list/UI.",
+        ].join("\n")
+      : settings.hotChanges
+        ? "Saved. Runtime changes apply on the next matching variant call; no restart-required changes were recorded."
+        : "Saved. No changes requiring restart were recorded."
+    await showAlert(api.ui, { title: reasons.length > 0 ? "Restart Required" : "Saved", message })
     api.ui.toast({
-      variant: "success",
+      variant: reasons.length > 0 ? "warning" : "success",
       title: "Saved",
-      message: "Configuration written with backup. Restart OpenCode to apply.",
+      message: reasons.length > 0 ? "Restart OpenCode to apply task-list/UI changes." : "Runtime changes apply on the next matching variant call.",
     })
   } catch (err) {
     await showAlert(api.ui, {
@@ -796,8 +999,10 @@ async function promptForField(
   if (field === "model") {
     const config = loadSidecar(defaultSidecarPath())
     const models = modelOptions(api, config)
+    models.unshift({ title: "< Remove value >", value: "__remove__", description: "Delete this local model override", category: "Current field" })
     const picked = await showSelect(api.ui, { title: "Select model", options: models, current })
     if (!picked) return undefined
+    if (picked === "__remove__") return ""
     if (picked === "__custom__") {
       return showPrompt(api.ui, { title: "Custom model ID", placeholder: "provider/model-id" })
     }
@@ -805,10 +1010,11 @@ async function promptForField(
   }
 
   if (field === "color") {
-    const picked = await showSelect(api.ui, { title: "Pick color", options: colorOptions() })
+    const picked = await showSelect(api.ui, { title: "Pick color", options: [{ title: "< Remove value >", value: "__remove__", description: "Delete this local color override", category: "Current field" }, ...colorOptions()] })
     if (picked === "__custom__") {
       return showPrompt(api.ui, { title: "Hex color", placeholder: "#FF5733" })
     }
+    if (picked === "__remove__") return ""
     return picked
   }
 
@@ -887,6 +1093,7 @@ async function mainMenu(api: TuiPluginApi, config: SidecarConfig, settings: Wiza
     { title: "Edit variant...", value: "edit-variant", description: "Change fields on an existing variant" },
     { title: "Toggle disable...", value: "toggle", description: "Enable or disable agents/variants" },
     { title: "Delete variant...", value: "delete", description: "Remove a variant" },
+    { title: "Info", value: "info", description: "Hot reload, restart boundaries, inheritance, and routing behavior" },
     { title: "Run diagnostics", value: "diagnostics", description: "Check models, conflicts, plugin install, and task-callability" },
     { title: "Debug & advanced...", value: "advanced", description: "Debug mode, logs, and wizard-only parent filter" },
     { title: "Preview configuration", value: "preview", description: `View current config (${agentCount} agents, ${vCount} variants)` },
@@ -905,21 +1112,24 @@ async function mainMenu(api: TuiPluginApi, config: SidecarConfig, settings: Wiza
     case "edit-parent":
       return editParentFlow(api, config, settings)
     case "edit-variant":
-      return mainMenu(api, await editVariant(api, config), settings)
+      return mainMenu(api, await editVariant(api, config, settings), settings)
     case "toggle":
-      return mainMenu(api, await toggleDisable(api, config), settings)
+      return mainMenu(api, await toggleDisable(api, config, settings), settings)
+    case "info":
+      await showWizardInfo(api)
+      return mainMenu(api, config, settings)
     case "diagnostics":
       await runDiagnostics(api, config)
       return mainMenu(api, config, settings)
     case "advanced":
       return mainMenu(api, await debugAdvancedMenu(api, config, settings), settings)
     case "delete":
-      return mainMenu(api, await deleteVariant(api, config), settings)
+      return mainMenu(api, await deleteVariant(api, config, settings), settings)
     case "preview":
       await previewConfig(api, config)
       return mainMenu(api, config, settings)
     case "save":
-      await saveConfig(api, config)
+      await saveConfig(api, config, settings)
       return config
     default:
       return config
@@ -946,7 +1156,7 @@ async function editParentFlow(api: TuiPluginApi, config: SidecarConfig, settings
   const agent = await showSelect(api.ui, { title: "Edit parent fields - pick agent", options: opts })
   if (!agent || agent === "__back__") return mainMenu(api, config, settings)
 
-  const updated = await editParentFields(api, config, agent)
+  const updated = await editParentFields(api, config, agent, settings)
   return mainMenu(api, updated, settings)
 }
 
@@ -1027,7 +1237,7 @@ function registerConfigureCommand(api: TuiPluginApi, run: () => Promise<void>) {
 const tui: TuiPlugin = async (api) => {
   const unregister = registerConfigureCommand(api, async () => {
     const config = loadSidecar(defaultSidecarPath())
-    await mainMenu(api, config, { subagentCapableOnly: true })
+    await mainMenu(api, config, { subagentCapableOnly: true, hotChanges: false, restartReasons: [] })
   })
 
   api.lifecycle.onDispose(() => {

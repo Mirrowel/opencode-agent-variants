@@ -43,6 +43,8 @@ If a variant resolves to a model that is definitely missing, the plugin skips th
 
 Parent overrides apply only when the parent has at least one enabled variant.
 
+Parent overrides are local to the parent by default. A parent can opt in to sharing a field with variants through `parent.propagate.<field>`. A variant accepts propagated fields by default, and can opt out per field through `variant.inherit.<field> = false`.
+
 ## Supported Override Fields
 
 Parents and variants support:
@@ -61,11 +63,73 @@ Parents and variants support:
 - `color`
 - `disable`
 
+Hot-reloadable fields for existing aliases:
+
+- `model`
+- `variant`
+- `temperature`
+- `top_p`
+- `prompt`
+- `prompt_prepend`
+- `prompt_append`
+- `options`
+
+Fields/actions that require an OpenCode restart because they affect cached task-list or UI metadata:
+
+- adding/deleting/enabling/disabling variants
+- `name`
+- `description`
+- `description_prepend`
+- `description_append`
+- `color`
+
 Variants also support:
 
 - `name`: custom generated agent name. Defaults to `${parent}-${variantKey}`.
 
 The sidecar intentionally does not configure `permission`, `tools`, or `mode`. Those come from the parent.
+
+## Inheritance And Propagation
+
+Parent propagation and variant inheritance are field-level controls:
+
+```jsonc
+"agents": {
+  "general": {
+    "parent": {
+      "temperature": 0.2,
+      "propagate": {
+        "temperature": true
+      }
+    },
+    "variants": {
+      "light": {
+        "model": "light",
+        "inherit": {
+          "temperature": true,
+          "prompt_append": false
+        }
+      }
+    }
+  }
+}
+```
+
+A variant receives a parent field only when all of these are true:
+
+- `parent.propagate.<field>` is `true`
+- `variant.inherit.<field>` is not `false`
+- the variant does not set a local value for that field
+
+Variant local values always win. Parent propagation defaults to off. Variant inheritance defaults to on.
+
+The wizard shows compact field indicators:
+
+- `PROP:on/off` for parent propagation
+- `INH:on/off` for variant inheritance
+- `SRC:local/inherit/none` for the value source
+
+Use `Inspect field` in the field action menu to see local value, inherited value, resulting value, and whether the field hot-reloads or requires restart. Submitting an empty field value removes the local override; pressing escape cancels.
 
 Agent Variants are intended for agents callable by OpenCode's `task` tool. The wizard defaults to a subagent-capable parent filter (`mode: "subagent"` or `mode: "all"`) and hides primary-only agents from add/edit parent pickers. This is a wizard-only setting, not a sidecar field. Existing sidecar entries for primary-only parents still appear in edit/delete/toggle flows so they can be repaired.
 

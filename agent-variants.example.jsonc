@@ -27,7 +27,14 @@
 
       "parent": {
         // Parent fields apply only when this parent has at least one enabled variant.
-        "description_append": "Uses the default strongest model. Use for the hardest tasks."
+        // They stay local to the parent unless explicitly propagated per field.
+        "description_append": "Uses the default strongest model. Use for the hardest tasks.",
+        "propagate": {
+          // Parent propagation is off by default. Turn on only fields variants
+          // should inherit when they do not set their own local value.
+          "temperature": false,
+          "prompt_append": false
+        }
 
         // Optional parent overrides:
         // "model": "heavy",
@@ -48,7 +55,13 @@
           // Variant names default to parent-key, so this becomes general-light.
           // "name": "general-cheap",
           "model": "light",
-          "description_append": "Use {alias} for most tasks that do not need {parent}'s strongest model. Runs on {model_label}."
+          "description_append": "Use {alias} for most tasks that do not need {parent}'s strongest model. Runs on {model_label}.",
+          "inherit": {
+            // Variant inheritance is on by default. Set a field to false to
+            // block a propagated parent override from reaching this variant.
+            "temperature": true,
+            "prompt_append": true
+          }
 
           // Optional variant overrides:
           // "variant": "default",

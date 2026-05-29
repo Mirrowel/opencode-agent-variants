@@ -18,6 +18,34 @@ const Color = z.union([
   z.enum(["primary", "secondary", "accent", "success", "warning", "error", "info"]),
 ])
 
+export const PATCH_FIELDS = [
+  "model",
+  "variant",
+  "temperature",
+  "top_p",
+  "prompt",
+  "prompt_prepend",
+  "prompt_append",
+  "description",
+  "description_prepend",
+  "description_append",
+  "options",
+  "color",
+] as const
+export const HOT_RELOAD_FIELDS = [
+  "model",
+  "variant",
+  "temperature",
+  "top_p",
+  "prompt",
+  "prompt_prepend",
+  "prompt_append",
+  "options",
+] as const
+export const RESTART_FIELDS = PATCH_FIELDS.filter((field) => !HOT_RELOAD_FIELDS.includes(field as HotReloadField))
+
+const FieldFlags = z.record(z.string(), z.boolean())
+
 const Patch = z.object({
   model: z.string().optional(),
   variant: z.string().optional(),
@@ -34,7 +62,12 @@ const Patch = z.object({
   disable: z.boolean().optional(),
 })
 
+const ParentPatch = Patch.extend({
+  propagate: FieldFlags.optional(),
+})
+
 const Variant = Patch.extend({
+  inherit: FieldFlags.optional(),
   name: z.string().min(1).optional(),
 })
 
@@ -51,13 +84,16 @@ export const SidecarConfig = z.object({
     z.string(),
     z.object({
       disable: z.boolean().optional(),
-      parent: Patch.default({}),
+      parent: ParentPatch.default({}),
       variants: z.record(z.string(), Variant).default({}),
     }),
   ).default({}),
 })
 
+export type PatchField = (typeof PATCH_FIELDS)[number]
+export type HotReloadField = (typeof HOT_RELOAD_FIELDS)[number]
 export type AgentPatch = z.infer<typeof Patch>
+export type ParentPatch = z.infer<typeof ParentPatch>
 export type VariantConfig = z.infer<typeof Variant>
 export type SidecarConfig = z.infer<typeof SidecarConfig>
 export type DiagnosticLevel = "error" | "warning" | "info"
@@ -82,6 +118,51 @@ export type TemplateContext = {
   routed_agent?: string
 }
 export type AgentMode = "primary" | "subagent" | "all"
+
+export function isHotReloadField(field: string): field is HotReloadField {
+  return HOT_RELOAD_FIELDS.includes(field as HotReloadField)
+}
+
+export function isPatchField(field: string): field is PatchField {
+  return PATCH_FIELDS.includes(field as PatchField)
+}
+
+export function patchValue(patch: Partial<Record<PatchField, unknown>> | undefined, field: PatchField) {
+  return patch?.[field]
+}
+
+export function patchHasValue(patch: Partial<Record<PatchField, unknown>> | undefined, field: PatchField) {
+  return patchValue(patch, field) !== undefined
+}
+
+export function propagationEnabled(parent: { propagate?: Partial<Record<PatchField, boolean>> } | undefined, field: PatchField) {
+  return parent?.propagate?.[field] === true
+}
+
+export function inheritanceEnabled(variant: { inherit?: Partial<Record<PatchField, boolean>> } | undefined, field: PatchField) {
+  return variant?.inherit?.[field] !== false
+}
+
+export function inheritedPatch(parent: ParentPatch, variant: VariantConfig): AgentPatch {
+  return Object.fromEntries(
+    PATCH_FIELDS
+      .filter((field) => propagationEnabled(parent, field) && inheritanceEnabled(variant, field) && patchHasValue(parent, field))
+      .map((field) => [field, parent[field]]),
+  ) as AgentPatch
+}
+
+export function mergePatches(parent: AgentPatch, variant: VariantConfig): AgentPatch {
+  return Object.fromEntries(
+    PATCH_FIELDS.flatMap((field) => {
+      const value = patchHasValue(variant, field) ? variant[field] : parent[field]
+      return value === undefined ? [] : [[field, value]]
+    }),
+  ) as AgentPatch
+}
+
+export function effectiveVariantPatch(parent: ParentPatch, variant: VariantConfig): AgentPatch {
+  return mergePatches(inheritedPatch(parent, variant), variant)
+}
 
 export function defaultConfigDir() {
   return join(homedir(), ".config", "opencode")
