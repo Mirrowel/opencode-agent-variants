@@ -22,7 +22,7 @@ The plugin adds generated variants to OpenCode's normal `task` tool list and pro
 
 ## Install
 
-After the package is published to npm, install it with OpenCode's plugin installer:
+Install it with OpenCode's plugin installer:
 
 ```sh
 opencode plugin opencode-agent-variants --global
