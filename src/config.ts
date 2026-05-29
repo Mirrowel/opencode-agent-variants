@@ -81,6 +81,7 @@ export type TemplateContext = {
   model_label?: string
   routed_agent?: string
 }
+export type AgentMode = "primary" | "subagent" | "all"
 
 export function defaultConfigDir() {
   return join(homedir(), ".config", "opencode")
@@ -225,7 +226,11 @@ export function validateModel(modelInput: string | undefined, config: SidecarCon
   if (catalog.providersWithModelList.has(split.providerID) && !catalog.refs.has(model)) return `Model "${model}" was not found in provider "${split.providerID}".`
 }
 
-export function diagnoseConfig(config: SidecarConfig, input: { agents: string[]; providers: unknown; pluginEntries?: unknown[] }) {
+export function isSubagentCapableMode(mode: AgentMode | undefined) {
+  return mode !== "primary"
+}
+
+export function diagnoseConfig(config: SidecarConfig, input: { agents: string[]; providers: unknown; pluginEntries?: unknown[]; agentModes?: Record<string, AgentMode> }) {
   const diagnostics: Diagnostic[] = []
   const catalog = modelCatalogFromProviders(input.providers)
   const knownAgents = new Set([...Object.keys(BUILTIN_AGENT_DESCRIPTIONS), ...input.agents])
@@ -239,9 +244,11 @@ export function diagnoseConfig(config: SidecarConfig, input: { agents: string[];
 
   for (const [agent, entry] of Object.entries(config.agents)) {
     if (!knownAgents.has(agent)) diagnostics.push({ level: "warning", agent, message: `Parent agent "${agent}" is not a known built-in or configured agent.` })
+    if (!isSubagentCapableMode(input.agentModes?.[agent])) diagnostics.push({ level: "warning", agent, message: `Parent agent "${agent}" is primary-only and will not be callable by the task tool.` })
     if (entry.disable) diagnostics.push({ level: "info", agent, message: `Parent "${agent}" is disabled in sidecar config.` })
     for (const [key, variant] of Object.entries(entry.variants)) {
       const alias = variantName(agent, key, variant)
+      if (!isSubagentCapableMode(input.agentModes?.[agent])) diagnostics.push({ level: "warning", agent, variant: key, alias, message: `Variant "${alias}" inherits a primary-only parent and will not be callable by the task tool.` })
       const issue = validateModel(variant.model, config, catalog)
       if (issue) diagnostics.push({ level: "warning", agent, variant: key, alias, message: `Variant "${alias}" disabled at runtime: ${issue}` })
       if (alias === agent) diagnostics.push({ level: "error", agent, variant: key, alias, message: `Variant "${alias}" uses the same name as its parent.` })

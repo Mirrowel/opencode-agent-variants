@@ -8,6 +8,15 @@ on:
       - alpha
       - beta
       - rc
+    paths:
+      - src/**
+      - docs/CONFIG.md
+      - README.md
+      - LICENSE
+      - agent-variants.example.jsonc
+      - package.json
+      - package-lock.json
+      - tsconfig*.json
   workflow_dispatch:
     inputs:
       channel:
@@ -68,10 +77,12 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          registry-url: https://registry.npmjs.org/
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Upgrade npm for trusted publishing
+        run: npm install -g npm@latest
 
       - name: Check release intent
         run: npm run release:intent:check
@@ -84,6 +95,7 @@ jobs:
           TARGET_VERSION: ${{ github.event.inputs.target_version || '' }}
           VERSION_BUMP: ${{ github.event.inputs.version_bump || 'auto' }}
           FORCE_RELEASE: ${{ github.event.inputs.force_release || 'false' }}
+          REQUIRE_RELEVANT_CHANGES: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_release != 'true' && 'true' || 'false' }}
         run: bash .github/scripts/compute-version.sh
 
       - name: No release needed
@@ -110,7 +122,7 @@ jobs:
         if: steps.version.outputs.should_release == 'true'
         id: npm-version
         run: |
-          if npm view "opencode-agent-variants@${{ steps.version.outputs.version }}" version >/dev/null 2>&1; then
+          if npm view "$(node -p "require('./package.json').name")@${{ steps.version.outputs.version }}" version >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
@@ -118,6 +130,10 @@ jobs:
 
       - name: Publish to npm
         if: steps.version.outputs.should_release == 'true' && steps.npm-version.outputs.exists != 'true'
+        env:
+          # Trusted Publishing uses GitHub OIDC. Avoid setup-node token auth so
+          # npm does not try to publish with an absent/placeholder NODE_AUTH_TOKEN.
+          NODE_AUTH_TOKEN: ""
         run: npm publish --provenance --access public --tag "${{ steps.version.outputs.npm_tag }}"
 
       - name: Install git-cliff

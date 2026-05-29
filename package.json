@@ -1,5 +1,5 @@
 {
-  "name": "opencode-agent-variants",
+  "name": "@mirrowel/opencode-agent-variants",
   "version": "0.1.0",
   "type": "module",
   "description": "OpenCode plugin for creating and managing model variants of agents",

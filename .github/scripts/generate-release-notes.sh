@@ -31,6 +31,13 @@ This is the first release for this channel.
 EOF
 }
 
+normalize_changelog() {
+  # Stable releases compare from the latest stable tag, so prerelease tags can
+  # appear inside the range. Keep their commits, but remove the prerelease
+  # subheadings so the stable release notes read as one coherent release.
+  sed -i -E '/^## Changes in v[0-9]+\.[0-9]+\.[0-9]+-(dev|alpha|beta|rc|canary)\.[0-9]+$/d' changes.md
+}
+
 resolve_author_placeholders() {
   if ! grep -qE '\[\[[a-f0-9]{40}\|' changes.md 2>/dev/null; then
     return
@@ -115,12 +122,14 @@ generate_community_section() {
 }
 
 generate_changelog
+normalize_changelog
 resolve_author_placeholders
 generate_community_section
 
-install="opencode plugin opencode-agent-variants --global"
+package_name="$(node -p "require('./package.json').name")"
+install="opencode plugin ${package_name}@latest --global"
 if [ "$npm_tag" != "latest" ]; then
-  install="opencode plugin opencode-agent-variants@$npm_tag --global"
+  install="opencode plugin ${package_name}@$npm_tag --global"
 fi
 
 experimental_note=""
@@ -137,13 +146,16 @@ fi
 
 compare_url=""
 if [ -n "$previous_tag" ]; then
-  compare_left="${previous_tag//\//%2F}"
-  compare_right="${tag//\//%2F}"
-  compare_url="https://github.com/$repo/compare/$compare_left...$compare_right"
+  compare_url="https://github.com/$repo/compare/$previous_tag...$tag"
 fi
 
-cat > release-notes.md <<EOF
-$experimental_note## Package
+: > release-notes.md
+if [ -n "$experimental_note" ]; then
+  printf '%s\n\n' "$experimental_note" >> release-notes.md
+fi
+
+cat >> release-notes.md <<EOF
+## Package
 
 | Field | Value |
 | ----- | ----- |
@@ -171,7 +183,7 @@ fi
 cat >> release-notes.md <<EOF
 ## Links
 
-- [npm package](https://www.npmjs.com/package/opencode-agent-variants)
+- [npm package](https://www.npmjs.com/package/${package_name})
 - [Repository](https://github.com/$repo)
 - [Issues](https://github.com/$repo/issues)
 EOF

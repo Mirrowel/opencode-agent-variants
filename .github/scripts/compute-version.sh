@@ -29,12 +29,37 @@ bump_version() {
 }
 
 latest_stable_tag() {
-  git tag --list 'v[0-9]*.[0-9]*.[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | semver_sort | tail -n 1 || true
+  git tag --merged HEAD --list 'v[0-9]*.[0-9]*.[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | semver_sort | tail -n 1 || true
 }
 
 latest_channel_tag() {
   local channel="$1"
-  git tag --list "$channel/v*" | semver_sort | tail -n 1 || true
+  git tag --merged HEAD --list "v[0-9]*.[0-9]*.[0-9]*-$channel.*" | semver_sort | tail -n 1 || true
+}
+
+latest_prerelease_base() {
+  git tag --merged HEAD --list 'v[0-9]*.[0-9]*.[0-9]*-*' \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+-(dev|alpha|beta|rc|canary)\.[0-9]+$' \
+    | sed -E 's/^v([0-9]+\.[0-9]+\.[0-9]+)-.*/\1/' \
+    | semver_sort \
+    | tail -n 1 || true
+}
+
+tag_points_at_head() {
+  local tag="$1"
+  [ -n "$tag" ] && [ "$(git rev-list -n 1 "$tag" 2>/dev/null || true)" = "$(git rev-parse HEAD)" ]
+}
+
+release_relevant_changes() {
+  local previous_tag="$1"
+  local changed_files
+  if [ -n "$previous_tag" ]; then
+    changed_files="$(git diff --name-only "$previous_tag..HEAD")"
+  else
+    changed_files="$(git ls-tree -r --name-only HEAD)"
+  fi
+
+  printf '%s\n' "$changed_files" | grep -Eq '^(src/|README\.md$|LICENSE$|agent-variants\.example\.jsonc$|docs/CONFIG\.md$|package(-lock)?\.json$|tsconfig(\..*)?\.json$)'
 }
 
 conventional_bump_since() {
@@ -64,7 +89,9 @@ next_prerelease_number() {
   local package_name="$1"
   local base_version="$2"
   local channel="$3"
-  npm view "$package_name" versions --json 2>/dev/null | node -e '
+  local npm_latest
+  local git_latest
+  npm_latest="$(npm view "$package_name" versions --json 2>/dev/null | node -e '
     const fs = require("node:fs")
     const versions = JSON.parse(fs.readFileSync(0, "utf8") || "[]")
     const base = process.argv[1]
@@ -77,8 +104,14 @@ next_prerelease_number() {
       .map(Number)
       .sort((a, b) => a - b)
       .at(-1)
-    console.log((latest ?? 0) + 1)
-  ' "$base_version" "$channel"
+    console.log(latest ?? 0)
+  ' "$base_version" "$channel")"
+  git_latest="$(git tag --merged HEAD --list "v$base_version-$channel.*" \
+    | sed -E "s/^v${base_version//./\.}-$channel\.([0-9]+)$/\1/" \
+    | grep -E '^[0-9]+$' \
+    | sort -n \
+    | tail -n 1 || true)"
+  echo "$(( (${npm_latest:-0} > ${git_latest:-0} ? ${npm_latest:-0} : ${git_latest:-0}) + 1 ))"
 }
 
 validate_stable_version() {
@@ -120,6 +153,7 @@ case "$version_bump" in
 esac
 
 stable_tag="$(latest_stable_tag)"
+prerelease_line="$(latest_prerelease_base)"
 stable_version="0.0.0"
 if [ -n "$stable_tag" ]; then
   stable_version="${stable_tag#v}"
@@ -131,14 +165,18 @@ else
   bump="$version_bump"
 fi
 
-stable_candidate="$(semver_max "$intent_version" "$(bump_version "$stable_version" "$bump")")"
+# Stable releases promote the highest prerelease base. If dev published
+# 0.5.0-dev.N, merging dev to main must release at least 0.5.0 even if the
+# merge commit range would otherwise infer a smaller conventional-commit bump.
+stable_candidate="$(semver_max "$intent_version" "$prerelease_line" "$(bump_version "$stable_version" "$bump")")"
 prerelease_default_bump="minor"
 if [ "$bump" = "major" ]; then
   prerelease_default_bump="major"
 fi
-prerelease_base="$(semver_max "$intent_version" "$(bump_version "$stable_version" "$prerelease_default_bump")")"
+prerelease_base="$(semver_max "$intent_version" "$prerelease_line" "$(bump_version "$stable_version" "$prerelease_default_bump")")"
 
 force_release="${FORCE_RELEASE:-false}"
+require_relevant_changes="${REQUIRE_RELEVANT_CHANGES:-false}"
 if [ -n "$target_version" ]; then
   stable_candidate="$target_version"
   prerelease_base="$target_version"
@@ -154,20 +192,37 @@ if [ "$channel" != "latest" ]; then
   prerelease="true"
   latest="false"
   base_version="$prerelease_base"
-  prerelease_number="$(next_prerelease_number "$package_name" "$base_version" "$channel")"
-  version="$base_version-$channel.$prerelease_number"
-  tag="$channel/v$version"
   previous_tag="$(latest_channel_tag "$channel")"
+  if tag_points_at_head "$previous_tag"; then
+    version="${previous_tag#v}"
+    tag="$previous_tag"
+    should_release="false"
+  else
+    prerelease_number="$(next_prerelease_number "$package_name" "$base_version" "$channel")"
+    version="$base_version-$channel.$prerelease_number"
+    tag="v$version"
+    should_release="true"
+  fi
   if [ -z "$previous_tag" ]; then
     previous_tag="$stable_tag"
   fi
-  should_release="true"
 else
   version="$stable_candidate"
   tag="v$version"
   previous_tag="$stable_tag"
   if [ "$force_release" = "true" ] || [ -n "$target_version" ] || [ "$(printf '%s\n%s\n' "$stable_version" "$stable_candidate" | semver_sort | tail -n 1)" != "$stable_version" ]; then
     should_release="true"
+  fi
+fi
+
+release_relevant="true"
+if [ "$require_relevant_changes" = "true" ] && [ "$force_release" != "true" ]; then
+  release_relevant="false"
+  if release_relevant_changes "$previous_tag"; then
+    release_relevant="true"
+  fi
+  if [ "$release_relevant" != "true" ]; then
+    should_release="false"
   fi
 fi
 
@@ -179,6 +234,8 @@ fi
   echo "base_version=$base_version"
   echo "tag=$tag"
   echo "previous_tag=$previous_tag"
+  echo "prerelease_line=$prerelease_line"
+  echo "release_relevant=$release_relevant"
   echo "prerelease=$prerelease"
   echo "latest=$latest"
   echo "should_release=$should_release"

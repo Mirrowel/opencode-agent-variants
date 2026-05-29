@@ -1,4 +1,31 @@
-# OpenCode Agent Variants
+<h1 align="center">OpenCode Agent Variants</h1>
+
+<p align="center">
+  <strong>Model-specific OpenCode subagents without copy-pasting agent prompts.</strong><br>
+  Let the main model call <code>general-light</code>, <code>explore-fast</code>, or any other generated variant through the normal <code>task</code> tool.
+</p>
+
+<p align="center">
+  <a href="https://www.npmjs.com/package/@mirrowel/opencode-agent-variants"><img src="https://img.shields.io/npm/v/%40mirrowel%2Fopencode-agent-variants/latest?label=latest&style=flat-square&color=blue" alt="npm latest version"></a>
+  <a href="https://www.npmjs.com/package/@mirrowel/opencode-agent-variants"><img src="https://img.shields.io/npm/v/%40mirrowel%2Fopencode-agent-variants/dev?label=dev&style=flat-square&color=orange" alt="npm dev version"></a>
+  <a href="https://www.npmjs.com/package/@mirrowel/opencode-agent-variants"><img src="https://img.shields.io/npm/dm/%40mirrowel%2Fopencode-agent-variants?style=flat-square&color=green" alt="npm downloads"></a>
+  <a href="https://github.com/Mirrowel/opencode-agent-variants/releases"><img src="https://img.shields.io/github/v/release/Mirrowel/opencode-agent-variants?style=flat-square&color=purple" alt="GitHub release"></a>
+  <a href="https://github.com/Mirrowel/opencode-agent-variants/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/Mirrowel/opencode-agent-variants/ci.yml?branch=main&style=flat-square&label=ci" alt="CI status"></a>
+  <a href="https://github.com/Mirrowel/opencode-agent-variants/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green?style=flat-square" alt="MIT License"></a>
+</p>
+
+<p align="center">
+  <a href="#install">Install</a> ·
+  <a href="#quick-start">Quick Start</a> ·
+  <a href="#why-agent-variants">Why Agent Variants?</a> ·
+  <a href="#common-patterns">Patterns</a> ·
+  <a href="#wizard">Wizard</a> ·
+  <a href="#config-file">Config</a> ·
+  <a href="#built-in-agents">Built-In Agents</a> ·
+  <a href="#debug-mode">Debugging</a>
+</p>
+
+---
 
 OpenCode Agent Variants creates model-specific versions of your agents without copying prompts by hand.
 
@@ -10,6 +37,29 @@ Use it when you want the main model to choose between agents like:
 - `explore-light` for routine exploration on a smaller model
 
 The plugin adds generated variants to OpenCode's normal `task` tool list and provides one TUI wizard for editing the variant config.
+
+## Why Agent Variants?
+
+OpenCode already has strong built-in agents, but model selection is usually attached to the current session or a hand-written agent config. That creates an awkward choice:
+
+- Run every subagent on the expensive main model.
+- Copy built-in prompts into custom agents and watch them drift from upstream.
+- Tell the model when to use cheaper agents in prose and hope it follows the rule.
+
+Agent Variants keeps the normal OpenCode flow: the assistant still calls `task` once, but the task list can contain purpose-built aliases such as `general-light` or `explore-glm`. Built-in variants route back to the native parent agent, so OpenCode keeps owning the prompt, permissions, tools, and mode.
+
+## What It Looks Like
+
+After configuration, the main model sees ordinary task agents with distinct names and descriptions:
+
+```txt
+general         Strong default reasoning agent.
+general-light   Copy of general using GLM 5.1. Use for routine implementation work.
+explore         Codebase exploration agent.
+explore-light   Copy of explore using GLM 5.1. Use for search, reading, and summarization.
+```
+
+When the model calls `task` with `general-light`, the plugin routes execution through the native `general` agent and applies the configured model override to the child session.
 
 ## Features
 
@@ -25,7 +75,7 @@ The plugin adds generated variants to OpenCode's normal `task` tool list and pro
 Install it with OpenCode's plugin installer:
 
 ```sh
-opencode plugin opencode-agent-variants --global
+opencode plugin @mirrowel/opencode-agent-variants@latest --global
 ```
 
 The installer detects both plugin targets and updates the right config files:
@@ -35,13 +85,37 @@ The installer detects both plugin targets and updates the right config files:
 
 Restart OpenCode after installation.
 
+## Quick Start
+
+1. Install the plugin globally:
+
+```sh
+opencode plugin @mirrowel/opencode-agent-variants@latest --global
+```
+
+2. Restart OpenCode.
+
+3. Open the wizard:
+
+```txt
+Agent Variants: Configure
+```
+
+4. Create a variant from a subagent-capable parent, for example `general -> general-light` or `explore -> explore-light`.
+
+5. Restart OpenCode again so the generated agent list is assembled at startup.
+
+After that, the main model can call the generated variant through the normal `task` tool. No agent-facing management tools are added.
+
+> **Tip:** Use the wizard's `Run diagnostics` action after editing. It checks model availability, alias conflicts, parent task-callability, disabled entries, and plugin installation state.
+
 ## Manual Install
 
 If you prefer to configure it manually, add the package to your OpenCode config:
 
 ```jsonc
 {
-  "plugin": ["opencode-agent-variants"]
+  "plugin": ["@mirrowel/opencode-agent-variants@latest"]
 }
 ```
 
@@ -49,11 +123,11 @@ And add the same package to your TUI config:
 
 ```jsonc
 {
-  "plugin": ["opencode-agent-variants"]
+  "plugin": ["@mirrowel/opencode-agent-variants@latest"]
 }
 ```
 
-For local development, use a file URL or local path instead of the npm package name.
+Use `@mirrowel/opencode-agent-variants@dev` if you intentionally want the current prerelease channel. For local development, use a file URL or local path instead of the npm package name.
 
 ## Wizard
 
@@ -75,14 +149,36 @@ The wizard supports:
 - editing parent overrides
 - editing variant overrides
 - enabling or disabling parents and variants
-- toggling debug mode
-- running diagnostics
-- viewing and clearing the debug log
 - deleting variants
+- running diagnostics
+- opening `Debug & advanced` to toggle debug mode, view/clear logs, and change wizard-only filters
 - previewing the generated config
 - saving changes with timestamped backups
 
 Agent/variant list changes take effect after restarting OpenCode because agents and plugins are assembled at startup. Debug mode is hot-read and takes effect immediately after the wizard saves it.
+
+The wizard defaults to showing only subagent-capable parent agents when adding or editing parent entries. Agent Variants are meant for agents callable through OpenCode's `task` tool. You can temporarily show all agents from `Debug & advanced` if you need to inspect or repair existing config.
+
+## Common Patterns
+
+| Pattern | Example | Why use it |
+| --- | --- | --- |
+| Cheap general work | `general-light` | Let the main model delegate routine edits or analysis to a cheaper model. |
+| Cheap code search | `explore-light` | Keep broad codebase reading off your strongest model. |
+| Specialist model | `explore-gemini`, `general-glm` | Route specific task types to models that are strong or inexpensive for that shape of work. |
+| Clear task-list wording | `description_append` | Teach the main model when to pick each variant without adding extra tools or prompts. |
+| Shared model aliases | `models.light` | Change the underlying model once and reuse it across multiple variants. |
+
+## Compatibility Notes
+
+| Agent source | Behavior |
+| --- | --- |
+| Built-in agents like `general` and `explore` | Virtual aliases route to the native parent, preserving upstream prompts and permissions. |
+| Agents from `opencode.json` or `opencode.jsonc` | Variants are generated as copied config agents with overrides applied. |
+| Markdown agents | Variants are generated from the configured markdown-backed agent definition. |
+| Primary-only agents | Diagnostics warn because they are not callable through the `task` tool. |
+
+Agent Variants is designed for subagents. It does not try to override OpenCode's main-session model picker.
 
 ## Config File
 
@@ -187,11 +283,11 @@ Agents defined in `opencode.json`, `.opencode/agent/*.md`, or global agent markd
 - If a variant resolves to a definitely missing model, it is skipped for that run and a warning toast is shown.
 - Conflicting aliases are skipped instead of overwriting existing agents.
 
-Use the wizard's `Run diagnostics` action to inspect model validation, alias conflicts, disabled parents, and plugin installation state.
+Use the wizard's `Run diagnostics` action to inspect model validation, alias conflicts, disabled parents, task-callability, and plugin installation state.
 
 ## Debug Mode
 
-Debug mode is off by default. Enable it from the wizard with `Debug mode: off`.
+Debug mode is off by default. Enable it from the wizard through `Debug & advanced`.
 
 When enabled, the server plugin emits diagnostic log lines and TUI toast notifications for built-in virtual variants:
 
@@ -202,7 +298,7 @@ When enabled, the server plugin emits diagnostic log lines and TUI toast notific
 
 Logs are written to `~/.config/opencode/agent-variants.debug.log`. The plugin does not write debug lines to stdout, because that can corrupt the terminal UI.
 
-Debug mode is stored in `agent-variants.jsonc` and takes effect immediately for future variant calls. The wizard can also view and clear the debug log.
+Debug mode is stored in `agent-variants.jsonc` and takes effect immediately for future variant calls. The wizard can also view and clear the debug log from `Debug & advanced`.
 
 ## Development
 
