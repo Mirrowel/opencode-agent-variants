@@ -27,6 +27,7 @@ import {
 
 type AgentEntry = SidecarConfig["agents"][string]
 type ModelEntry = SidecarConfig["models"][string]
+type RichSelectOption<Value = unknown> = TuiDialogSelectOption<Value>
 
 type WizardSettings = {
   subagentCapableOnly: boolean
@@ -67,6 +68,89 @@ const EDITABLE_FIELDS: FieldDef[] = [
   { key: "color", label: "Color", type: "string" },
 ]
 const EDITABLE_FIELD_KEYS = new Set(EDITABLE_FIELDS.map((field) => field.key))
+
+const FIELD_HELP: Record<
+  PatchField,
+  {
+    purpose: string
+    parent: string
+    variant: string
+    empty: string
+  }
+> = {
+  model: {
+    purpose: "Selects the provider/model used for this agent call. Values can be named model shortcuts from this sidecar or full provider/model IDs.",
+    parent: "Sets the parent agent's model override. It reaches variants only if this field is propagated and the variant accepts inheritance.",
+    variant: "Sets this variant's model override. A local value wins over any propagated parent model.",
+    empty: "Removing it makes the agent fall back to an inherited parent model, or otherwise to OpenCode's current/session model.",
+  },
+  variant: {
+    purpose: "Selects a provider-specific model variant, when the provider exposes one. This is separate from the agent variant alias name.",
+    parent: "Sets the parent agent's provider model variant. It reaches variants only through propagation/inheritance.",
+    variant: "Sets the provider model variant for this generated alias. Local value wins over inherited value.",
+    empty: "Removing it clears the provider variant override.",
+  },
+  temperature: {
+    purpose: "Controls sampling randomness. Lower values are more deterministic; higher values are more exploratory when the provider supports it.",
+    parent: "Sets the parent temperature override and can share it with variants through propagation.",
+    variant: "Sets this variant's temperature override. Local value wins over inherited parent temperature.",
+    empty: "Removing it lets inherited/provider/default temperature behavior apply.",
+  },
+  top_p: {
+    purpose: "Controls nucleus sampling. Lower values narrow token choices; provider support varies.",
+    parent: "Sets the parent top_p override and can share it with variants through propagation.",
+    variant: "Sets this variant's top_p override. Local value wins over inherited parent top_p.",
+    empty: "Removing it lets inherited/provider/default top_p behavior apply.",
+  },
+  prompt: {
+    purpose: "Replaces the agent prompt override used by Agent Variants. Use this only when you want a full replacement rather than a small patch.",
+    parent: "Sets a parent prompt replacement and can share it with variants through propagation.",
+    variant: "Sets this variant's prompt replacement. Local value wins over inherited parent prompt replacement.",
+    empty: "Removing it clears the replacement and falls back to prepend/append patches or the native prompt.",
+  },
+  prompt_prepend: {
+    purpose: "Adds text before the effective agent prompt. Useful for small steering instructions without replacing the base prompt.",
+    parent: "Prepends text to the parent prompt and can share that prepend with variants through propagation.",
+    variant: "Prepends text for this variant. Local value wins over inherited parent prepend.",
+    empty: "Removing it clears the prepend patch.",
+  },
+  prompt_append: {
+    purpose: "Adds text after the effective agent prompt. This is usually the safest way to add variant-specific behavior.",
+    parent: "Appends text to the parent prompt and can share that append with variants through propagation.",
+    variant: "Appends text for this variant. Local value wins over inherited parent append.",
+    empty: "Removing it clears the append patch.",
+  },
+  description: {
+    purpose: "Replaces the description shown in OpenCode's task-list metadata. This affects what the model reads when choosing a subagent.",
+    parent: "Replaces parent description metadata after restart and can be propagated for generated variant descriptions.",
+    variant: "Replaces this variant's task-list description after restart.",
+    empty: "Removing it restores generated/default description behavior after restart.",
+  },
+  description_prepend: {
+    purpose: "Adds text before the generated or replaced description shown in the task list.",
+    parent: "Prepends parent description metadata after restart and can be propagated to variants.",
+    variant: "Prepends this variant's task-list description after restart.",
+    empty: "Removing it clears the description prepend after restart.",
+  },
+  description_append: {
+    purpose: "Adds text after the generated or replaced description shown in the task list. Good for short routing guidance.",
+    parent: "Appends parent description metadata after restart and can be propagated to variants.",
+    variant: "Appends this variant's task-list description after restart.",
+    empty: "Removing it clears the description append after restart.",
+  },
+  options: {
+    purpose: "JSON object of provider/model request options merged into the LLM call. Use only provider-supported keys.",
+    parent: "Sets parent request options and can share them with variants through propagation.",
+    variant: "Sets request options for this variant. Local object wins over inherited parent options.",
+    empty: "Removing it clears the options override.",
+  },
+  color: {
+    purpose: "Sets the generated agent color in OpenCode UI metadata where supported.",
+    parent: "Sets parent color metadata after restart and can be propagated to variants.",
+    variant: "Sets this variant's generated agent color after restart.",
+    empty: "Removing it restores OpenCode/default color behavior after restart.",
+  },
+}
 
 // Helpers.
 
@@ -227,7 +311,7 @@ function fieldResult(input: { parent?: AgentEntry["parent"]; variant?: VariantCo
   return effectiveVariantPatch(input.parent, input.variant)[input.field]
 }
 
-function fieldOption(api: TuiPluginApi, input: { field: FieldDef; parent?: AgentEntry["parent"]; variant?: VariantConfig; mode: "parent" | "variant" }): TuiDialogSelectOption<string> {
+function fieldOption(api: TuiPluginApi, input: { field: FieldDef; parent?: AgentEntry["parent"]; variant?: VariantConfig; mode: "parent" | "variant" }): RichSelectOption<string> {
   const source = sourceLabel({ parent: input.parent, variant: input.variant, field: input.field.key, mode: input.mode })
   const value = fieldResult({ parent: input.parent, variant: input.variant, field: input.field.key, mode: input.mode })
   const restart = !isHotReloadField(input.field.key)
@@ -235,12 +319,13 @@ function fieldOption(api: TuiPluginApi, input: { field: FieldDef; parent?: Agent
   const status = input.mode === "parent"
     ? propagationEnabled(input.parent ?? {}, input.field.key)
     : inheritanceEnabled(input.variant ?? {}, input.field.key)
-  const footer = restart ? "restart" : input.mode === "parent" ? `prop ${status ? "on" : "off"}` : `inherit ${status ? "on" : "off"}`
+  const modeLabel = input.mode === "parent" ? "PROP" : "INH"
   return {
     title: input.field.label,
     value: input.field.key,
-    description: value !== undefined ? `${inherited ? "inherited: " : ""}${truncate(formatInputValue(value) ?? String(value), 70)}` : "not set",
-    footer,
+    description: value !== undefined ? `${inherited ? "inherited: " : ""}${truncate(formatInputValue(value) ?? String(value), 72)}` : "not set",
+    footer: status ? "Y" : "N",
+    ...(restart ? ({ bg: api.theme.current.diffRemovedBg } as object) : {}),
   }
 }
 
@@ -379,7 +464,7 @@ function showFieldAction(
     options: [
       { title: "Set/edit value", value: "set", description: "Submit an empty value to remove the local override" },
       { title: props.toggleLabel, value: "toggle", description: "Change inheritance/propagation for this field" },
-      { title: "Inspect field", value: "inspect", description: truncate(props.inspect().replace(/\n/g, "  "), 120) },
+      { title: "Field info/help", value: "inspect", description: truncate(props.inspect().replace(/\n/g, "  "), 120) },
       { title: "< Back", value: "back", description: "Return to field list" },
     ],
   }) as Promise<"set" | "toggle" | "inspect" | "back" | undefined>
@@ -388,25 +473,36 @@ function showFieldAction(
 function inspectParentField(agent: string, parent: AgentEntry["parent"], field: PatchField) {
   const def = fieldDef(field)
   const value = parent[field]
+  const help = FIELD_HELP[field]
   return [
     `${def?.label ?? field} (${agent} parent)`,
+    "",
+    help.purpose,
+    "",
+    help.parent,
     "",
     `Hot reload: ${isHotReloadField(field) ? "yes" : "no, restart required"}`,
     `Local value: ${value === undefined ? "not set" : formatInputValue(value)}`,
     `Propagates to variants: ${propagationEnabled(parent, field) ? "yes" : "no"}`,
     `Resulting parent value: ${value === undefined ? "not set" : formatInputValue(value)}`,
     "",
-    "Submitting an empty value in the editor removes the local override.",
+    help.empty,
+    "Submitting an empty value in the editor removes the local override. Escape cancels without changes.",
   ].join("\n")
 }
 
 function inspectVariantField(agent: string, key: string, parent: AgentEntry["parent"], variant: VariantConfig, field: PatchField) {
   const def = fieldDef(field)
+  const help = FIELD_HELP[field]
   const inherited = inheritedPatch(parent, variant)[field]
   const local = variant[field]
   const result = effectiveVariantPatch(parent, variant)[field]
   return [
     `${def?.label ?? field} (${variantName(agent, key, variant)})`,
+    "",
+    help.purpose,
+    "",
+    help.variant,
     "",
     `Hot reload: ${isHotReloadField(field) ? "yes" : "no, restart required"}`,
     `Local value: ${local === undefined ? "not set" : formatInputValue(local)}`,
@@ -416,7 +512,8 @@ function inspectVariantField(agent: string, key: string, parent: AgentEntry["par
     `Resulting value: ${result === undefined ? "not set" : formatInputValue(result)}`,
     `Source: ${local !== undefined ? "local variant override" : inherited !== undefined ? "inherited parent override" : "none"}`,
     "",
-    "Submitting an empty value in the editor removes the local override.",
+    help.empty,
+    "Submitting an empty value in the editor removes the local override. Escape cancels without changes.",
   ].join("\n")
 }
 
@@ -489,7 +586,7 @@ async function editParentFields(
 
   while (true) {
     const parent = (next.agents[agent] as AgentEntry).parent
-    const fieldOpts: TuiDialogSelectOption<string>[] = [
+    const fieldOpts: RichSelectOption<string>[] = [
       ...EDITABLE_FIELDS.map((field) => fieldOption(api, { field, parent, mode: "parent" })),
       { title: "Propagation: enable all", value: "__propagate_all__", description: "Allow parent values to flow to variants that accept inheritance" },
       { title: "Propagation: disable all", value: "__propagate_none__", description: "Keep parent overrides local to the parent" },
@@ -647,13 +744,13 @@ async function editVariant(api: TuiPluginApi, config: SidecarConfig, settings: W
     const nextEntry = next.agents[agent] as AgentEntry
     const parent = nextEntry.parent
     const target = nextEntry.variants[key] as VariantConfig & Record<string, unknown>
-    const fieldOpts: TuiDialogSelectOption<string>[] = [
+    const fieldOpts: RichSelectOption<string>[] = [
       ...EDITABLE_FIELDS.map((field) => fieldOption(api, { field, parent, variant: target, mode: "variant" })),
       {
         title: "Display name",
         value: "name",
         description: target.name ? String(target.name) : `default: ${agent}-${key}`,
-        footer: "restart",
+        ...({ bg: api.theme.current.diffRemovedBg } as object),
       },
       { title: "Inheritance: enable all", value: "__inherit_all__", description: "Accept all propagated parent overrides when no local value is set" },
       { title: "Inheritance: disable all", value: "__inherit_none__", description: "Use only this variant's local values" },
