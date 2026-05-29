@@ -1,0 +1,96 @@
+{
+  // Toggle route/model diagnostics. This can be changed from the wizard and
+  // takes effect immediately for future variant calls. Logs are written to
+  // ~/.config/opencode/agent-variants.debug.log.
+  "debug": false,
+
+  // Optional model shortcuts. Variants can use either a shortcut key like
+  // "light" or a full provider/model reference like "anthropic/claude-sonnet-4-6".
+  "models": {
+    "light": {
+      "model": "zai-coding-plan/glm-5.1",
+      "label": "GLM 5.1"
+    }
+
+    // "heavy": {
+    //   "model": "anthropic/claude-opus-4-5",
+    //   "label": "Opus 4.5"
+    // }
+  },
+
+  "agents": {
+    // Built-in agents are virtual-routed. The model sees general-light, but
+    // OpenCode executes native general to preserve the native prompt and permissions.
+    "general": {
+      // Disable the whole parent entry and all variants without deleting them.
+      // "disable": true,
+
+      "parent": {
+        // Parent fields apply only when this parent has at least one enabled variant.
+        "description_append": "Uses the default strongest model. Use for the hardest tasks."
+
+        // Optional parent overrides:
+        // "model": "heavy",
+        // "variant": "default",
+        // "temperature": 0.2,
+        // "top_p": 0.9,
+        // "prompt": "Replace the parent prompt/system prompt.",
+        // "prompt_prepend": "Text before the parent prompt/system prompt.",
+        // "prompt_append": "Text after the parent prompt/system prompt.",
+        // "description": "Replace the parent description.",
+        // "description_prepend": "Text before the parent description.",
+        // "options": { "reasoningEffort": "high" },
+        // "color": "primary"
+      },
+
+      "variants": {
+        "light": {
+          // Variant names default to parent-key, so this becomes general-light.
+          // "name": "general-cheap",
+          "model": "light",
+          "description_append": "Use {alias} for most tasks that do not need {parent}'s strongest model. Runs on {model_label}."
+
+          // Optional variant overrides:
+          // "variant": "default",
+          // "temperature": 0.1,
+          // "top_p": 0.95,
+          // "prompt": "Replace the prompt/system prompt for this variant only.",
+          // "prompt_prepend": "Text before this variant prompt/system prompt.",
+          // "prompt_append": "Text after this variant prompt/system prompt.",
+          // "description": "Replace the generated copy-of description.",
+          // "description_prepend": "Text before the generated description.",
+          // "options": { "reasoningEffort": "medium" },
+          // "color": "secondary",
+          // "disable": true
+        }
+      }
+    },
+
+    // Another built-in example.
+    "explore": {
+      "parent": {
+        "description_append": "Uses the default strongest model. Use for difficult investigations."
+      },
+      "variants": {
+        "light": {
+          "model": "light",
+          "description_append": "Use for most code search, reading, and exploration tasks."
+        }
+      }
+    },
+
+    // Config/markdown agents can be copied directly when they exist in OpenCode config.
+    // "frontend-designer": {
+    //   "parent": {
+    //     "description_append": "Uses the default strongest model. Use for high-quality frontend work."
+    //   },
+    //   "variants": {
+    //     "light": {
+    //       "name": "frontend-light",
+    //       "model": "light",
+    //       "description_append": "Use for routine frontend edits and reviews."
+    //     }
+    //   }
+    // }
+  }
+}

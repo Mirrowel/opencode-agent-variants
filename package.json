@@ -1,0 +1,60 @@
+{
+  "name": "opencode-agent-variants",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "OpenCode plugin for creating and managing model variants of agents",
+  "license": "MIT",
+  "main": "dist/server.js",
+  "types": "dist/server.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js"
+    },
+    "./server": {
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.js"
+    }
+  },
+  "files": [
+    "dist",
+    "docs/CONFIG.md",
+    "agent-variants.example.jsonc",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "agent",
+    "subagent",
+    "model",
+    "variants"
+  ],
+  "oc-plugin": [
+    "server",
+    "tui"
+  ],
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "npm run clean && tsc --outDir dist --declaration",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run typecheck && npm run build"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.14.39",
+    "comment-json": "^4.2.5",
+    "zod": "^4.1.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.8.0"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.14.0"
+  }
+}

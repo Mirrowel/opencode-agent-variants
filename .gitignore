@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Package artifacts
+*.tgz
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local OpenCode sidecar state
+agent-variants.jsonc
+agent-variants.jsonc.*.bak
+
+# Private planning notes for local agents only
+docs/PLAN.md
+docs/WALKTHROUGH.md
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
