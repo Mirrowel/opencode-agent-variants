@@ -27,6 +27,7 @@ agent-variants.jsonc.*.bak
 # Private planning notes for local agents only
 docs/PLAN.md
 docs/WALKTHROUGH.md
+docs/RELEASE.md
 
 # OS/editor files
 .DS_Store

@@ -2,33 +2,66 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches:
+      - main
+      - dev
+      - alpha
+      - beta
+      - rc
   workflow_dispatch:
     inputs:
-      tag:
-        description: "Existing tag to release, for example v0.1.0"
+      channel:
+        description: "Release channel"
         required: true
+        type: choice
+        default: dev
+        options:
+          - latest
+          - dev
+          - alpha
+          - beta
+          - rc
+          - canary
+      target_version:
+        description: "Optional stable base version override, for example 0.3.3"
+        required: false
         type: string
+        default: ""
+      version_bump:
+        description: "Override conventional-commit bump"
+        required: false
+        type: choice
+        default: auto
+        options:
+          - auto
+          - none
+          - patch
+          - minor
+          - major
+      force_release:
+        description: "Release even when stable auto-detection finds no releasable commits"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
   id-token: write
 
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.channel || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: Publish npm package and GitHub release
+  release:
+    name: Build, publish, and release
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v5
@@ -40,33 +73,141 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Check release intent
+        run: npm run release:intent:check
+
+      - name: Compute release version
+        id: version
+        env:
+          RELEASE_BRANCH: ${{ github.ref_name }}
+          RELEASE_CHANNEL: ${{ github.event.inputs.channel || '' }}
+          TARGET_VERSION: ${{ github.event.inputs.target_version || '' }}
+          VERSION_BUMP: ${{ github.event.inputs.version_bump || 'auto' }}
+          FORCE_RELEASE: ${{ github.event.inputs.force_release || 'false' }}
+        run: node scripts/compute-release-version.mjs
+
+      - name: No release needed
+        if: steps.version.outputs.should_release != 'true'
+        run: echo "No releasable changes detected for stable channel."
+
       - name: Typecheck
+        if: steps.version.outputs.should_release == 'true'
         run: npm run typecheck
 
       - name: Build
+        if: steps.version.outputs.should_release == 'true'
         run: npm run build
 
       - name: Verify package contents
+        if: steps.version.outputs.should_release == 'true'
         run: npm pack --dry-run
 
       - name: Check npm version
+        if: steps.version.outputs.should_release == 'true'
         id: npm-version
-        shell: bash
         run: |
-          VERSION="$(node -p "require('./package.json').version")"
-          NAME="$(node -p "require('./package.json').name")"
-          if npm view "$NAME@$VERSION" version >/dev/null 2>&1; then
+          if npm view "opencode-agent-variants@${{ steps.version.outputs.version }}" version >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Publish to npm
-        if: steps.npm-version.outputs.exists != 'true'
-        run: npm publish --provenance --access public
+        if: steps.version.outputs.should_release == 'true' && steps.npm-version.outputs.exists != 'true'
+        run: npm publish --provenance --access public --tag "${{ steps.version.outputs.npm_tag }}"
 
-      - name: Create GitHub release
+      - name: Install git-cliff
+        if: steps.version.outputs.should_release == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG_NAME: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-        run: gh release create "$TAG_NAME" --title "$TAG_NAME" --generate-notes
+        run: |
+          API_RESPONSE=$(curl -s -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/orhun/git-cliff/releases/latest)
+          LATEST_CLIFF_URL=$(echo "$API_RESPONSE" | jq -r '.assets[] | select(.name | endswith("x86_64-unknown-linux-gnu.tar.gz")) | .browser_download_url')
+          if [ -z "$LATEST_CLIFF_URL" ] || [ "$LATEST_CLIFF_URL" = "null" ]; then
+            echo "Could not find git-cliff release asset."
+            exit 1
+          fi
+          curl -L "$LATEST_CLIFF_URL" | tar xz
+          sudo mv git-cliff-*/git-cliff /usr/local/bin/
+
+      - name: Prepare git-cliff config
+        if: steps.version.outputs.should_release == 'true'
+        run: sed -i "s|{{ repository_url }}|https://github.com/${GITHUB_REPOSITORY}|g" .github/cliff.toml
+
+      - name: Generate release notes
+        if: steps.version.outputs.should_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PREVIOUS_TAG="${{ steps.version.outputs.previous_tag }}"
+          if [ -n "$PREVIOUS_TAG" ]; then
+            git-cliff --config .github/cliff.toml --github-repo "${{ github.repository }}" --strip all --output changes.md "$PREVIOUS_TAG..HEAD"
+            COMPARE_URL="https://github.com/${{ github.repository }}/compare/${PREVIOUS_TAG}...${{ steps.version.outputs.tag }}"
+          else
+            cat > changes.md <<'EOF'
+          ## Initial Release
+
+          This is the first release for this channel.
+          EOF
+            COMPARE_URL=""
+          fi
+
+          INSTALL="opencode plugin opencode-agent-variants --global"
+          if [ "${{ steps.version.outputs.npm_tag }}" != "latest" ]; then
+            INSTALL="opencode plugin opencode-agent-variants@${{ steps.version.outputs.npm_tag }} --global"
+          fi
+
+          cat > release-notes.md <<EOF
+          ## Package
+
+          | Field | Value |
+          | ----- | ----- |
+          | Version | \`${{ steps.version.outputs.version }}\` |
+          | npm tag | \`${{ steps.version.outputs.npm_tag }}\` |
+          | Channel | \`${{ steps.version.outputs.channel }}\` |
+          | Commit | [\`${GITHUB_SHA::7}\`](https://github.com/${{ github.repository }}/commit/${GITHUB_SHA}) |
+
+          ## Install
+
+          \`\`\`sh
+          $INSTALL
+          \`\`\`
+
+          ## Changes
+
+          $(cat changes.md)
+
+          EOF
+
+          if [ -n "$COMPARE_URL" ]; then
+            echo "**Full Changelog**: $COMPARE_URL" >> release-notes.md
+          fi
+
+      - name: Check GitHub release
+        if: steps.version.outputs.should_release == 'true'
+        id: github-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub release
+        if: steps.version.outputs.should_release == 'true' && steps.github-release.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          FLAGS=""
+          if [ "${{ steps.version.outputs.prerelease }}" = "true" ]; then
+            FLAGS="--prerelease"
+          else
+            FLAGS="--latest"
+          fi
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --target "$GITHUB_SHA" \
+            --title "${{ steps.version.outputs.tag }}" \
+            --notes-file release-notes.md \
+            $FLAGS

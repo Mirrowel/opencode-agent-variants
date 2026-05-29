@@ -6,6 +6,9 @@ on:
       - main
       - master
       - dev
+      - alpha
+      - beta
+      - rc
   pull_request:
   workflow_dispatch:
 
