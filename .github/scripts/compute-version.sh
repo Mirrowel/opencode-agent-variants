@@ -45,6 +45,11 @@ latest_prerelease_base() {
     | tail -n 1 || true
 }
 
+tag_points_at_head() {
+  local tag="$1"
+  [ -n "$tag" ] && [ "$(git rev-list -n 1 "$tag" 2>/dev/null || true)" = "$(git rev-parse HEAD)" ]
+}
+
 conventional_bump_since() {
   local tag="$1"
   local range="HEAD"
@@ -166,14 +171,20 @@ if [ "$channel" != "latest" ]; then
   prerelease="true"
   latest="false"
   base_version="$prerelease_base"
-  prerelease_number="$(next_prerelease_number "$package_name" "$base_version" "$channel")"
-  version="$base_version-$channel.$prerelease_number"
-  tag="v$version"
   previous_tag="$(latest_channel_tag "$channel")"
+  if tag_points_at_head "$previous_tag"; then
+    version="${previous_tag#v}"
+    tag="$previous_tag"
+    should_release="false"
+  else
+    prerelease_number="$(next_prerelease_number "$package_name" "$base_version" "$channel")"
+    version="$base_version-$channel.$prerelease_number"
+    tag="v$version"
+    should_release="true"
+  fi
   if [ -z "$previous_tag" ]; then
     previous_tag="$stable_tag"
   fi
-  should_release="true"
 else
   version="$stable_candidate"
   tag="v$version"
