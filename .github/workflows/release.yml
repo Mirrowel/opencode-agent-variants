@@ -95,6 +95,7 @@ jobs:
           TARGET_VERSION: ${{ github.event.inputs.target_version || '' }}
           VERSION_BUMP: ${{ github.event.inputs.version_bump || 'auto' }}
           FORCE_RELEASE: ${{ github.event.inputs.force_release || 'false' }}
+          REQUIRE_RELEVANT_CHANGES: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_release != 'true' && 'true' || 'false' }}
         run: bash .github/scripts/compute-version.sh
 
       - name: No release needed
