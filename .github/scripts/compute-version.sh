@@ -34,7 +34,7 @@ latest_stable_tag() {
 
 latest_channel_tag() {
   local channel="$1"
-  git tag --list "$channel/v*" | semver_sort | tail -n 1 || true
+  git tag --list "v[0-9]*.[0-9]*.[0-9]*-$channel.*" | semver_sort | tail -n 1 || true
 }
 
 conventional_bump_since() {
@@ -156,7 +156,7 @@ if [ "$channel" != "latest" ]; then
   base_version="$prerelease_base"
   prerelease_number="$(next_prerelease_number "$package_name" "$base_version" "$channel")"
   version="$base_version-$channel.$prerelease_number"
-  tag="$channel/v$version"
+  tag="v$version"
   previous_tag="$(latest_channel_tag "$channel")"
   if [ -z "$previous_tag" ]; then
     previous_tag="$stable_tag"

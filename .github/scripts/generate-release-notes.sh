@@ -137,13 +137,16 @@ fi
 
 compare_url=""
 if [ -n "$previous_tag" ]; then
-  compare_left="${previous_tag//\//%2F}"
-  compare_right="${tag//\//%2F}"
-  compare_url="https://github.com/$repo/compare/$compare_left...$compare_right"
+  compare_url="https://github.com/$repo/compare/$previous_tag...$tag"
 fi
 
-cat > release-notes.md <<EOF
-$experimental_note## Package
+: > release-notes.md
+if [ -n "$experimental_note" ]; then
+  printf '%s\n\n' "$experimental_note" >> release-notes.md
+fi
+
+cat >> release-notes.md <<EOF
+## Package
 
 | Field | Value |
 | ----- | ----- |
