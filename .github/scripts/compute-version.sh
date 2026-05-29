@@ -50,6 +50,23 @@ tag_points_at_head() {
   [ -n "$tag" ] && [ "$(git rev-list -n 1 "$tag" 2>/dev/null || true)" = "$(git rev-parse HEAD)" ]
 }
 
+release_relevant_changes() {
+  local previous_tag="$1"
+  local range=""
+  local changed_files
+  if [ -n "$previous_tag" ]; then
+    range="$previous_tag..HEAD"
+  fi
+
+  if [ -n "$range" ]; then
+    changed_files="$(git diff --name-only "$range")"
+  else
+    changed_files="$(git ls-tree -r --name-only HEAD)"
+  fi
+
+  printf '%s\n' "$changed_files" | grep -Eq '^(src/|README\.md$|LICENSE$|agent-variants\.example\.jsonc$|docs/CONFIG\.md$|package(-lock)?\.json$|tsconfig(\..*)?\.json$)'
+}
+
 conventional_bump_since() {
   local tag="$1"
   local range="HEAD"
@@ -194,6 +211,17 @@ else
   fi
 fi
 
+release_relevant="false"
+if release_relevant_changes "$previous_tag"; then
+  release_relevant="true"
+fi
+if [ "$force_release" = "true" ]; then
+  release_relevant="true"
+fi
+if [ "$release_relevant" != "true" ]; then
+  should_release="false"
+fi
+
 {
   echo "branch=$branch"
   echo "channel=$channel"
@@ -203,6 +231,7 @@ fi
   echo "tag=$tag"
   echo "previous_tag=$previous_tag"
   echo "prerelease_line=$prerelease_line"
+  echo "release_relevant=$release_relevant"
   echo "prerelease=$prerelease"
   echo "latest=$latest"
   echo "should_release=$should_release"
