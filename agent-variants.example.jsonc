@@ -4,6 +4,16 @@
   // ~/.config/opencode/agent-variants.debug.log.
   "debug": false,
 
+  // Wizard display preferences. These are changed from Debug & advanced.
+  "ui": {
+    "width": "large",
+    // Legacy preset/reference value. Presets are compact=32, normal=50,
+    // tall=68, max=100.
+    "height": "normal",
+    // Fine-grained maximum height percentage, clamped to 25-100.
+    "height_percent": 58
+  },
+
   // Optional model presets. Parent/variant model fields can use either a
   // preset key like "light" or a full provider/model reference like
   // "anthropic/claude-sonnet-4-6". Preset fields apply together, but local

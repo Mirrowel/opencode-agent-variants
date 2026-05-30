@@ -80,8 +80,15 @@ const ModelShortcut = z.object({
   options: z.record(z.string(), z.unknown()).optional(),
 })
 
+const UiSettings = z.object({
+  width: z.enum(["medium", "large", "xlarge"]).default("large"),
+  height: z.enum(["compact", "normal", "tall", "max"]).default("normal"),
+  height_percent: z.number().int().min(25).max(100).optional(),
+}).default({ width: "large", height: "normal" })
+
 export const SidecarConfig = z.object({
   debug: z.boolean().default(false),
+  ui: UiSettings,
   models: z.record(z.string(), ModelShortcut).default({}),
   agents: z.record(
     z.string(),
@@ -99,6 +106,7 @@ export type AgentPatch = z.infer<typeof Patch>
 export type ParentPatch = z.infer<typeof ParentPatch>
 export type VariantConfig = z.infer<typeof Variant>
 export type ModelShortcut = z.infer<typeof ModelShortcut>
+export type UiSettings = z.infer<typeof UiSettings>
 export type SidecarConfig = z.infer<typeof SidecarConfig>
 export type DiagnosticLevel = "error" | "warning" | "info"
 export type Diagnostic = {
@@ -181,7 +189,7 @@ export function debugLogPath(configDir = defaultConfigDir()) {
 }
 
 export function emptyConfig(): SidecarConfig {
-  return { debug: false, models: {}, agents: {} }
+  return { debug: false, ui: { width: "large", height: "normal" }, models: {}, agents: {} }
 }
 
 export function loadSidecar(filePath = defaultSidecarPath()) {

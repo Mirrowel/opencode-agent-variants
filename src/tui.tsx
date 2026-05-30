@@ -64,12 +64,23 @@ type WizardSettings = {
   restartReasons: string[]
 }
 type DialogSize = "medium" | "large" | "xlarge"
+type DialogHeight = "compact" | "normal" | "tall" | "max"
 type KeyContext = { event?: { preventDefault?: () => void; stopPropagation?: () => void } }
 
 // Constants.
 
 const BUILTIN_AGENT_KEYS = Object.keys(BUILTIN_AGENT_DESCRIPTIONS)
-const UI_SIZE_KV = "agent-variants.ui-size"
+const UI_SIZE_KV = "agent-variants.ui-width"
+const UI_HEIGHT_KV = "agent-variants.ui-height"
+const UI_HEIGHT_PERCENT_KV = "agent-variants.ui-height-percent"
+const HEIGHT_PERCENT_MIN = 25
+const HEIGHT_PERCENT_MAX = 100
+const HEIGHT_PRESETS: Array<{ label: DialogHeight; value: number; key: string }> = [
+  { label: "compact", value: 32, key: "1" },
+  { label: "normal", value: 50, key: "2" },
+  { label: "tall", value: 68, key: "3" },
+  { label: "max", value: 100, key: "4" },
+]
 const BUILTIN_AGENT_MODES: Record<string, AgentMode> = {
   build: "primary",
   plan: "primary",
@@ -272,8 +283,61 @@ function nextWizardDialogSize(api: TuiPluginApi): DialogSize {
   return "medium"
 }
 
+function wizardDialogHeight(api: TuiPluginApi): DialogHeight {
+  const value = api.kv.get<DialogHeight>(UI_HEIGHT_KV, "normal")
+  if (value === "compact" || value === "normal" || value === "tall" || value === "max") return value
+  return "normal"
+}
+
+function setWizardDialogHeight(api: TuiPluginApi, height: DialogHeight) {
+  api.kv.set(UI_HEIGHT_KV, height)
+}
+
+function clampHeightPercent(value: number) {
+  return Math.max(HEIGHT_PERCENT_MIN, Math.min(HEIGHT_PERCENT_MAX, Math.round(value)))
+}
+
+function heightPresetPercent(height: DialogHeight) {
+  return HEIGHT_PRESETS.find((preset) => preset.label === height)?.value ?? 50
+}
+
+function effectiveUiHeightPercent(ui: SidecarConfig["ui"]) {
+  return clampHeightPercent(ui.height_percent ?? heightPresetPercent(ui.height))
+}
+
+function wizardDialogHeightPercent(api: TuiPluginApi) {
+  const value = api.kv.get<number>(UI_HEIGHT_PERCENT_KV, 50)
+  return typeof value === "number" && Number.isFinite(value) ? clampHeightPercent(value) : 50
+}
+
+function setWizardDialogHeightPercent(api: TuiPluginApi, value: number) {
+  api.kv.set(UI_HEIGHT_PERCENT_KV, clampHeightPercent(value))
+}
+
 function useWizardDialogSize(api: TuiPluginApi) {
   createEffect(() => api.ui.dialog.setSize(wizardDialogSize(api)))
+}
+
+function useHidePromptCursor(api: TuiPluginApi) {
+  const editors = collectEditors(api.renderer.root)
+  const previous = editors.map((editor) => ({ editor, showCursor: editor.showCursor }))
+  for (const editor of editors) {
+    editor.showCursor = false
+  }
+  onCleanup(() => {
+    for (const item of previous) {
+      if (item.editor.isDestroyed) continue
+      item.editor.showCursor = item.showCursor
+    }
+  })
+}
+
+function collectEditors(root: { getChildren?: () => unknown[] }): Array<{ showCursor: boolean; isDestroyed?: boolean; getChildren?: () => unknown[] }> {
+  const children = typeof root.getChildren === "function" ? root.getChildren() : []
+  return [
+    ...(typeof (root as { showCursor?: unknown }).showCursor === "boolean" ? [root as { showCursor: boolean; isDestroyed?: boolean; getChildren?: () => unknown[] }] : []),
+    ...children.flatMap((child) => collectEditors(child as { getChildren?: () => unknown[] })),
+  ]
 }
 
 function shieldBindings(command: string, except: readonly string[] = []) {
@@ -291,6 +355,11 @@ function blockKey(ctx: KeyContext | undefined) {
 function cappedHeight(count: number, max: number, min = 1) {
   if (count <= 0) return min
   return Math.max(min, Math.min(count, max))
+}
+
+function wizardMaxRows(api: TuiPluginApi, terminalHeight: number, chromeRows: number, minRows: number) {
+  const usable = Math.max(minRows, terminalHeight - chromeRows)
+  return Math.max(minRows, Math.min(usable, Math.floor(terminalHeight * (wizardDialogHeightPercent(api) / 100))))
 }
 
 function menuTitleWidth(size: DialogSize, options: readonly { title: string }[]) {
@@ -696,8 +765,9 @@ function MenuDialog<Value>(props: {
 }) {
   const theme = () => props.api.theme.current
   useWizardDialogSize(props.api)
+  useHidePromptCursor(props.api)
   const dimensions = useTerminalDimensions()
-  const listHeight = createMemo(() => cappedHeight(props.options.length, Math.max(6, dimensions().height - 14)))
+  const listHeight = createMemo(() => cappedHeight(props.options.length, wizardMaxRows(props.api, dimensions().height, 14, 6)))
   const titleWidth = createMemo(() => menuTitleWidth(wizardDialogSize(props.api), props.options))
   let scroll: ScrollBoxRenderable | undefined
   const popMode = props.api.mode.push("agent-variants.dialog")
@@ -814,8 +884,9 @@ function FieldListDialog(props: {
 }) {
   const theme = () => props.api.theme.current
   useWizardDialogSize(props.api)
+  useHidePromptCursor(props.api)
   const dimensions = useTerminalDimensions()
-  const listHeight = createMemo(() => cappedHeight(props.options.length, Math.max(8, dimensions().height - 15)))
+  const listHeight = createMemo(() => cappedHeight(props.options.length, wizardMaxRows(props.api, dimensions().height, 15, 8)))
   let scroll: ScrollBoxRenderable | undefined
   const popMode = props.api.mode.push("agent-variants.dialog")
   const [selected, setSelected] = createSignal(Math.max(0, props.options.findIndex((option) => option.value === props.current)))
@@ -1022,13 +1093,149 @@ function showInfo(api: TuiPluginApi, props: { title: string; message: string }):
   })
 }
 
+type HeightSliderChoice = { action: "save" | "custom"; value: number }
+
+async function showHeightSlider(api: TuiPluginApi, config: SidecarConfig): Promise<number | undefined> {
+  let current = effectiveUiHeightPercent(config.ui)
+  while (true) {
+    const choice = await showHeightSliderOnce(api, current)
+    if (!choice) return undefined
+    current = choice.value
+    if (choice.action === "save") return current
+
+    const input = await showPrompt(api.ui, {
+      title: "Wizard UI height percent",
+      placeholder: `${HEIGHT_PERCENT_MIN}-${HEIGHT_PERCENT_MAX}`,
+      value: String(current),
+    })
+    if (input === undefined) continue
+    const value = Number(input)
+    if (!Number.isFinite(value)) {
+      await showAlert(api.ui, { title: "Invalid height", message: `Enter a number from ${HEIGHT_PERCENT_MIN} to ${HEIGHT_PERCENT_MAX}.` })
+      continue
+    }
+    current = clampHeightPercent(value)
+  }
+}
+
+function showHeightSliderOnce(api: TuiPluginApi, current: number): Promise<HeightSliderChoice | undefined> {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = (value: HeightSliderChoice | undefined, clear = true) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+      if (clear) api.ui.dialog.clear()
+    }
+    api.ui.dialog.replace(
+      () => <HeightSliderDialog api={api} current={current} onDone={done} />,
+      () => done(undefined, false),
+    )
+  })
+}
+
+function HeightSliderDialog(props: { api: TuiPluginApi; current: number; onDone: (value: HeightSliderChoice | undefined) => void }) {
+  const theme = () => props.api.theme.current
+  useWizardDialogSize(props.api)
+  useHidePromptCursor(props.api)
+  const [value, setValue] = createSignal(clampHeightPercent(props.current))
+  const popMode = props.api.mode.push("agent-variants.dialog")
+  const commandPrefix = `agent-variants.height.${Math.random().toString(36).slice(2)}`
+  const setPreset = (height: DialogHeight) => setValue(heightPresetPercent(height))
+  const move = (delta: number) => setValue((current) => clampHeightPercent(current + delta))
+  const sliderWidth = createMemo(() => wizardDialogSize(props.api) === "xlarge" ? 64 : wizardDialogSize(props.api) === "large" ? 48 : 34)
+  const sliderCells = createMemo(() => {
+    const width = sliderWidth()
+    const selected = Math.round(((value() - HEIGHT_PERCENT_MIN) / (HEIGHT_PERCENT_MAX - HEIGHT_PERCENT_MIN)) * (width - 1))
+    const presetPositions = new Map(HEIGHT_PRESETS.map((preset) => [Math.round(((preset.value - HEIGHT_PERCENT_MIN) / (HEIGHT_PERCENT_MAX - HEIGHT_PERCENT_MIN)) * (width - 1)), preset.label]))
+    return Array.from({ length: width }, (_, index) => {
+      const current = index === selected
+      const preset = presetPositions.get(index)
+      return {
+        char: current ? "●" : preset ? "│" : index < selected ? "━" : "─",
+        color: current ? theme().primary : preset ? theme().accent : index < selected ? theme().success : theme().textMuted,
+      }
+    })
+  })
+  const unregister = props.api.keymap.registerLayer({
+    priority: 10000,
+    commands: [
+      { name: `${commandPrefix}.left`, title: "Lower height", run: (ctx: KeyContext) => { blockKey(ctx); move(-1) } },
+      { name: `${commandPrefix}.right`, title: "Raise height", run: (ctx: KeyContext) => { blockKey(ctx); move(1) } },
+      { name: `${commandPrefix}.down`, title: "Lower height faster", run: (ctx: KeyContext) => { blockKey(ctx); move(-5) } },
+      { name: `${commandPrefix}.up`, title: "Raise height faster", run: (ctx: KeyContext) => { blockKey(ctx); move(5) } },
+      { name: `${commandPrefix}.compact`, title: "Compact preset", run: (ctx: KeyContext) => { blockKey(ctx); setPreset("compact") } },
+      { name: `${commandPrefix}.normal`, title: "Normal preset", run: (ctx: KeyContext) => { blockKey(ctx); setPreset("normal") } },
+      { name: `${commandPrefix}.tall`, title: "Tall preset", run: (ctx: KeyContext) => { blockKey(ctx); setPreset("tall") } },
+      { name: `${commandPrefix}.max`, title: "Max preset", run: (ctx: KeyContext) => { blockKey(ctx); setPreset("max") } },
+      { name: `${commandPrefix}.custom`, title: "Custom percent", run: (ctx: KeyContext) => { blockKey(ctx); props.onDone({ action: "custom", value: value() }) } },
+      { name: `${commandPrefix}.save`, title: "Save height", run: (ctx: KeyContext) => { blockKey(ctx); props.onDone({ action: "save", value: value() }) } },
+      { name: `${commandPrefix}.back`, title: "Back", run: (ctx: KeyContext) => { blockKey(ctx); props.onDone(undefined) } },
+      { name: `${commandPrefix}.shield`, title: "Block background input", run: blockKey },
+    ],
+    bindings: [
+      { key: "left", cmd: `${commandPrefix}.left`, desc: "Lower height" },
+      { key: "right", cmd: `${commandPrefix}.right`, desc: "Raise height" },
+      { key: "down", cmd: `${commandPrefix}.down`, desc: "Lower height faster" },
+      { key: "up", cmd: `${commandPrefix}.up`, desc: "Raise height faster" },
+      { key: "1", cmd: `${commandPrefix}.compact`, desc: "Compact preset" },
+      { key: "2", cmd: `${commandPrefix}.normal`, desc: "Normal preset" },
+      { key: "3", cmd: `${commandPrefix}.tall`, desc: "Tall preset" },
+      { key: "4", cmd: `${commandPrefix}.max`, desc: "Max preset" },
+      { key: "c", cmd: `${commandPrefix}.custom`, desc: "Custom percent" },
+      { key: "enter", cmd: `${commandPrefix}.save`, desc: "Save height" },
+      { key: "escape", cmd: `${commandPrefix}.back`, desc: "Back" },
+      ...shieldBindings(`${commandPrefix}.shield`, ["1", "2", "3", "4", "c"]),
+    ],
+  })
+  onCleanup(() => {
+    unregister()
+    popMode()
+  })
+
+  return (
+    <box flexDirection="column" width="100%" paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1}>
+      <box flexDirection="row" justifyContent="space-between" width="100%" marginBottom={1}>
+        <text fg={theme().accent}><b>Wizard UI height</b></text>
+        <text fg={theme().textMuted}>esc</text>
+      </box>
+      <box flexDirection="row" justifyContent="space-between" width="100%" marginBottom={1}>
+        <text fg={theme().textMuted}>Current</text>
+        <text fg={theme().primary}><b>{value()}%</b></text>
+      </box>
+      <box flexDirection="row" width="100%" marginBottom={1}>
+        <text fg={theme().textMuted}>{HEIGHT_PERCENT_MIN}% </text>
+        <For each={sliderCells()}>{(cell) => <text fg={cell.color}>{cell.char}</text>}</For>
+        <text fg={theme().textMuted}> {HEIGHT_PERCENT_MAX}%</text>
+      </box>
+      <box flexDirection="column" gap={0} marginBottom={1}>
+        <For each={HEIGHT_PRESETS}>
+          {(preset) => <text fg={value() === preset.value ? theme().primary : theme().textMuted}>{preset.key} {preset.label}: {preset.value}%</text>}
+        </For>
+      </box>
+      <box flexDirection="column" gap={0} marginBottom={1}>
+        <text fg={theme().textMuted}>left/right adjust 1%</text>
+        <text fg={theme().textMuted}>up/down adjust 5%</text>
+        <text fg={theme().textMuted}>c custom percent</text>
+      </box>
+      <box flexDirection="row" justifyContent="space-between" width="100%">
+        <text fg={theme().textMuted}>enter save</text>
+        <box paddingLeft={3} paddingRight={3} backgroundColor={theme().primary} onMouseUp={() => props.onDone({ action: "save", value: value() })}>
+          <text fg={theme().background}><b>save</b></text>
+        </box>
+      </box>
+    </box>
+  )
+}
+
 function InfoDialog(props: { api: TuiPluginApi; title: string; message: string; onDone: () => void }) {
   const theme = () => props.api.theme.current
   useWizardDialogSize(props.api)
+  useHidePromptCursor(props.api)
   const dimensions = useTerminalDimensions()
   const popMode = props.api.mode.push("agent-variants.dialog")
   const lines = createMemo(() => props.message.split(/\r?\n/))
-  const bodyHeight = createMemo(() => cappedHeight(lines().length, Math.max(8, dimensions().height - 13), 4))
+  const bodyHeight = createMemo(() => wizardMaxRows(props.api, dimensions().height, 13, 4))
   let scroll: ScrollBoxRenderable | undefined
   const page = () => Math.max(1, (scroll?.height ?? bodyHeight()) - 1)
   const commandPrefix = `agent-variants.info.${Math.random().toString(36).slice(2)}`
@@ -1086,7 +1293,7 @@ function InfoDialog(props: { api: TuiPluginApi; title: string; message: string; 
       </box>
       </scrollbox>
       <box flexDirection="row" justifyContent="space-between" width="100%">
-        <text fg={theme().textMuted}>{lines().length > bodyHeight() ? "up/down scroll" : ""}</text>
+        <text fg={theme().textMuted}>up/down scroll</text>
         <box paddingLeft={3} paddingRight={3} backgroundColor={theme().primary} onMouseUp={props.onDone}>
           <text fg={theme().background}><b>ok</b></text>
         </box>
@@ -1726,6 +1933,29 @@ async function toggleDebug(api: TuiPluginApi, config: SidecarConfig): Promise<Si
   return next
 }
 
+async function updateUiSettings(api: TuiPluginApi, config: SidecarConfig, ui: Partial<SidecarConfig["ui"]>): Promise<SidecarConfig> {
+  const next = structuredClone(config)
+  next.ui = { ...next.ui, ...ui }
+  setWizardDialogSize(api, next.ui.width)
+  setWizardDialogHeight(api, next.ui.height)
+  setWizardDialogHeightPercent(api, effectiveUiHeightPercent(next.ui))
+  try {
+    saveSidecar(next, defaultSidecarPath())
+  } catch (err) {
+    await showAlert(api.ui, { title: "Save failed", message: String(err instanceof Error ? err.message : err) })
+    setWizardDialogSize(api, config.ui.width)
+    setWizardDialogHeight(api, config.ui.height)
+    setWizardDialogHeightPercent(api, effectiveUiHeightPercent(config.ui))
+    return config
+  }
+  api.ui.toast({
+    variant: "info",
+    title: "Wizard UI updated",
+    message: `Width ${next.ui.width}, height ${effectiveUiHeightPercent(next.ui)}%.`,
+  })
+  return next
+}
+
 async function runDiagnostics(api: TuiPluginApi, config: SidecarConfig): Promise<void> {
   const generatedAliases = generatedAliasSet(config)
   const diagnostics = diagnoseConfig(config, {
@@ -2037,10 +2267,16 @@ async function debugAdvancedMenu(api: TuiPluginApi, config: SidecarConfig, setti
     { title: "View debug log", value: "view-log", description: "Show recent agent-variants.debug.log entries" },
     { title: "Clear debug log", value: "clear-log", description: "Empty agent-variants.debug.log" },
     {
-      title: `Wizard UI size: ${wizardDialogSize(api)}`,
+      title: `Wizard UI width: ${wizardDialogSize(api)}`,
       value: "ui-size",
       description: "Cycle dialog width: medium, large, xlarge",
-      help: "Controls the width of Agent Variants custom wizard screens. Large is the default; xlarge is useful for long descriptions on wide terminals.",
+      help: "Controls the width of Agent Variants custom wizard screens. OpenCode currently exposes fixed widths only: medium = 60 columns, large = 88 columns, xlarge = 116 columns.",
+    },
+    {
+      title: `Wizard UI height: ${wizardDialogHeightPercent(api)}%`,
+      value: "ui-height",
+      description: "Adjust max height with slider or preset reference points",
+      help: `Controls the maximum height of Agent Variants custom wizard screens. Presets: ${HEIGHT_PRESETS.map((preset) => `${preset.label}=${preset.value}%`).join(", ")}. Short menus stay compact; long info screens can use the extra space.`,
     },
     {
       title: `Parent picker filter: ${settings.subagentCapableOnly ? "subagent-capable only" : "all agents"}`,
@@ -2061,9 +2297,12 @@ async function debugAdvancedMenu(api: TuiPluginApi, config: SidecarConfig, setti
       await clearDebugLog(api)
       return debugAdvancedMenu(api, config, settings)
     case "ui-size":
-      setWizardDialogSize(api, nextWizardDialogSize(api))
-      api.ui.toast({ variant: "info", title: "Wizard UI size updated", message: `Using ${wizardDialogSize(api)} dialogs.` })
-      return debugAdvancedMenu(api, config, settings)
+      return debugAdvancedMenu(api, await updateUiSettings(api, config, { width: nextWizardDialogSize(api) }), settings)
+    case "ui-height": {
+      const height = await showHeightSlider(api, config)
+      if (height === undefined) return debugAdvancedMenu(api, config, settings)
+      return debugAdvancedMenu(api, await updateUiSettings(api, config, { height_percent: height }), settings)
+    }
     case "filter":
       settings.subagentCapableOnly = !settings.subagentCapableOnly
       api.ui.toast({
@@ -2114,6 +2353,9 @@ function registerConfigureCommand(api: TuiPluginApi, run: () => Promise<void>) {
 const tui: TuiPlugin = async (api) => {
   const unregister = registerConfigureCommand(api, async () => {
     const config = loadSidecar(defaultSidecarPath())
+    setWizardDialogSize(api, config.ui.width)
+    setWizardDialogHeight(api, config.ui.height)
+    setWizardDialogHeightPercent(api, effectiveUiHeightPercent(config.ui))
     await mainMenu(api, config, { subagentCapableOnly: true, hotChanges: false, restartReasons: [] })
   })
 
