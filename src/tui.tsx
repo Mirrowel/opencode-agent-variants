@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, writeFileSync } from "node:fs"
 import type { TuiPlugin, TuiPluginApi, TuiDialogSelectOption } from "@opencode-ai/plugin/tui"
+import { createMemo, createSignal, For, onCleanup, Show } from "solid-js"
 import {
   BUILTIN_AGENT_DESCRIPTIONS,
   debugLogPath,
@@ -27,7 +28,25 @@ import {
 
 type AgentEntry = SidecarConfig["agents"][string]
 type ModelEntry = SidecarConfig["models"][string]
-type RichSelectOption<Value = unknown> = TuiDialogSelectOption<Value>
+type FieldListChoice =
+  | { action: "select"; value: string }
+  | { action: "toggle"; value: string }
+  | { action: "inspect"; value: string }
+type FieldListOption = {
+  title: string
+  value: string
+  description: string
+  restart?: boolean
+  channel?: boolean
+  channelLabel?: string
+  channelEnabled?: boolean
+  kind?: "field" | "action"
+}
+type ResolvedModel = {
+  providerName: string
+  modelName: string
+  variants: string[]
+}
 
 type WizardSettings = {
   subagentCapableOnly: boolean
@@ -46,6 +65,26 @@ const BUILTIN_AGENT_MODES: Record<string, AgentMode> = {
   scout: "subagent",
 }
 const THEME_COLORS = ["primary", "secondary", "accent", "success", "warning", "error", "info"] as const
+const PRESET_COLORS = [
+  ["slate", "#64748B"],
+  ["red", "#EF4444"],
+  ["orange", "#F97316"],
+  ["amber", "#F59E0B"],
+  ["yellow", "#EAB308"],
+  ["lime", "#84CC16"],
+  ["green", "#22C55E"],
+  ["emerald", "#10B981"],
+  ["teal", "#14B8A6"],
+  ["cyan", "#06B6D4"],
+  ["sky", "#0EA5E9"],
+  ["blue", "#3B82F6"],
+  ["indigo", "#6366F1"],
+  ["violet", "#8B5CF6"],
+  ["purple", "#A855F7"],
+  ["fuchsia", "#D946EF"],
+  ["pink", "#EC4899"],
+  ["rose", "#F43F5E"],
+] as const
 
 interface FieldDef {
   key: PatchField
@@ -213,12 +252,54 @@ function modelOptions(api: TuiPluginApi, config: SidecarConfig): TuiDialogSelect
   return opts
 }
 
+function resolveModelReference(api: TuiPluginApi, config: SidecarConfig, model: unknown): ResolvedModel | undefined {
+  if (typeof model !== "string" || model.length === 0) return undefined
+  const modelRef = (config.models[model] as ModelEntry | undefined)?.model ?? model
+  const slash = modelRef.indexOf("/")
+  if (slash === -1) return undefined
+  const providerID = modelRef.slice(0, slash)
+  const modelID = modelRef.slice(slash + 1)
+  const provider = api.state.provider.find((item) => item.id === providerID)
+  const providerModel = provider?.models[modelID]
+  if (!provider || !providerModel) return undefined
+  return {
+    providerName: provider.name,
+    modelName: providerModel.name,
+    variants: Object.keys(providerModel.variants ?? {}),
+  }
+}
+
+function modelVariantOptions(api: TuiPluginApi, config: SidecarConfig, model: unknown): TuiDialogSelectOption<string>[] {
+  const resolved = resolveModelReference(api, config, model)
+  const opts: TuiDialogSelectOption<string>[] = [
+    { title: "Default", value: "__remove__", description: "Remove this local model variant override", category: "Default" },
+  ]
+  if (resolved) for (const variant of resolved.variants) {
+    opts.push({ title: variant, value: variant, description: `${resolved.modelName} via ${resolved.providerName}`, category: "Known variants" })
+  }
+  opts.push({
+    title: "Custom variant...",
+    value: "__custom__",
+    description: resolved ? "Type a provider-specific variant manually" : "No concrete model selected; type a variant manually",
+    category: "Custom",
+  })
+  return opts
+}
+
 function colorOptions(): TuiDialogSelectOption<string>[] {
   const opts: TuiDialogSelectOption<string>[] = THEME_COLORS.map((c) => ({
     title: c,
     value: c,
     category: "Theme colors",
   }))
+  for (const [name, value] of PRESET_COLORS) {
+    opts.push({
+      title: name,
+      value,
+      description: value,
+      category: "Preset colors",
+    })
+  }
   opts.push({
     title: "Custom hex...",
     value: "__custom__",
@@ -311,21 +392,20 @@ function fieldResult(input: { parent?: AgentEntry["parent"]; variant?: VariantCo
   return effectiveVariantPatch(input.parent, input.variant)[input.field]
 }
 
-function fieldOption(api: TuiPluginApi, input: { field: FieldDef; parent?: AgentEntry["parent"]; variant?: VariantConfig; mode: "parent" | "variant" }): RichSelectOption<string> {
+function fieldListOption(input: { field: FieldDef; parent?: AgentEntry["parent"]; variant?: VariantConfig; mode: "parent" | "variant" }): FieldListOption {
   const source = sourceLabel({ parent: input.parent, variant: input.variant, field: input.field.key, mode: input.mode })
   const value = fieldResult({ parent: input.parent, variant: input.variant, field: input.field.key, mode: input.mode })
-  const restart = !isHotReloadField(input.field.key)
   const inherited = source === "SRC:inherit"
-  const status = input.mode === "parent"
-    ? propagationEnabled(input.parent ?? {}, input.field.key)
-    : inheritanceEnabled(input.variant ?? {}, input.field.key)
-  const modeLabel = input.mode === "parent" ? "PROP" : "INH"
   return {
     title: input.field.label,
     value: input.field.key,
-    description: value !== undefined ? `${inherited ? "inherited: " : ""}${truncate(formatInputValue(value) ?? String(value), 72)}` : "not set",
-    footer: status ? "Y" : "N",
-    ...(restart ? ({ bg: api.theme.current.diffRemovedBg } as object) : {}),
+    description: value !== undefined ? `${inherited ? "inherited: " : ""}${truncate(formatInputValue(value) ?? String(value), 76)}` : "not set",
+    restart: !isHotReloadField(input.field.key),
+    channel: true,
+    channelLabel: input.mode === "parent" ? "propagation" : "inheritance",
+    channelEnabled: input.mode === "parent"
+      ? propagationEnabled(input.parent ?? {}, input.field.key)
+      : inheritanceEnabled(input.variant ?? {}, input.field.key),
   }
 }
 
@@ -364,6 +444,118 @@ function showSelect<Value>(
       () => done(undefined),
     )
   })
+}
+
+function showFieldList(api: TuiPluginApi, props: { title: string; options: FieldListOption[]; current?: string }): Promise<FieldListChoice | undefined> {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = (value: FieldListChoice | undefined, clear = true) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+      if (clear) api.ui.dialog.clear()
+    }
+    api.ui.dialog.replace(
+      () => <FieldListDialog api={api} title={props.title} options={props.options} current={props.current} onDone={done} />,
+      () => done(undefined, false),
+    )
+  })
+}
+
+function FieldListDialog(props: {
+  api: TuiPluginApi
+  title: string
+  options: FieldListOption[]
+  current?: string
+  onDone: (value: FieldListChoice | undefined) => void
+}) {
+  const theme = () => props.api.theme.current
+  const [selected, setSelected] = createSignal(Math.max(0, props.options.findIndex((option) => option.value === props.current)))
+  const current = createMemo(() => props.options[selected()] ?? props.options[0])
+  const move = (delta: number) => {
+    setSelected((value) => Math.max(0, Math.min(props.options.length - 1, value + delta)))
+  }
+  const choose = (action: FieldListChoice["action"] = "select") => {
+    const option = current()
+    if (!option) return
+    if (action !== "select" && option.kind === "action") return
+    if (action !== "select" && !option.channel) return
+    props.onDone({ action, value: option.value })
+  }
+  const commandPrefix = `agent-variants.field-list.${Math.random().toString(36).slice(2)}`
+  const unregister = props.api.keymap.registerLayer({
+    priority: 10000,
+    commands: [
+      { name: `${commandPrefix}.up`, title: "Previous field", run: () => move(-1) },
+      { name: `${commandPrefix}.down`, title: "Next field", run: () => move(1) },
+      { name: `${commandPrefix}.select`, title: "Select field", run: () => choose("select") },
+      { name: `${commandPrefix}.toggle`, title: "Toggle inheritance", run: () => choose("toggle") },
+      { name: `${commandPrefix}.inspect`, title: "Field info/help", run: () => choose("inspect") },
+      { name: `${commandPrefix}.back`, title: "Back", run: () => props.onDone(undefined) },
+    ],
+    bindings: [
+      { key: "up", cmd: `${commandPrefix}.up`, desc: "Previous field" },
+      { key: "ctrl+p", cmd: `${commandPrefix}.up`, desc: "Previous field" },
+      { key: "down", cmd: `${commandPrefix}.down`, desc: "Next field" },
+      { key: "ctrl+n", cmd: `${commandPrefix}.down`, desc: "Next field" },
+      { key: "enter", cmd: `${commandPrefix}.select`, desc: "Select field" },
+      { key: "space", cmd: `${commandPrefix}.toggle`, desc: "Toggle inheritance/propagation" },
+      { key: "i", cmd: `${commandPrefix}.inspect`, desc: "Field info/help" },
+      { key: "escape", cmd: `${commandPrefix}.back`, desc: "Back" },
+    ],
+  })
+  onCleanup(unregister)
+
+  return (
+    <box flexDirection="column" width="100%" paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1}>
+      <box flexDirection="row" justifyContent="space-between" width="100%" marginBottom={1}>
+        <text fg={theme().text}><b>{props.title}</b></text>
+        <text fg={theme().textMuted} onMouseUp={() => props.onDone(undefined)}>esc</text>
+      </box>
+      <box flexDirection="column" gap={0} marginBottom={1}>
+        <box flexDirection="row" gap={3}>
+          <text fg={theme().textMuted}>enter edit</text>
+          <text fg={theme().textMuted}>space toggle</text>
+          <text fg={theme().textMuted}>i help</text>
+        </box>
+        <box flexDirection="row" gap={1}>
+          <text fg={theme().success}>■</text>
+          <text fg={theme().textMuted}>inherits/propagates</text>
+          <text fg={theme().error}>■</text>
+          <text fg={theme().textMuted}>blocked</text>
+        </box>
+      </box>
+      <box flexDirection="column" gap={0}>
+        <For each={props.options}>
+          {(option, index) => {
+            const active = createMemo(() => selected() === index())
+            const fg = createMemo(() => active() ? theme().background : option.restart ? theme().error : theme().text)
+            const valueFg = createMemo(() => active() ? theme().background : option.description.startsWith("inherited:") ? theme().success : option.description === "not set" ? theme().textMuted : theme().textMuted)
+            return (
+              <box
+                flexDirection="row"
+                width="100%"
+                gap={1}
+                paddingLeft={1}
+                paddingRight={1}
+                backgroundColor={active() ? theme().primary : theme().backgroundPanel}
+                onMouseOver={() => setSelected(index())}
+                onMouseUp={() => props.onDone({ action: "select", value: option.value })}
+              >
+                <text width={24} flexShrink={0} fg={fg()} wrapMode="none"><b>{option.title}</b></text>
+                <text flexGrow={1} fg={valueFg()} wrapMode="none" overflow="hidden">{option.description}</text>
+                <Show when={option.channel}>
+                  <box width={3} flexShrink={0} justifyContent="center">
+                    <text fg={option.channelEnabled ? theme().success : theme().error}>■</text>
+                  </box>
+                </Show>
+              </box>
+            )
+          }}
+        </For>
+      </box>
+    </box>
+  )
 }
 
 function showPrompt(
@@ -583,18 +775,21 @@ async function editParentFields(
 ): Promise<SidecarConfig> {
   const next = structuredClone(config)
   if (!next.agents[agent]) next.agents[agent] = { parent: {}, variants: {} }
+  let selectedField: string | undefined = EDITABLE_FIELDS[0]?.key
 
   while (true) {
     const parent = (next.agents[agent] as AgentEntry).parent
-    const fieldOpts: RichSelectOption<string>[] = [
-      ...EDITABLE_FIELDS.map((field) => fieldOption(api, { field, parent, mode: "parent" })),
-      { title: "Propagation: enable all", value: "__propagate_all__", description: "Allow parent values to flow to variants that accept inheritance" },
-      { title: "Propagation: disable all", value: "__propagate_none__", description: "Keep parent overrides local to the parent" },
-      { title: "< Back", value: "__back__", description: "Return to main menu" },
+    const fieldOpts: FieldListOption[] = [
+      ...EDITABLE_FIELDS.map((field) => fieldListOption({ field, parent, mode: "parent" })),
+      { title: "Propagation: enable all", value: "__propagate_all__", description: "Share all parent parameters", kind: "action" },
+      { title: "Propagation: disable all", value: "__propagate_none__", description: "Keep parent parameters local", kind: "action" },
+      { title: "< Back", value: "__back__", description: "Return to main menu", kind: "action" },
     ]
 
-    const field = await showSelect(api.ui, { title: `Edit parent fields - ${agent}`, options: fieldOpts })
+    const pickedField = await showFieldList(api, { title: `Edit parent fields - ${agent}`, options: fieldOpts, current: selectedField })
+    const field = pickedField?.value
     if (!field || field === "__back__") return next
+    selectedField = field
 
     if (field === "__propagate_all__" || field === "__propagate_none__") {
       parent.propagate = Object.fromEntries(PATCH_FIELDS.map((key) => [key, field === "__propagate_all__"]))
@@ -606,26 +801,21 @@ async function editParentFields(
 
     const picked = fieldDef(field)
     if (!picked) continue
-    const action = await showFieldAction(api, {
-      title: `${picked.label} - ${agent}`,
-      inspect: () => inspectParentField(agent, parent, picked.key),
-      toggleLabel: `Toggle propagation (${propagationEnabled(parent, picked.key) ? "on" : "off"})`,
-    })
-    if (!action || action === "back") continue
-    if (action === "inspect") {
+    if (pickedField.action === "inspect") {
       await showAlert(api.ui, { title: picked.label, message: inspectParentField(agent, parent, picked.key) })
       continue
     }
-    if (action === "toggle") {
+    if (pickedField.action === "toggle") {
       parent.propagate = { ...(parent.propagate ?? {}), [picked.key]: !propagationEnabled(parent, picked.key) }
       markFieldChange(settings, picked.key, `${agent}: ${picked.label} propagation requires restart.`)
       if (!isHotReloadField(picked.key)) await warnRestartField(api, picked.label, "Propagation for this field affects cached task-list/UI metadata.")
       continue
     }
-
-    const value = await promptForField(api, field, formatInputValue(parent[picked.key]))
+    const value = await promptForField(api, field, formatInputValue(parent[picked.key]), { config: next, model: parent.model })
     if (value === undefined) continue
+    const previous = parent[picked.key]
     setField(parent as Record<string, unknown>, picked.key, value)
+    if (picked.key === "model" && previous !== value) delete parent.variant
     markFieldChange(settings, picked.key, `${agent}: ${picked.label} requires restart.`)
     if (!isHotReloadField(picked.key)) await warnRestartField(api, picked.label, "This field is stored in OpenCode's cached agent/task-list metadata.")
   }
@@ -706,7 +896,7 @@ async function editVariantFields(
     })
     if (!want) continue
 
-    const value = await promptForField(api, field.key, formatInputValue(variant[field.key]))
+    const value = await promptForField(api, field.key, formatInputValue(variant[field.key]), { config, model: variant.model })
     if (value !== undefined && value !== "") {
       variant[field.key] = value
     }
@@ -740,33 +930,26 @@ async function editVariant(api: TuiPluginApi, config: SidecarConfig, settings: W
   if (!key) return config
 
   const next = structuredClone(config)
+  let selectedField: string | undefined = EDITABLE_FIELDS[0]?.key
   while (true) {
     const nextEntry = next.agents[agent] as AgentEntry
     const parent = nextEntry.parent
     const target = nextEntry.variants[key] as VariantConfig & Record<string, unknown>
-    const fieldOpts: RichSelectOption<string>[] = [
-      ...EDITABLE_FIELDS.map((field) => fieldOption(api, { field, parent, variant: target, mode: "variant" })),
+    const fieldOpts: FieldListOption[] = [
+      ...EDITABLE_FIELDS.map((field) => fieldListOption({ field, parent, variant: target, mode: "variant" })),
       {
         title: "Display name",
         value: "name",
         description: target.name ? String(target.name) : `default: ${agent}-${key}`,
-        ...({ bg: api.theme.current.diffRemovedBg } as object),
+        restart: true,
       },
-      { title: "Inheritance: enable all", value: "__inherit_all__", description: "Accept all propagated parent overrides when no local value is set" },
-      { title: "Inheritance: disable all", value: "__inherit_none__", description: "Use only this variant's local values" },
-      { title: "< Back", value: "__back__", description: "Return to variant picker" },
+      { title: "< Back", value: "__back__", description: "Return to variant picker", kind: "action" },
     ]
 
-    const field = await showSelect(api.ui, { title: `Edit field - ${variantName(agent, key, target)}`, options: fieldOpts })
+    const pickedField = await showFieldList(api, { title: `Edit field - ${variantName(agent, key, target)}`, options: fieldOpts, current: selectedField })
+    const field = pickedField?.value
     if (!field || field === "__back__") return next
-
-    if (field === "__inherit_all__" || field === "__inherit_none__") {
-      target.inherit = Object.fromEntries(PATCH_FIELDS.map((patchField) => [patchField, field === "__inherit_all__"]))
-      markHot(settings)
-      markRestart(settings, `${variantName(agent, key, target)}: restart-required fields changed inheritance status.`)
-      await warnRestartField(api, "Bulk inheritance", "Hot fields apply on the next matching variant call; description/color inheritance changes require restart.")
-      continue
-    }
+    selectedField = field
 
     if (field === "name") {
       const val = await showPrompt(api.ui, { title: "Display name", value: target.name as string | undefined, placeholder: `${agent}-${key}` })
@@ -781,25 +964,21 @@ async function editVariant(api: TuiPluginApi, config: SidecarConfig, settings: W
     if (!EDITABLE_FIELD_KEYS.has(field as PatchField)) continue
     const picked = fieldDef(field)
     if (!picked) continue
-    const action = await showFieldAction(api, {
-      title: `${picked.label} - ${variantName(agent, key, target)}`,
-      inspect: () => inspectVariantField(agent, key, nextEntry.parent, target, picked.key),
-      toggleLabel: `Toggle inheritance (${inheritanceEnabled(target, picked.key) ? "on" : "off"})`,
-    })
-    if (!action || action === "back") continue
-    if (action === "inspect") {
+    if (pickedField.action === "inspect") {
       await showAlert(api.ui, { title: picked.label, message: inspectVariantField(agent, key, nextEntry.parent, target, picked.key) })
       continue
     }
-    if (action === "toggle") {
+    if (pickedField.action === "toggle") {
       target.inherit = { ...(target.inherit ?? {}), [picked.key]: !inheritanceEnabled(target, picked.key) }
       markFieldChange(settings, picked.key, `${variantName(agent, key, target)}: ${picked.label} inheritance requires restart.`)
       if (!isHotReloadField(picked.key)) await warnRestartField(api, picked.label, "Inheritance for this field affects cached task-list/UI metadata.")
       continue
     }
-    const val = await promptForField(api, field, formatInputValue(target[picked.key]))
+    const val = await promptForField(api, field, formatInputValue(target[picked.key]), { config: next, model: effectiveVariantPatch(nextEntry.parent, target).model })
     if (val === undefined) continue
+    const previous = target[picked.key]
     setField(target, picked.key, val)
+    if (picked.key === "model" && previous !== val) delete target.variant
     markFieldChange(settings, picked.key, `${variantName(agent, key, target)}: ${picked.label} requires restart.`)
     if (!isHotReloadField(picked.key)) await warnRestartField(api, picked.label, "This field is stored in OpenCode's cached agent/task-list metadata.")
   }
@@ -1092,6 +1271,7 @@ async function promptForField(
   api: TuiPluginApi,
   field: string,
   current: string | undefined,
+  context?: { config: SidecarConfig; model: unknown },
 ): Promise<unknown> {
   if (field === "model") {
     const config = loadSidecar(defaultSidecarPath())
@@ -1102,6 +1282,25 @@ async function promptForField(
     if (picked === "__remove__") return ""
     if (picked === "__custom__") {
       return showPrompt(api.ui, { title: "Custom model ID", placeholder: "provider/model-id" })
+    }
+    return picked
+  }
+
+  if (field === "variant") {
+    const config = context?.config ?? loadSidecar(defaultSidecarPath())
+    const resolved = resolveModelReference(api, config, context?.model)
+    if (!resolved || resolved.variants.length === 0) {
+      api.ui.toast({
+        variant: "info",
+        title: "No known variants",
+        message: resolved ? `${resolved.modelName} exposes no known variants.` : "Pick a concrete model first for known variants.",
+      })
+    }
+    const picked = await showSelect(api.ui, { title: "Select model variant", options: modelVariantOptions(api, config, context?.model), current })
+    if (!picked) return undefined
+    if (picked === "__remove__") return ""
+    if (picked === "__custom__") {
+      return showPrompt(api.ui, { title: "Custom model variant", placeholder: "variant-id", value: current })
     }
     return picked
   }
