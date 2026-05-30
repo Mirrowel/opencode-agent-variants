@@ -20,22 +20,101 @@ if [ -n "$previous_tag" ]; then
 fi
 
 generate_changelog() {
-  if [ -n "$previous_tag" ]; then
-    git-cliff --config .github/cliff.toml --github-repo "$repo" --strip all --output changes.md "$range"
-    return
-  fi
-  cat > changes.md <<'EOF'
-## Initial Release
+  if [ -z "$previous_tag" ]; then
+    cat > changes.md <<'EOF'
+### Initial Release
 
 This is the first release for this channel.
 EOF
+    return
+  fi
+
+  git-cliff --config .github/cliff.toml --github-repo "$repo" --output changes.md "$range"
 }
 
 normalize_changelog() {
-  # Stable releases compare from the latest stable tag, so prerelease tags can
-  # appear inside the range. Keep their commits, but remove the prerelease
-  # subheadings so the stable release notes read as one coherent release.
-  sed -i -E '/^## Changes in v[0-9]+\.[0-9]+\.[0-9]+-(dev|alpha|beta|rc|canary)\.[0-9]+$/d' changes.md
+  # Stable releases can include prerelease tags inside the compare range. git-cliff
+  # renders one section per tag, which can repeat groups like CI/Maintenance.
+  # Merge those repeated groups into one deterministic changelog while preserving
+  # git-cliff's rendered commit text and full conventional subjects.
+  if [ -z "$previous_tag" ]; then
+    return 0
+  fi
+
+  local tmp raw current_group
+  tmp="$(mktemp -d)"
+  raw="$tmp/raw.md"
+  current_group="other"
+  cp changes.md "$raw"
+
+  local groups=(
+    "breaking|Breaking Changes"
+    "features|Features"
+    "fixes|Fixes"
+    "performance|Performance"
+    "refactoring|Refactoring"
+    "documentation|Documentation"
+    "tests|Tests"
+    "ci|CI"
+    "build|Build"
+    "maintenance|Maintenance"
+    "other|Other Changes"
+  )
+
+  for group in "${groups[@]}"; do
+    : > "$tmp/${group%%|*}.md"
+  done
+
+  while IFS= read -r line; do
+    if [[ "$line" =~ ^##[[:space:]] ]]; then
+      continue
+    fi
+    if [[ "$line" =~ ^###[[:space:]](.+)$ ]]; then
+      case "${BASH_REMATCH[1]}" in
+        "Breaking Changes") current_group="breaking" ;;
+        "Features") current_group="features" ;;
+        "Fixes") current_group="fixes" ;;
+        "Performance") current_group="performance" ;;
+        "Refactoring") current_group="refactoring" ;;
+        "Documentation") current_group="documentation" ;;
+        "Tests") current_group="tests" ;;
+        "CI") current_group="ci" ;;
+        "Build") current_group="build" ;;
+        "Maintenance") current_group="maintenance" ;;
+        *) current_group="other" ;;
+      esac
+      continue
+    fi
+    if [[ "$line" == "- "* ]]; then
+      local sha timestamp
+      sha="$(printf '%s\n' "$line" | sed -n 's|.*commit/\([a-f0-9]\{40\}\).*|\1|p')"
+      timestamp=""
+      if [ -n "$sha" ]; then
+        timestamp="$(git show -s --format=%cI "$sha" 2>/dev/null || true)"
+      fi
+      printf '%s\t%s\n' "$timestamp" "$line" >> "$tmp/$current_group.md"
+    fi
+  done < "$raw"
+
+  : > changes.md
+  local wrote=false
+  for group in "${groups[@]}"; do
+    local key="${group%%|*}"
+    local title="${group#*|}"
+    if [ -s "$tmp/$key.md" ]; then
+      wrote=true
+      {
+        echo "### $title"
+        sort -r "$tmp/$key.md" | cut -f2-
+        echo
+      } >> changes.md
+    fi
+  done
+
+  if [ "$wrote" != "true" ]; then
+    echo "No notable changes." > changes.md
+  fi
+  rm -rf "$tmp"
 }
 
 resolve_author_placeholders() {

@@ -2,19 +2,40 @@
   // Toggle route/model diagnostics. This can be changed from the wizard and
   // takes effect immediately for future variant calls. Logs are written to
   // ~/.config/opencode/agent-variants.debug.log.
+  // Debug changes do not create config backup entries.
   "debug": false,
 
-  // Optional model shortcuts. Variants can use either a shortcut key like
-  // "light" or a full provider/model reference like "anthropic/claude-sonnet-4-6".
+  // Wizard display preferences. These are changed from Debug & advanced.
+  // UI changes do not create config backup entries.
+  "ui": {
+    "width": "large",
+    // Legacy preset/reference value. Presets are compact=32, normal=50,
+    // tall=68, max=100.
+    "height": "normal",
+    // Fine-grained maximum height percentage, clamped to 25-100.
+    "height_percent": 50
+  },
+
+  // Optional model presets. Parent/variant model fields can use either a
+  // preset key like "light" or a full provider/model reference like
+  // "anthropic/claude-sonnet-4-6". Preset fields apply together, but local
+  // parent/variant fields can override them later.
   "models": {
     "light": {
       "model": "zai-coding-plan/glm-5.1",
-      "label": "GLM 5.1"
+      "label": "GLM 5.1",
+      // Optional model-related preset fields:
+      // "variant": "low",
+      // "temperature": 0.2,
+      // "top_p": 0.95,
+      // "options": { "reasoningEffort": "low" }
     }
 
     // "heavy": {
     //   "model": "anthropic/claude-opus-4-5",
-    //   "label": "Opus 4.5"
+    //   "label": "Opus 4.5",
+    //   "variant": "high",
+    //   "temperature": 0.3
     // }
   },
 
@@ -27,7 +48,14 @@
 
       "parent": {
         // Parent fields apply only when this parent has at least one enabled variant.
-        "description_append": "Uses the default strongest model. Use for the hardest tasks."
+        // They stay local to the parent unless explicitly propagated per field.
+        "description_append": "Uses the default strongest model. Use for the hardest tasks.",
+        "propagate": {
+          // Parent propagation is off by default. Turn on only fields variants
+          // should inherit when they do not set their own local value.
+          "temperature": false,
+          "prompt_append": false
+        }
 
         // Optional parent overrides:
         // "model": "heavy",
@@ -48,7 +76,13 @@
           // Variant names default to parent-key, so this becomes general-light.
           // "name": "general-cheap",
           "model": "light",
-          "description_append": "Use {alias} for most tasks that do not need {parent}'s strongest model. Runs on {model_label}."
+          "description_append": "Use {alias} for most tasks that do not need {parent}'s strongest model. Runs on {model_label}.",
+          "inherit": {
+            // Variant inheritance is on by default. Set a field to false to
+            // block a propagated parent override from reaching this variant.
+            "temperature": true,
+            "prompt_append": true
+          }
 
           // Optional variant overrides:
           // "variant": "default",

@@ -3,11 +3,14 @@ import { appendFileSync } from "node:fs"
 import type { Plugin } from "@opencode-ai/plugin"
 import {
   applyPromptPatch,
+  applyModelPresetPatch,
   applyTextPatch,
+  BUILTIN_AGENT_MODES,
   BUILTIN_AGENT_DESCRIPTIONS,
   defaultConfigDir,
   defaultSidecarPath,
   debugLogPath,
+  effectiveVariantPatch,
   fingerprint,
   generatedVariantDescription,
   hasPromptPatch,
@@ -18,8 +21,10 @@ import {
   splitModelRef,
   templateContext,
   validateModel,
+  validateModelVariant,
   type AgentPatch,
   type Diagnostic,
+  type ModelCatalog,
   type SidecarConfig,
   type TemplateContext,
   type VariantConfig,
@@ -30,10 +35,12 @@ type AgentConfig = Record<string, any>
 type RuntimeRoute = {
   alias: string
   parent: string
+  targetAgent: string
   key: string
-  patch: VariantConfig
+  patch: AgentPatch
   model?: string
   variant?: string
+  base?: AgentPatch
 }
 type PendingRoute = RuntimeRoute & {
   token: string
@@ -45,15 +52,15 @@ type PendingRoute = RuntimeRoute & {
 
 const BUILTIN_AGENTS = new Set(Object.keys(BUILTIN_AGENT_DESCRIPTIONS))
 const ROUTE_TTL = 10 * 60 * 1000
-const MARKER_PREFIX = "<!-- agent-variants-route:"
+const MARKER_PREFIX = "<!-- agent-variants-route"
 const MARKER_SUFFIX = " -->"
-
-function marker(token: string) {
-  return `${MARKER_PREFIX}${token}${MARKER_SUFFIX}`
-}
 
 function attr(value: string | undefined) {
   return (value ?? "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+}
+
+function marker(token: string, route: RuntimeRoute) {
+  return `${MARKER_PREFIX} token="${attr(token)}" selected_alias="${attr(route.alias)}" routed_agent="${attr(route.targetAgent)}" parent_agent="${attr(route.parent)}" effective_model="${attr(routeModel(route))}" model_variant="${attr(route.variant ?? "default")}"${MARKER_SUFFIX}`
 }
 
 function routeModel(route: RuntimeRoute) {
@@ -61,7 +68,11 @@ function routeModel(route: RuntimeRoute) {
 }
 
 function routeSummary(route: RuntimeRoute) {
-  return `${route.alias} selected; native agent=${route.parent}; effective model=${routeModel(route)}; variant=${route.variant ?? "default"}`
+  return `${route.alias} selected; native agent=${route.targetAgent}; parent=${route.parent}; effective model=${routeModel(route)}; variant=${route.variant ?? "default"}`
+}
+
+function agentMode(config: AgentConfig | undefined, agent: string) {
+  return config?.mode ?? BUILTIN_AGENT_MODES[agent] ?? "all"
 }
 
 function debugEnabled() {
@@ -78,6 +89,7 @@ function mergeOptions(target: Record<string, unknown> | undefined, source: Recor
 
 function applyPatch(target: AgentConfig, patch: AgentPatch, config: SidecarConfig, base?: AgentConfig, context?: TemplateContext) {
   const next = target
+  patch = applyModelPresetPatch(patch, config)
   const model = resolveModel(patch.model, config)
   if (model) next.model = model
   if (patch.variant !== undefined) next.variant = patch.variant
@@ -94,13 +106,34 @@ function applyPatch(target: AgentConfig, patch: AgentPatch, config: SidecarConfi
   return next
 }
 
+function validatePatchModel(label: string, patch: AgentPatch, config: SidecarConfig, catalog: ModelCatalog) {
+  return [validateModel(patch.model, config, catalog), validateModelVariant(patch.model, patch.variant, config, catalog)]
+    .filter((item): item is string => !!item)
+    .map((issue) => `${label}: ${issue}`)
+}
+
+function removeInvalidModelFields(patch: AgentPatch, config: SidecarConfig, catalog: ModelCatalog) {
+  const result = { ...patch }
+  if (validateModel(result.model, config, catalog)) {
+    delete result.model
+    delete result.variant
+    return result
+  }
+  if (validateModelVariant(result.model, result.variant, config, catalog)) delete result.variant
+  return result
+}
+
 function applyConfigPatch(target: AgentConfig, patch: AgentPatch, config: SidecarConfig, base: AgentConfig | undefined, builtin: boolean, context?: TemplateContext) {
   const safePatch = builtin && patch.prompt === undefined ? { ...patch, prompt_prepend: undefined, prompt_append: undefined } : patch
   return applyPatch(target, safePatch, config, base, context)
 }
 
-function virtualPatch(alias: string, description: string, patch: VariantConfig, config: SidecarConfig): AgentConfig {
+function virtualPatch(alias: string, description: string, patch: VariantConfig, config: SidecarConfig, base?: AgentConfig): AgentConfig {
+  patch = applyModelPresetPatch(patch, config) as VariantConfig
   const result: AgentConfig = {
+    ...(base?.permission !== undefined ? { permission: base.permission } : {}),
+    ...(base?.tools !== undefined ? { tools: base.tools } : {}),
+    ...(base?.color !== undefined ? { color: base.color } : {}),
     mode: "subagent",
     description,
   }
@@ -141,20 +174,28 @@ function assembleAgents(cfg: Record<string, any>, sidecar: SidecarConfig) {
 
     const isBuiltin = BUILTIN_AGENTS.has(parent)
     const base = parentConfig ?? (isBuiltin ? { description: BUILTIN_AGENT_DESCRIPTIONS[parent] } : undefined)
+    if (agentMode(parentConfig, parent) === "primary") {
+      diagnostics.push({ level: "warning", agent: parent, message: `Parent agent "${parent}" is primary-only; variants may not be callable by the task tool unless the wizard filter was intentionally disabled.` })
+    }
     if (!base && !isBuiltin) {
       diagnostics.push({ level: "warning", agent: parent, message: `Parent agent "${parent}" was not found; variants skipped.` })
       continue
     }
 
-    cfg.agent[parent] = applyConfigPatch({ ...(parentConfig ?? {}) }, entry.parent, sidecar, base, isBuiltin, templateContext(parent, undefined, {}, sidecar))
-    if (isBuiltin && hasPromptPatch(entry.parent)) parentPromptPatches.set(parent, entry.parent)
-    if (isBuiltin && hasRequestPatch(entry.parent)) parentRequestPatches.set(parent, entry.parent)
+    const parentPatch = removeInvalidModelFields(applyModelPresetPatch(entry.parent, sidecar), sidecar, catalog)
+    for (const issue of validatePatchModel(`Parent "${parent}"`, applyModelPresetPatch(entry.parent, sidecar), sidecar, catalog)) {
+      diagnostics.push({ level: "warning", agent: parent, message: `${issue}; model fields skipped for parent override.` })
+    }
+    cfg.agent[parent] = applyConfigPatch({ ...(parentConfig ?? {}) }, parentPatch, sidecar, base, isBuiltin, templateContext(parent, undefined, {}, sidecar))
+    if (isBuiltin && hasPromptPatch(parentPatch)) parentPromptPatches.set(parent, parentPatch)
+    if (isBuiltin && hasRequestPatch(parentPatch)) parentRequestPatches.set(parent, parentPatch)
 
     for (const [key, variant] of enabledVariants) {
       const alias = variantName(parent, key, variant)
-      const modelIssue = validateModel(variant.model, sidecar, catalog)
-      if (modelIssue) {
-        diagnostics.push({ level: "warning", agent: parent, variant: key, alias, message: `Variant "${alias}" disabled at runtime: ${modelIssue}` })
+      const effective = applyModelPresetPatch(effectiveVariantPatch(entry.parent, variant), sidecar)
+      const modelIssues = validatePatchModel(`Variant "${alias}"`, effective, sidecar, catalog)
+      if (modelIssues.length > 0) {
+        diagnostics.push({ level: "warning", agent: parent, variant: key, alias, message: `Variant "${alias}" disabled at runtime: ${modelIssues.join(" ")}` })
         continue
       }
       if (alias === parent) {
@@ -171,24 +212,42 @@ function assembleAgents(cfg: Record<string, any>, sidecar: SidecarConfig) {
         continue
       }
       generatedAliases.set(alias, `${parent}.${key}`)
-      const description = generatedVariantDescription(parent, key, variant, sidecar)
+      const description = generatedVariantDescription(parent, key, { ...variant, ...effective }, sidecar)
       if (isBuiltin) {
-        cfg.agent[alias] = virtualPatch(alias, description, variant, sidecar)
+        cfg.agent[alias] = virtualPatch(alias, description, effective as VariantConfig, sidecar, parentConfig)
         virtualRoutes.set(alias, {
           alias,
           parent,
+          targetAgent: parent,
           key,
-          patch: variant,
-          model: resolveModel(variant.model, sidecar),
-          variant: variant.variant,
+          patch: effective,
+          model: resolveModel(effective.model, sidecar),
+          variant: effective.variant,
         })
         continue
       }
 
-      const copy = applyPatch({ ...(cfg.agent[parent] ?? {}) }, variant, sidecar, cfg.agent[parent], templateContext(parent, key, variant, sidecar))
+      const copy = applyPatch({ ...(parentConfig ?? {}) }, effective, sidecar, parentConfig, templateContext(parent, key, effective, sidecar))
       copy.description = description
       delete copy.disable
       cfg.agent[alias] = copy
+      virtualRoutes.set(alias, {
+        alias,
+        parent,
+        targetAgent: alias,
+        key,
+        patch: effective,
+        model: resolveModel(effective.model, sidecar),
+        variant: effective.variant,
+        base: {
+          model: parentConfig?.model,
+          variant: parentConfig?.variant,
+          temperature: parentConfig?.temperature,
+          top_p: parentConfig?.top_p,
+          prompt: parentConfig?.prompt,
+          options: parentConfig?.options,
+        },
+      })
     }
   }
 
@@ -208,7 +267,9 @@ function takeMarkerRoute(parts: any[], routes: Map<string, RuntimeRoute>) {
     if (start < 0) continue
     const end = part.text.indexOf(MARKER_SUFFIX, start)
     if (end < 0) continue
-    const token = part.text.slice(start + MARKER_PREFIX.length, end)
+    const body = part.text.slice(start + MARKER_PREFIX.length, end)
+    const token = body.startsWith(":") ? body.slice(1) : /\btoken="([^"]+)"/.exec(body)?.[1]
+    if (!token) continue
     const route = routes.get(token)
     part.text = `${part.text.slice(0, start)}${part.text.slice(end + MARKER_SUFFIX.length)}`.trim()
     routes.delete(token)
@@ -281,7 +342,8 @@ async function warningToast(client: any, diagnostic: Diagnostic) {
   }).catch(() => undefined)
 }
 
-function applyRequestPatch(output: { temperature?: number; topP?: number; options: Record<string, any> }, patch: AgentPatch) {
+function applyRequestPatch(output: { temperature?: number; topP?: number; options: Record<string, any> }, patch: AgentPatch, config: SidecarConfig) {
+  patch = applyModelPresetPatch(patch, config)
   if (patch.temperature !== undefined) output.temperature = patch.temperature
   if (patch.top_p !== undefined) output.topP = patch.top_p
   if (patch.options !== undefined) Object.assign(output.options, patch.options)
@@ -296,10 +358,66 @@ function applySystemPatch(system: string[], patch: AgentPatch, context?: Templat
 function annotateTaskOutput(text: string, route: RuntimeRoute) {
   const annotated = text.replace(
     /^<task\b([^>]*)>/,
-    `<task$1 agent_variant="${attr(route.alias)}" routed_agent="${attr(route.parent)}" effective_model="${attr(routeModel(route))}" model_variant="${attr(route.variant ?? "default")}">`,
+    `<task$1 agent_variant="${attr(route.alias)}" routed_agent="${attr(route.targetAgent)}" parent_agent="${attr(route.parent)}" effective_model="${attr(routeModel(route))}" model_variant="${attr(route.variant ?? "default")}">`,
   )
   if (annotated !== text) return annotated
-  return [`<agent_variant alias="${attr(route.alias)}" routed_agent="${attr(route.parent)}" effective_model="${attr(routeModel(route))}" model_variant="${attr(route.variant ?? "default")}" />`, text].join("\n")
+  return [`<agent_variant alias="${attr(route.alias)}" routed_agent="${attr(route.targetAgent)}" parent_agent="${attr(route.parent)}" effective_model="${attr(routeModel(route))}" model_variant="${attr(route.variant ?? "default")}" />`, text].join("\n")
+}
+
+function resetGeneratedRequest(output: { temperature?: number; topP?: number; options: Record<string, any> }, route: RuntimeRoute) {
+  if (route.targetAgent === route.parent) return
+  if (route.base?.temperature === undefined) delete output.temperature
+  if (route.base?.temperature !== undefined) output.temperature = route.base.temperature
+  if (route.base?.top_p === undefined) delete output.topP
+  if (route.base?.top_p !== undefined) output.topP = route.base.top_p
+  output.options = { ...(route.base?.options ?? {}) }
+}
+
+function applyMessageModel(output: { message: { model?: { providerID: string; modelID: string; variant?: string } } }, route: RuntimeRoute) {
+  const model = splitModelRef(route.model)
+  const baseModel = splitModelRef(route.base?.model)
+  if (model) {
+    output.message.model = {
+      providerID: model.providerID,
+      modelID: model.modelID,
+    }
+    if (route.variant) output.message.model.variant = route.variant
+    return
+  }
+  if (route.variant && output.message.model) {
+    output.message.model.variant = route.variant
+    return
+  }
+  if (baseModel) {
+    output.message.model = {
+      providerID: baseModel.providerID,
+      modelID: baseModel.modelID,
+    }
+    if (route.base?.variant) output.message.model.variant = route.base.variant
+    return
+  }
+  if (route.targetAgent !== route.parent) delete output.message.model
+}
+
+function liveRoute(staticRoute: RuntimeRoute, catalog: ModelCatalog) {
+  const config = loadSidecar(defaultSidecarPath())
+  const entry = config.agents[staticRoute.parent]
+  const variant = entry?.variants[staticRoute.key]
+  if (!entry || entry.disable === true || !variant || variant.disable === true) {
+    throw new Error(`Variant "${staticRoute.alias}" is disabled or removed. Restart OpenCode to update the task list.`)
+  }
+  if (variantName(staticRoute.parent, staticRoute.key, variant) !== staticRoute.alias) {
+    throw new Error(`Variant "${staticRoute.alias}" was renamed. Restart OpenCode to update the task list.`)
+  }
+  const patch = applyModelPresetPatch(effectiveVariantPatch(entry.parent, variant), config)
+  const issues = validatePatchModel(`Variant "${staticRoute.alias}"`, patch, config, catalog)
+  if (issues.length > 0) throw new Error(`Variant "${staticRoute.alias}" is invalid after hot reload: ${issues.join(" ")}`)
+  return {
+    ...staticRoute,
+    patch,
+    model: resolveModel(patch.model, config),
+    variant: patch.variant,
+  }
 }
 
 const plugin: Plugin = async (input) => {
@@ -307,6 +425,7 @@ const plugin: Plugin = async (input) => {
   let virtualRoutes = new Map<string, RuntimeRoute>()
   let parentPromptPatches = new Map<string, AgentPatch>()
   let parentRequestPatches = new Map<string, AgentPatch>()
+  let catalog = modelCatalogFromProviders(undefined)
   const pending: PendingRoute[] = []
   const tokenRoutes = new Map<string, RuntimeRoute>()
   const bySession = new Map<string, RuntimeRoute>()
@@ -314,6 +433,7 @@ const plugin: Plugin = async (input) => {
 
   return {
     config: async (cfg) => {
+      catalog = modelCatalogFromProviders((cfg as Record<string, any>).provider)
       const assembled = assembleAgents(cfg as Record<string, any>, sidecar)
       virtualRoutes = assembled.virtualRoutes
       parentPromptPatches = assembled.parentPromptPatches
@@ -322,29 +442,48 @@ const plugin: Plugin = async (input) => {
     },
     "tool.execute.before": async (hookInput, output) => {
       if (hookInput.tool !== "task") return
-      const args = output.args as { subagent_type?: string; prompt?: string; description?: string }
+      const args = output.args as {
+        subagent_type?: string
+        prompt?: string
+        description?: string
+        selected_alias?: string
+        agent_variant?: string
+        routed_agent?: string
+        effective_model?: string
+        model_variant?: string
+      }
       if (!args?.subagent_type || !args.prompt) return
-      const route = virtualRoutes.get(args.subagent_type)
-      if (!route) return
+      const staticRoute = virtualRoutes.get(args.subagent_type)
+      if (!staticRoute) return
+      const route = liveRoute(staticRoute, catalog)
       cleanupPending(pending, tokenRoutes)
       const token = randomUUID()
+      const originalDescription = args.description
       tokenRoutes.set(token, route)
       byCall.set(hookInput.callID, route)
       pending.push({
         ...route,
         token,
         parentSessionID: hookInput.sessionID,
-        targetAgent: route.parent,
+        targetAgent: route.targetAgent,
         fingerprint: fingerprint({
           parentSessionID: hookInput.sessionID,
-          agent: route.parent,
+          agent: route.targetAgent,
           prompt: args.prompt,
-          description: args.description,
+          description: originalDescription,
         }),
         createdAt: Date.now(),
       })
-      args.prompt = `${args.prompt}\n\n${marker(token)}`
-      args.subagent_type = route.parent
+      args.selected_alias = route.alias
+      args.agent_variant = route.alias
+      args.routed_agent = route.targetAgent
+      args.effective_model = routeModel(route)
+      args.model_variant = route.variant ?? "default"
+      if (args.description && !args.description.includes(`@${route.alias} variant`)) {
+        args.description = `${args.description} (@${route.alias} variant)`
+      }
+      args.prompt = `${args.prompt}\n\n${marker(token, route)}`
+      args.subagent_type = route.targetAgent
       await debugToast(
         input.client,
         sidecar.debug,
@@ -362,7 +501,8 @@ const plugin: Plugin = async (input) => {
         ...output.metadata,
         agentVariant: {
           alias: route.alias,
-          routedAgent: route.parent,
+          routedAgent: route.targetAgent,
+          parentAgent: route.parent,
           effectiveModel: routeModel(route),
           modelVariant: route.variant ?? "default",
         },
@@ -376,16 +516,7 @@ const plugin: Plugin = async (input) => {
       if (markerRoute) {
         removePendingToken(pending, markerRoute.token)
         bySession.set(hookInput.sessionID, markerRoute.route)
-        const model = splitModelRef(markerRoute.route.model)
-        if (model) {
-          output.message.model = {
-            providerID: model.providerID,
-            modelID: model.modelID,
-          }
-          if (markerRoute.route.variant) (output.message.model as { variant?: string }).variant = markerRoute.route.variant
-        } else if (markerRoute.route.variant) {
-          (output.message.model as { variant?: string }).variant = markerRoute.route.variant
-        }
+        applyMessageModel(output, markerRoute.route)
         await debugToast(
           input.client,
           sidecar.debug,
@@ -407,16 +538,7 @@ const plugin: Plugin = async (input) => {
       })
       if (!route) return
       bySession.set(hookInput.sessionID, route)
-      const model = splitModelRef(route.model)
-      if (model) {
-        output.message.model = {
-          providerID: model.providerID,
-          modelID: model.modelID,
-        }
-        if (route.variant) (output.message.model as { variant?: string }).variant = route.variant
-      } else if (route.variant) {
-        (output.message.model as { variant?: string }).variant = route.variant
-      }
+      applyMessageModel(output, route)
       await debugToast(
         input.client,
         sidecar.debug,
@@ -427,15 +549,21 @@ const plugin: Plugin = async (input) => {
     "chat.params": async (hookInput, output) => {
       const routed = bySession.get(hookInput.sessionID)
       const parent = parentRequestPatches.get(hookInput.agent)
-      if (parent) applyRequestPatch(output, parent)
-      if (routed) applyRequestPatch(output, routed.patch)
+      if (routed) {
+        resetGeneratedRequest(output, routed)
+        applyRequestPatch(output, routed.patch, sidecar)
+        return
+      }
+      if (parent) applyRequestPatch(output, parent, sidecar)
     },
     "experimental.chat.system.transform": async (hookInput, output) => {
       if (!hookInput.sessionID) return
       const routed = bySession.get(hookInput.sessionID)
       if (routed) {
-        const parent = parentPromptPatches.get(routed.parent)
-        if (parent) applySystemPatch(output.system, parent, templateContext(routed.parent, undefined, {}, sidecar))
+        if (routed.targetAgent !== routed.parent && routed.base?.prompt !== undefined) {
+          output.system[0] = applyPromptPatch(routed.base.prompt, routed.patch, templateContext(routed.parent, routed.key, routed.patch, sidecar))
+          return
+        }
         applySystemPatch(output.system, routed.patch, templateContext(routed.parent, routed.key, routed.patch, sidecar))
         return
       }

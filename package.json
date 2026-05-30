@@ -26,11 +26,12 @@
     },
     "./tui": {
       "types": "./dist/tui.d.ts",
-      "import": "./dist/tui.js"
+      "import": "./src/tui.tsx"
     }
   },
   "files": [
     "dist",
+    "src/tui.tsx",
     "docs/CONFIG.md",
     "agent-variants.example.jsonc",
     "README.md",
@@ -65,11 +66,13 @@
     "prepublishOnly": "npm run typecheck && npm run build"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "^1.14.39",
+    "@opencode-ai/plugin": ">=1.14.0",
     "comment-json": "^4.2.5",
+    "solid-js": "^1.9.12",
     "zod": "^4.1.8"
   },
   "devDependencies": {
+    "@opentui/solid": "^0.2.16",
     "@types/node": "^22.0.0",
     "typescript": "^5.8.0"
   },
