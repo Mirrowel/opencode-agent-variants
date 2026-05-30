@@ -11,7 +11,7 @@
     // tall=68, max=100.
     "height": "normal",
     // Fine-grained maximum height percentage, clamped to 25-100.
-    "height_percent": 58
+    "height_percent": 50
   },
 
   // Optional model presets. Parent/variant model fields can use either a

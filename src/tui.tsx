@@ -357,6 +357,17 @@ function cappedHeight(count: number, max: number, min = 1) {
   return Math.max(min, Math.min(count, max))
 }
 
+function dialogContentWidth(api: TuiPluginApi) {
+  const size = wizardDialogSize(api)
+  if (size === "xlarge") return 106
+  if (size === "large") return 78
+  return 50
+}
+
+function estimatedVisualRows(message: string, width: number) {
+  return message.split(/\r?\n/).reduce((rows, line) => rows + Math.max(1, Math.ceil(line.length / Math.max(1, width))), 0)
+}
+
 function wizardMaxRows(api: TuiPluginApi, terminalHeight: number, chromeRows: number, minRows: number) {
   const usable = Math.max(minRows, terminalHeight - chromeRows)
   return Math.max(minRows, Math.min(usable, Math.floor(terminalHeight * (wizardDialogHeightPercent(api) / 100))))
@@ -601,6 +612,22 @@ function setField(target: Record<string, unknown>, field: string, value: unknown
     return
   }
   target[field] = value
+}
+
+function fieldValueAfterInput(value: unknown) {
+  return value === "" ? undefined : value
+}
+
+function comparableValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(comparableValue)
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, item]) => [key, comparableValue(item)]))
+  }
+  return value
+}
+
+function fieldValueChanged(previous: unknown, next: unknown) {
+  return JSON.stringify(comparableValue(previous)) !== JSON.stringify(comparableValue(fieldValueAfterInput(next)))
 }
 
 function markFieldChange(settings: WizardSettings, field: string, reason: string) {
@@ -1235,7 +1262,8 @@ function InfoDialog(props: { api: TuiPluginApi; title: string; message: string; 
   const dimensions = useTerminalDimensions()
   const popMode = props.api.mode.push("agent-variants.dialog")
   const lines = createMemo(() => props.message.split(/\r?\n/))
-  const bodyHeight = createMemo(() => wizardMaxRows(props.api, dimensions().height, 13, 4))
+  const visualRows = createMemo(() => estimatedVisualRows(props.message, dialogContentWidth(props.api)))
+  const bodyHeight = createMemo(() => cappedHeight(visualRows() + 1, wizardMaxRows(props.api, dimensions().height, 13, 4), 4))
   let scroll: ScrollBoxRenderable | undefined
   const page = () => Math.max(1, (scroll?.height ?? bodyHeight()) - 1)
   const commandPrefix = `agent-variants.info.${Math.random().toString(36).slice(2)}`
@@ -1279,7 +1307,7 @@ function InfoDialog(props: { api: TuiPluginApi; title: string; message: string; 
         <text fg={theme().textMuted} onMouseUp={props.onDone}>esc</text>
       </box>
       <scrollbox maxHeight={bodyHeight()} ref={(element: ScrollBoxRenderable) => (scroll = element)}>
-      <box flexDirection="column" gap={0} marginBottom={1}>
+      <box flexDirection="column" gap={0}>
         <For each={lines()}>
           {(line) => {
             const heading = line.length > 0 && !line.startsWith(" ") && (line.endsWith(":") || /^[A-Z][A-Za-z ]+$/.test(line))
@@ -1293,7 +1321,7 @@ function InfoDialog(props: { api: TuiPluginApi; title: string; message: string; 
       </box>
       </scrollbox>
       <box flexDirection="row" justifyContent="space-between" width="100%">
-        <text fg={theme().textMuted}>up/down scroll</text>
+        <text fg={theme().textMuted}>{visualRows() > bodyHeight() ? "up/down scroll" : ""}</text>
         <box paddingLeft={3} paddingRight={3} backgroundColor={theme().primary} onMouseUp={props.onDone}>
           <text fg={theme().background}><b>ok</b></text>
         </box>
@@ -1566,6 +1594,7 @@ async function editParentFields(
     const value = await promptForField(api, field, formatInputValue(parent[picked.key]), { config: next, model: parent.model })
     if (value === undefined) continue
     const previous = parent[picked.key]
+    if (!fieldValueChanged(previous, value)) continue
     setField(parent as Record<string, unknown>, picked.key, value)
     if (picked.key === "model" && previous !== value) delete parent.variant
     markFieldChange(settings, picked.key, `${agent}: ${picked.label} requires restart.`)
@@ -1713,6 +1742,8 @@ async function editVariant(api: TuiPluginApi, config: SidecarConfig, settings: W
       }
       const val = await showPrompt(api.ui, { title: "Display name", value: target.name as string | undefined, placeholder: `${agent}-${key}` })
       if (val === undefined) continue
+      const previous = target.name
+      if (!fieldValueChanged(previous, val)) continue
       if (val === "") delete target.name
       if (val !== "") target.name = val
       markRestart(settings, `${agent}.${key}: display name requires restart.`)
@@ -1736,6 +1767,7 @@ async function editVariant(api: TuiPluginApi, config: SidecarConfig, settings: W
     const val = await promptForField(api, field, formatInputValue(target[picked.key]), { config: next, model: effectiveVariantPatch(nextEntry.parent, target).model })
     if (val === undefined) continue
     const previous = target[picked.key]
+    if (!fieldValueChanged(previous, val)) continue
     setField(target, picked.key, val)
     if (picked.key === "model" && previous !== val) delete target.variant
     markFieldChange(settings, picked.key, `${variantName(agent, key, target)}: ${picked.label} requires restart.`)
