@@ -13,6 +13,14 @@ export const BUILTIN_AGENT_DESCRIPTIONS: Record<string, string> = {
   scout: "Docs and dependency-source specialist. Use this when you need to inspect external documentation, clone dependency repositories into the managed cache, and research library implementation details without modifying the user's workspace.",
 }
 
+export const BUILTIN_AGENT_MODES: Record<string, AgentMode> = {
+  build: "primary",
+  plan: "primary",
+  general: "subagent",
+  explore: "subagent",
+  scout: "subagent",
+}
+
 const Color = z.union([
   z.string().regex(/^#[0-9a-fA-F]{6}$/),
   z.enum(["primary", "secondary", "accent", "success", "warning", "error", "info"]),
@@ -156,6 +164,7 @@ export type ModelCatalog = {
   providers: Set<string>
   providersWithModelList: Set<string>
   refs: Set<string>
+  variants: Map<string, Set<string>>
 }
 export type TemplateContext = {
   parent: string
@@ -493,18 +502,21 @@ export function generatedVariantDescription(parent: string, key: string, variant
 }
 
 export function modelCatalogFromProviders(providers: unknown): ModelCatalog {
-  const catalog: ModelCatalog = { providers: new Set(), providersWithModelList: new Set(), refs: new Set() }
+  const catalog: ModelCatalog = { providers: new Set(), providersWithModelList: new Set(), refs: new Set(), variants: new Map() }
   const list = Array.isArray(providers) ? providers : Object.entries((providers ?? {}) as Record<string, unknown>).map(([id, value]) => ({ id, ...(value as object) }))
   for (const provider of list as Array<Record<string, unknown>>) {
     const providerID = typeof provider.id === "string" ? provider.id : undefined
     if (!providerID) continue
     catalog.providers.add(providerID)
-    const models = provider.models as Record<string, { id?: string }> | undefined
+    const models = provider.models as Record<string, { id?: string; variants?: Record<string, unknown> }> | undefined
     if (!models || Object.keys(models).length === 0) continue
     catalog.providersWithModelList.add(providerID)
     for (const [key, value] of Object.entries(models)) {
-      catalog.refs.add(`${providerID}/${key}`)
-      if (typeof value.id === "string") catalog.refs.add(`${providerID}/${value.id}`)
+      const refs = [`${providerID}/${key}`, typeof value.id === "string" ? `${providerID}/${value.id}` : undefined].filter((ref): ref is string => !!ref)
+      for (const ref of refs) {
+        catalog.refs.add(ref)
+        if (value.variants && Object.keys(value.variants).length > 0) catalog.variants.set(ref, new Set(Object.keys(value.variants)))
+      }
     }
   }
   return catalog
@@ -519,8 +531,35 @@ export function validateModel(modelInput: string | undefined, config: SidecarCon
   if (catalog.providersWithModelList.has(split.providerID) && !catalog.refs.has(model)) return `Model "${model}" was not found in provider "${split.providerID}".`
 }
 
+export function validateModelVariant(modelInput: string | undefined, variant: string | undefined, config: SidecarConfig, catalog: ModelCatalog) {
+  if (!variant) return
+  const model = resolveModel(modelInput, config)
+  if (!model) return
+  const variants = catalog.variants.get(model)
+  if (variants && variants.size > 0 && !variants.has(variant)) return `Variant "${variant}" was not found for model "${model}".`
+}
+
 export function isSubagentCapableMode(mode: AgentMode | undefined) {
   return mode !== "primary"
+}
+
+function unknownFlagKeys(flags: Record<string, boolean> | undefined) {
+  if (!flags) return []
+  return Object.keys(flags).filter((key) => !isPatchField(key))
+}
+
+function aliasIssue(alias: string) {
+  if (alias.trim().length === 0) return "Alias is empty after trimming."
+  if (alias !== alias.trim()) return `Alias "${alias}" has leading or trailing whitespace.`
+  if (/\s/.test(alias)) return `Alias "${alias}" contains whitespace.`
+  if (/[\u0000-\u001f\u007f]/.test(alias)) return `Alias "${alias}" contains control characters.`
+}
+
+function validatePatchModel(label: string, patch: AgentPatch, config: SidecarConfig, catalog: ModelCatalog) {
+  return [
+    validateModel(patch.model, config, catalog),
+    validateModelVariant(patch.model, patch.variant, config, catalog),
+  ].filter((item): item is string => !!item).map((issue) => `${label}: ${issue}`)
 }
 
 export function diagnoseConfig(config: SidecarConfig, input: { agents: string[]; providers: unknown; pluginEntries?: unknown[]; agentModes?: Record<string, AgentMode> }) {
@@ -535,15 +574,44 @@ export function diagnoseConfig(config: SidecarConfig, input: { agents: string[];
 
   diagnostics.push({ level: "info", message: `Debug mode is ${config.debug ? "enabled" : "disabled"}.` })
 
+  for (const [key, preset] of Object.entries(config.models)) {
+    for (const issue of validatePatchModel(`Model preset "${key}"`, preset, config, catalog)) {
+      diagnostics.push({ level: "warning", message: issue })
+    }
+  }
+
+  try {
+    const journal = loadBackupJournal()
+    diagnostics.push({ level: "info", message: `Backup journal has ${journal.patches.length} patch restore point(s) and ${journal.full.length} full backup(s).` })
+    if (journal.patches.length > 0) {
+      const restored = reconstructPatchBackup(0, config, journal)
+      if (!restored.ok) diagnostics.push({ level: "warning", message: `Backup journal hash check failed: ${restored.message}` })
+    }
+  } catch (err) {
+    diagnostics.push({ level: "warning", message: `Backup journal could not be read: ${err instanceof Error ? err.message : String(err)}` })
+  }
+
   for (const [agent, entry] of Object.entries(config.agents)) {
     if (!knownAgents.has(agent)) diagnostics.push({ level: "warning", agent, message: `Parent agent "${agent}" is not a known built-in or configured agent.` })
     if (!isSubagentCapableMode(input.agentModes?.[agent])) diagnostics.push({ level: "warning", agent, message: `Parent agent "${agent}" is primary-only and will not be callable by the task tool.` })
     if (entry.disable) diagnostics.push({ level: "info", agent, message: `Parent "${agent}" is disabled in sidecar config.` })
+    for (const key of unknownFlagKeys(entry.parent.propagate)) {
+      diagnostics.push({ level: "warning", agent, message: `Parent "${agent}" has unknown propagate key "${key}".` })
+    }
+    for (const issue of validatePatchModel(`Parent "${agent}"`, applyModelPresetPatch(entry.parent, config), config, catalog)) {
+      diagnostics.push({ level: "warning", agent, message: issue })
+    }
     for (const [key, variant] of Object.entries(entry.variants)) {
       const alias = variantName(agent, key, variant)
+      const issue = aliasIssue(alias)
+      if (issue) diagnostics.push({ level: "warning", agent, variant: key, alias, message: issue })
+      for (const inheritKey of unknownFlagKeys(variant.inherit)) {
+        diagnostics.push({ level: "warning", agent, variant: key, alias, message: `Variant "${alias}" has unknown inherit key "${inheritKey}".` })
+      }
       if (!isSubagentCapableMode(input.agentModes?.[agent])) diagnostics.push({ level: "warning", agent, variant: key, alias, message: `Variant "${alias}" inherits a primary-only parent and will not be callable by the task tool.` })
-      const issue = validateModel(variant.model, config, catalog)
-      if (issue) diagnostics.push({ level: "warning", agent, variant: key, alias, message: `Variant "${alias}" disabled at runtime: ${issue}` })
+      for (const modelIssue of validatePatchModel(`Variant "${alias}"`, applyModelPresetPatch(effectiveVariantPatch(entry.parent, variant), config), config, catalog)) {
+        diagnostics.push({ level: "warning", agent, variant: key, alias, message: `Variant "${alias}" disabled at runtime: ${modelIssue}` })
+      }
       if (alias === agent) diagnostics.push({ level: "error", agent, variant: key, alias, message: `Variant "${alias}" uses the same name as its parent.` })
       const existing = generated.get(alias)
       if (existing) diagnostics.push({ level: "error", agent, variant: key, alias, message: `Variant alias "${alias}" duplicates ${existing.agent}.${existing.variant}.` })

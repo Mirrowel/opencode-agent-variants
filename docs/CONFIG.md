@@ -11,7 +11,7 @@ See `agent-variants.example.jsonc` for a fully commented starter file.
 - `models`: named model presets. Each preset has `model` and can also provide `label`, `variant`, `temperature`, `top_p`, and `options`.
 - `agents`: parent-agent entries. Each key is a built-in or configured OpenCode agent name.
 
-Debug and UI-only saves do not create backup entries. Meaningful config saves are backed up in `~/.config/opencode/agent-variants.backup.json` as a reverse-patch journal, capped to the latest 50 patch restore points. The wizard's `Debug & advanced` > `Config backups` menu can create full snapshots, preview valid restore points, restore them, and delete full snapshots. Full snapshots are not auto-pruned.
+Debug and UI-only saves do not create backup entries. Meaningful config saves are backed up in `~/.config/opencode/agent-variants.backup.json` as a reverse-patch journal, capped to the latest 50 patch restore points. The wizard's `Debug & advanced` > `Config backups` menu can create full snapshots, preview valid restore points, restore them, optionally create a full backup before restore, and delete full snapshots. Full snapshots are not auto-pruned.
 
 ## Model Shortcuts
 
@@ -136,7 +136,7 @@ The wizard shows compact field indicators:
 - `INH:on/off` for variant inheritance
 - `SRC:local/inherit/none` for the value source
 
-Use `Inspect field` in the field action menu to see local value, inherited value, resulting value, and whether the field hot-reloads or requires restart. Submitting an empty field value removes the local override; pressing escape cancels.
+Press `i` on a field to see local value, inherited value, resulting value, and whether the field hot-reloads or requires restart. Submitting an empty field value removes the local override; pressing escape cancels.
 
 Agent Variants are intended for agents callable by OpenCode's `task` tool. The wizard defaults to a subagent-capable parent filter (`mode: "subagent"` or `mode: "all"`) and hides primary-only agents from add/edit parent pickers. This is a wizard-only setting, not a sidecar field. Existing sidecar entries for primary-only parents still appear in edit/delete/toggle flows so they can be repaired.
 
@@ -192,10 +192,30 @@ The plugin skips problematic variants instead of producing ambiguous agents:
 - variant alias equals parent name,
 - two variants generate the same alias,
 - generated alias conflicts with an existing agent,
-- variant model is definitely missing,
-- parent is primary-only and will not be callable by `task`.
+- variant model or configured model variant is definitely missing.
+
+Diagnostics also warn about non-skipping issues:
+
+- broken or unused model presets,
+- invalid parent model overrides,
+- unknown `parent.propagate` or `variant.inherit` keys,
+- suspicious alias names with whitespace or control characters,
+- parent is primary-only and may not be callable by `task`,
+- backup journal parse/hash-chain problems.
 
 Run `Agent Variants: Configure` -> `Run diagnostics` to inspect these issues.
+
+## Backups
+
+Backups are stored in:
+
+```txt
+~/.config/opencode/agent-variants.backup.json
+```
+
+Patch restore points are reverse patches from the current config back to a previous config state. The plugin validates hashes before previewing/restoring a patch point so manual sidecar edits do not silently corrupt history. Restoring a patch point removes the consumed patches, effectively moving the journal back in time.
+
+Full backups are complete config snapshots. They are created manually from `Debug & advanced` -> `Config backups` or optionally before a restore. They are not auto-pruned and can be deleted individually with double `ctrl+d` or all at once from the backup menu.
 
 ## Debug Log
 

@@ -22,7 +22,8 @@
   <a href="#wizard">Wizard</a> ·
   <a href="#config-file">Config</a> ·
   <a href="#built-in-agents">Built-In Agents</a> ·
-  <a href="#debug-mode">Debugging</a>
+  <a href="#debug-mode">Debugging</a> ·
+  <a href="#backups">Backups</a>
 </p>
 
 ---
@@ -107,7 +108,7 @@ Agent Variants: Configure
 
 After that, the main model can call the generated variant through the normal `task` tool. No agent-facing management tools are added.
 
-> **Tip:** Use the wizard's `Run diagnostics` action after editing. It checks model availability, alias conflicts, parent task-callability, disabled entries, and plugin installation state.
+> **Tip:** Use the wizard's `Run diagnostics` action after editing. It checks model and model-variant availability, model presets, alias conflicts, parent task-callability, disabled entries, inheritance/propagation typos, backup journal health, and plugin installation state.
 
 ## Manual Install
 
@@ -151,9 +152,9 @@ The wizard supports:
 - enabling or disabling parents and variants
 - deleting variants
 - running diagnostics
-- opening `Debug & advanced` to toggle debug mode, view/clear logs, and change wizard-only filters
+- opening `Debug & advanced` to toggle debug mode, view/clear logs, manage config backups, and change wizard-only filters
 - previewing the generated config
-- saving changes with timestamped backups
+- saving meaningful config changes with a single backup journal
 
 Agent/variant list changes take effect after restarting OpenCode because agents and plugins are assembled at startup. Debug mode is hot-read and takes effect immediately after the wizard saves it.
 
@@ -179,6 +180,26 @@ The wizard defaults to showing only subagent-capable parent agents when adding o
 | Primary-only agents | Diagnostics warn because they are not callable through the `task` tool. |
 
 Agent Variants is designed for subagents. It does not try to override OpenCode's main-session model picker.
+
+## Backups
+
+The wizard keeps config history in one journal file instead of creating many timestamped `.bak` files:
+
+```txt
+~/.config/opencode/agent-variants.backup.json
+```
+
+Meaningful config saves create reverse-patch restore points, capped to the latest 50 entries. Debug and UI-size changes do not create backups, and no-op saves are skipped entirely.
+
+From `Debug & advanced` -> `Config backups`, you can:
+
+- create a full backup of the current config
+- preview patch restore points or full backups
+- restore a valid restore point after hash-chain validation
+- optionally create a full backup before restoring
+- delete full backups individually with double `ctrl+d` or all at once
+
+Full backups are not auto-pruned. Patch restore points are auto-pruned to the configured limit.
 
 ## Config File
 
@@ -282,10 +303,10 @@ Agents defined in `opencode.json`, `.opencode/agent/*.md`, or global agent markd
 - If a sidecar parent has `disable: true`, the parent override and all variants are skipped.
 - If a variant has `disable: true`, only that variant is skipped.
 - Parent overrides apply only when the parent has at least one enabled variant.
-- If a variant resolves to a definitely missing model, it is skipped for that run and a warning toast is shown.
+- If a variant resolves to a definitely missing model or model variant, it is skipped for that run and a warning toast is shown.
 - Conflicting aliases are skipped instead of overwriting existing agents.
 
-Use the wizard's `Run diagnostics` action to inspect model validation, alias conflicts, disabled parents, task-callability, and plugin installation state.
+Use the wizard's `Run diagnostics` action to inspect model validation, preset issues, alias conflicts, disabled parents, task-callability, inheritance/propagation typos, backup journal health, and plugin installation state.
 
 ## Debug Mode
 

@@ -5,6 +5,7 @@ import {
   applyPromptPatch,
   applyModelPresetPatch,
   applyTextPatch,
+  BUILTIN_AGENT_MODES,
   BUILTIN_AGENT_DESCRIPTIONS,
   defaultConfigDir,
   defaultSidecarPath,
@@ -20,8 +21,10 @@ import {
   splitModelRef,
   templateContext,
   validateModel,
+  validateModelVariant,
   type AgentPatch,
   type Diagnostic,
+  type ModelCatalog,
   type SidecarConfig,
   type TemplateContext,
   type VariantConfig,
@@ -68,6 +71,10 @@ function routeSummary(route: RuntimeRoute) {
   return `${route.alias} selected; native agent=${route.targetAgent}; parent=${route.parent}; effective model=${routeModel(route)}; variant=${route.variant ?? "default"}`
 }
 
+function agentMode(config: AgentConfig | undefined, agent: string) {
+  return config?.mode ?? BUILTIN_AGENT_MODES[agent] ?? "all"
+}
+
 function debugEnabled() {
   try {
     return loadSidecar(defaultSidecarPath()).debug
@@ -99,14 +106,34 @@ function applyPatch(target: AgentConfig, patch: AgentPatch, config: SidecarConfi
   return next
 }
 
+function validatePatchModel(label: string, patch: AgentPatch, config: SidecarConfig, catalog: ModelCatalog) {
+  return [validateModel(patch.model, config, catalog), validateModelVariant(patch.model, patch.variant, config, catalog)]
+    .filter((item): item is string => !!item)
+    .map((issue) => `${label}: ${issue}`)
+}
+
+function removeInvalidModelFields(patch: AgentPatch, config: SidecarConfig, catalog: ModelCatalog) {
+  const result = { ...patch }
+  if (validateModel(result.model, config, catalog)) {
+    delete result.model
+    delete result.variant
+    return result
+  }
+  if (validateModelVariant(result.model, result.variant, config, catalog)) delete result.variant
+  return result
+}
+
 function applyConfigPatch(target: AgentConfig, patch: AgentPatch, config: SidecarConfig, base: AgentConfig | undefined, builtin: boolean, context?: TemplateContext) {
   const safePatch = builtin && patch.prompt === undefined ? { ...patch, prompt_prepend: undefined, prompt_append: undefined } : patch
   return applyPatch(target, safePatch, config, base, context)
 }
 
-function virtualPatch(alias: string, description: string, patch: VariantConfig, config: SidecarConfig): AgentConfig {
+function virtualPatch(alias: string, description: string, patch: VariantConfig, config: SidecarConfig, base?: AgentConfig): AgentConfig {
   patch = applyModelPresetPatch(patch, config) as VariantConfig
   const result: AgentConfig = {
+    ...(base?.permission !== undefined ? { permission: base.permission } : {}),
+    ...(base?.tools !== undefined ? { tools: base.tools } : {}),
+    ...(base?.color !== undefined ? { color: base.color } : {}),
     mode: "subagent",
     description,
   }
@@ -147,12 +174,18 @@ function assembleAgents(cfg: Record<string, any>, sidecar: SidecarConfig) {
 
     const isBuiltin = BUILTIN_AGENTS.has(parent)
     const base = parentConfig ?? (isBuiltin ? { description: BUILTIN_AGENT_DESCRIPTIONS[parent] } : undefined)
+    if (agentMode(parentConfig, parent) === "primary") {
+      diagnostics.push({ level: "warning", agent: parent, message: `Parent agent "${parent}" is primary-only; variants may not be callable by the task tool unless the wizard filter was intentionally disabled.` })
+    }
     if (!base && !isBuiltin) {
       diagnostics.push({ level: "warning", agent: parent, message: `Parent agent "${parent}" was not found; variants skipped.` })
       continue
     }
 
-    const parentPatch = applyModelPresetPatch(entry.parent, sidecar)
+    const parentPatch = removeInvalidModelFields(applyModelPresetPatch(entry.parent, sidecar), sidecar, catalog)
+    for (const issue of validatePatchModel(`Parent "${parent}"`, applyModelPresetPatch(entry.parent, sidecar), sidecar, catalog)) {
+      diagnostics.push({ level: "warning", agent: parent, message: `${issue}; model fields skipped for parent override.` })
+    }
     cfg.agent[parent] = applyConfigPatch({ ...(parentConfig ?? {}) }, parentPatch, sidecar, base, isBuiltin, templateContext(parent, undefined, {}, sidecar))
     if (isBuiltin && hasPromptPatch(parentPatch)) parentPromptPatches.set(parent, parentPatch)
     if (isBuiltin && hasRequestPatch(parentPatch)) parentRequestPatches.set(parent, parentPatch)
@@ -160,9 +193,9 @@ function assembleAgents(cfg: Record<string, any>, sidecar: SidecarConfig) {
     for (const [key, variant] of enabledVariants) {
       const alias = variantName(parent, key, variant)
       const effective = applyModelPresetPatch(effectiveVariantPatch(entry.parent, variant), sidecar)
-      const modelIssue = validateModel(effective.model, sidecar, catalog)
-      if (modelIssue) {
-        diagnostics.push({ level: "warning", agent: parent, variant: key, alias, message: `Variant "${alias}" disabled at runtime: ${modelIssue}` })
+      const modelIssues = validatePatchModel(`Variant "${alias}"`, effective, sidecar, catalog)
+      if (modelIssues.length > 0) {
+        diagnostics.push({ level: "warning", agent: parent, variant: key, alias, message: `Variant "${alias}" disabled at runtime: ${modelIssues.join(" ")}` })
         continue
       }
       if (alias === parent) {
@@ -181,7 +214,7 @@ function assembleAgents(cfg: Record<string, any>, sidecar: SidecarConfig) {
       generatedAliases.set(alias, `${parent}.${key}`)
       const description = generatedVariantDescription(parent, key, { ...variant, ...effective }, sidecar)
       if (isBuiltin) {
-        cfg.agent[alias] = virtualPatch(alias, description, effective as VariantConfig, sidecar)
+        cfg.agent[alias] = virtualPatch(alias, description, effective as VariantConfig, sidecar, parentConfig)
         virtualRoutes.set(alias, {
           alias,
           parent,
@@ -366,7 +399,7 @@ function applyMessageModel(output: { message: { model?: { providerID: string; mo
   if (route.targetAgent !== route.parent) delete output.message.model
 }
 
-function liveRoute(staticRoute: RuntimeRoute) {
+function liveRoute(staticRoute: RuntimeRoute, catalog: ModelCatalog) {
   const config = loadSidecar(defaultSidecarPath())
   const entry = config.agents[staticRoute.parent]
   const variant = entry?.variants[staticRoute.key]
@@ -377,6 +410,8 @@ function liveRoute(staticRoute: RuntimeRoute) {
     throw new Error(`Variant "${staticRoute.alias}" was renamed. Restart OpenCode to update the task list.`)
   }
   const patch = applyModelPresetPatch(effectiveVariantPatch(entry.parent, variant), config)
+  const issues = validatePatchModel(`Variant "${staticRoute.alias}"`, patch, config, catalog)
+  if (issues.length > 0) throw new Error(`Variant "${staticRoute.alias}" is invalid after hot reload: ${issues.join(" ")}`)
   return {
     ...staticRoute,
     patch,
@@ -390,6 +425,7 @@ const plugin: Plugin = async (input) => {
   let virtualRoutes = new Map<string, RuntimeRoute>()
   let parentPromptPatches = new Map<string, AgentPatch>()
   let parentRequestPatches = new Map<string, AgentPatch>()
+  let catalog = modelCatalogFromProviders(undefined)
   const pending: PendingRoute[] = []
   const tokenRoutes = new Map<string, RuntimeRoute>()
   const bySession = new Map<string, RuntimeRoute>()
@@ -397,6 +433,7 @@ const plugin: Plugin = async (input) => {
 
   return {
     config: async (cfg) => {
+      catalog = modelCatalogFromProviders((cfg as Record<string, any>).provider)
       const assembled = assembleAgents(cfg as Record<string, any>, sidecar)
       virtualRoutes = assembled.virtualRoutes
       parentPromptPatches = assembled.parentPromptPatches
@@ -418,7 +455,7 @@ const plugin: Plugin = async (input) => {
       if (!args?.subagent_type || !args.prompt) return
       const staticRoute = virtualRoutes.get(args.subagent_type)
       if (!staticRoute) return
-      const route = liveRoute(staticRoute)
+      const route = liveRoute(staticRoute, catalog)
       cleanupPending(pending, tokenRoutes)
       const token = randomUUID()
       const originalDescription = args.description
