@@ -14,7 +14,6 @@ import {
   isSubagentCapableMode,
   loadSidecar,
   patchHasValue,
-  PATCH_FIELDS,
   propagationEnabled,
   saveSidecar,
   variantName,
@@ -40,7 +39,13 @@ type FieldListOption = {
   channel?: boolean
   channelLabel?: string
   channelEnabled?: boolean
+  previewColor?: DisplayColor
   kind?: "field" | "action"
+}
+type DisplayColor = string | TuiPluginApi["theme"]["current"]["text"]
+type WizardSelectOption<Value = unknown> = TuiDialogSelectOption<Value> & {
+  color?: DisplayColor
+  danger?: boolean
 }
 type ResolvedModel = {
   providerName: string
@@ -271,7 +276,7 @@ function resolveModelReference(api: TuiPluginApi, config: SidecarConfig, model: 
 
 function modelVariantOptions(api: TuiPluginApi, config: SidecarConfig, model: unknown): TuiDialogSelectOption<string>[] {
   const resolved = resolveModelReference(api, config, model)
-  const opts: TuiDialogSelectOption<string>[] = [
+  const opts: WizardSelectOption<string>[] = [
     { title: "Default", value: "__remove__", description: "Remove this local model variant override", category: "Default" },
   ]
   if (resolved) for (const variant of resolved.variants) {
@@ -286,11 +291,12 @@ function modelVariantOptions(api: TuiPluginApi, config: SidecarConfig, model: un
   return opts
 }
 
-function colorOptions(): TuiDialogSelectOption<string>[] {
-  const opts: TuiDialogSelectOption<string>[] = THEME_COLORS.map((c) => ({
+function colorOptions(api: TuiPluginApi): WizardSelectOption<string>[] {
+  const opts: WizardSelectOption<string>[] = THEME_COLORS.map((c) => ({
     title: c,
     value: c,
     category: "Theme colors",
+    color: resolveUiColor(api, c),
   }))
   for (const [name, value] of PRESET_COLORS) {
     opts.push({
@@ -298,6 +304,7 @@ function colorOptions(): TuiDialogSelectOption<string>[] {
       value,
       description: value,
       category: "Preset colors",
+      color: value,
     })
   }
   opts.push({
@@ -307,6 +314,21 @@ function colorOptions(): TuiDialogSelectOption<string>[] {
     category: "Custom",
   })
   return opts
+}
+
+function resolveUiColor(api: TuiPluginApi, color: unknown): DisplayColor | undefined {
+  if (typeof color !== "string" || color.length === 0) return undefined
+  if (THEME_COLORS.includes(color as (typeof THEME_COLORS)[number])) return api.theme.current[color as (typeof THEME_COLORS)[number]]
+  if (/^#[0-9a-fA-F]{6}$/.test(color)) return color
+  return undefined
+}
+
+function parentColor(api: TuiPluginApi, config: SidecarConfig, agent: string): DisplayColor | undefined {
+  return resolveUiColor(api, (config.agents[agent] as AgentEntry | undefined)?.parent.color)
+}
+
+function variantColor(api: TuiPluginApi, config: SidecarConfig, agent: string, key: string, variant: VariantConfig): DisplayColor | undefined {
+  return resolveUiColor(api, effectiveVariantPatch((config.agents[agent] as AgentEntry | undefined)?.parent ?? {}, variant).color)
 }
 
 function variantCount(config: SidecarConfig): number {
@@ -392,7 +414,7 @@ function fieldResult(input: { parent?: AgentEntry["parent"]; variant?: VariantCo
   return effectiveVariantPatch(input.parent, input.variant)[input.field]
 }
 
-function fieldListOption(input: { field: FieldDef; parent?: AgentEntry["parent"]; variant?: VariantConfig; mode: "parent" | "variant" }): FieldListOption {
+function fieldListOption(api: TuiPluginApi, input: { field: FieldDef; parent?: AgentEntry["parent"]; variant?: VariantConfig; mode: "parent" | "variant" }): FieldListOption {
   const source = sourceLabel({ parent: input.parent, variant: input.variant, field: input.field.key, mode: input.mode })
   const value = fieldResult({ parent: input.parent, variant: input.variant, field: input.field.key, mode: input.mode })
   const inherited = source === "SRC:inherit"
@@ -406,6 +428,7 @@ function fieldListOption(input: { field: FieldDef; parent?: AgentEntry["parent"]
     channelEnabled: input.mode === "parent"
       ? propagationEnabled(input.parent ?? {}, input.field.key)
       : inheritanceEnabled(input.variant ?? {}, input.field.key),
+    previewColor: input.field.key === "color" ? resolveUiColor(api, value) : undefined,
   }
 }
 
@@ -446,7 +469,99 @@ function showSelect<Value>(
   })
 }
 
-function showFieldList(api: TuiPluginApi, props: { title: string; options: FieldListOption[]; current?: string }): Promise<FieldListChoice | undefined> {
+function showMenu<Value>(api: TuiPluginApi, props: { title: string; options: WizardSelectOption<Value>[]; current?: Value }): Promise<Value | undefined> {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = (value: Value | undefined, clear = true) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+      if (clear) api.ui.dialog.clear()
+    }
+    api.ui.dialog.replace(
+      () => <MenuDialog api={api} title={props.title} options={props.options} current={props.current} onDone={done} />,
+      () => done(undefined, false),
+    )
+  })
+}
+
+function MenuDialog<Value>(props: {
+  api: TuiPluginApi
+  title: string
+  options: WizardSelectOption<Value>[]
+  current?: Value
+  onDone: (value: Value | undefined) => void
+}) {
+  const theme = () => props.api.theme.current
+  const [selected, setSelected] = createSignal(Math.max(0, props.options.findIndex((option) => option.value === props.current)))
+  const current = createMemo(() => props.options[selected()] ?? props.options[0])
+  const move = (delta: number) => setSelected((value) => Math.max(0, Math.min(props.options.length - 1, value + delta)))
+  const choose = () => {
+    const option = current()
+    if (!option || option.disabled) return
+    props.onDone(option.value)
+  }
+  const commandPrefix = `agent-variants.menu.${Math.random().toString(36).slice(2)}`
+  const unregister = props.api.keymap.registerLayer({
+    priority: 10000,
+    commands: [
+      { name: `${commandPrefix}.up`, title: "Previous item", run: () => move(-1) },
+      { name: `${commandPrefix}.down`, title: "Next item", run: () => move(1) },
+      { name: `${commandPrefix}.select`, title: "Select item", run: choose },
+      { name: `${commandPrefix}.back`, title: "Back", run: () => props.onDone(undefined) },
+    ],
+    bindings: [
+      { key: "up", cmd: `${commandPrefix}.up`, desc: "Previous item" },
+      { key: "ctrl+p", cmd: `${commandPrefix}.up`, desc: "Previous item" },
+      { key: "down", cmd: `${commandPrefix}.down`, desc: "Next item" },
+      { key: "ctrl+n", cmd: `${commandPrefix}.down`, desc: "Next item" },
+      { key: "enter", cmd: `${commandPrefix}.select`, desc: "Select item" },
+      { key: "escape", cmd: `${commandPrefix}.back`, desc: "Back" },
+    ],
+  })
+  onCleanup(unregister)
+
+  return (
+    <box flexDirection="column" width="100%" paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1}>
+      <box flexDirection="row" justifyContent="space-between" width="100%" marginBottom={1}>
+        <text fg={theme().text}><b>{props.title}</b></text>
+        <text fg={theme().textMuted} onMouseUp={() => props.onDone(undefined)}>esc</text>
+      </box>
+      <box flexDirection="row" gap={3} marginBottom={1}>
+        <text fg={theme().textMuted}>enter select</text>
+        <text fg={theme().textMuted}>up/down move</text>
+      </box>
+      <box flexDirection="column" gap={0}>
+        <For each={props.options}>
+          {(option, index) => {
+            const active = createMemo(() => selected() === index())
+            const fg = createMemo(() => active() ? theme().background : option.danger ? theme().error : option.color ?? theme().text)
+            const descFg = createMemo(() => active() ? theme().background : theme().textMuted)
+            return (
+              <box
+                flexDirection="row"
+                width="100%"
+                gap={1}
+                paddingLeft={1}
+                paddingRight={1}
+                backgroundColor={active() ? theme().primary : theme().backgroundPanel}
+                onMouseOver={() => setSelected(index())}
+                onMouseUp={() => {
+                  if (!option.disabled) props.onDone(option.value)
+                }}
+              >
+                <text width={30} flexShrink={0} fg={fg()} wrapMode="none"><b>{option.title}</b></text>
+                <text flexGrow={1} fg={descFg()} wrapMode="none" overflow="hidden">{option.description ?? ""}</text>
+              </box>
+            )
+          }}
+        </For>
+      </box>
+    </box>
+  )
+}
+
+function showFieldList(api: TuiPluginApi, props: { title: string; options: FieldListOption[]; current?: string; titleColor?: DisplayColor }): Promise<FieldListChoice | undefined> {
   return new Promise((resolve) => {
     let settled = false
     const done = (value: FieldListChoice | undefined, clear = true) => {
@@ -456,7 +571,7 @@ function showFieldList(api: TuiPluginApi, props: { title: string; options: Field
       if (clear) api.ui.dialog.clear()
     }
     api.ui.dialog.replace(
-      () => <FieldListDialog api={api} title={props.title} options={props.options} current={props.current} onDone={done} />,
+      () => <FieldListDialog api={api} title={props.title} titleColor={props.titleColor} options={props.options} current={props.current} onDone={done} />,
       () => done(undefined, false),
     )
   })
@@ -465,6 +580,7 @@ function showFieldList(api: TuiPluginApi, props: { title: string; options: Field
 function FieldListDialog(props: {
   api: TuiPluginApi
   title: string
+  titleColor?: DisplayColor
   options: FieldListOption[]
   current?: string
   onDone: (value: FieldListChoice | undefined) => void
@@ -509,7 +625,7 @@ function FieldListDialog(props: {
   return (
     <box flexDirection="column" width="100%" paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1}>
       <box flexDirection="row" justifyContent="space-between" width="100%" marginBottom={1}>
-        <text fg={theme().text}><b>{props.title}</b></text>
+        <text fg={props.titleColor ?? theme().text}><b>{props.title}</b></text>
         <text fg={theme().textMuted} onMouseUp={() => props.onDone(undefined)}>esc</text>
       </box>
       <box flexDirection="column" gap={0} marginBottom={1}>
@@ -538,7 +654,7 @@ function FieldListDialog(props: {
                 gap={1}
                 paddingLeft={1}
                 paddingRight={1}
-                backgroundColor={active() ? theme().primary : theme().backgroundPanel}
+                backgroundColor={option.previewColor ?? (active() ? theme().primary : theme().backgroundPanel)}
                 onMouseOver={() => setSelected(index())}
                 onMouseUp={() => props.onDone({ action: "select", value: option.value })}
               >
@@ -723,12 +839,13 @@ async function addVariant(api: TuiPluginApi, config: SidecarConfig, settings: Wi
     return config
   }
 
-  const agentOpts: TuiDialogSelectOption<string>[] = agents.map((a) => ({
+  const agentOpts: WizardSelectOption<string>[] = agents.map((a) => ({
     title: a,
     value: a,
     description: `${agentMode(api, a)} - ${BUILTIN_AGENT_DESCRIPTIONS[a] ?? api.state.config.agent?.[a]?.description ?? "Configured agent"}`,
+    color: parentColor(api, config, a),
   }))
-  const agent = await showSelect(api.ui, { title: "Add variant - pick parent agent", options: agentOpts })
+  const agent = await showMenu(api, { title: "Add variant - pick parent agent", options: agentOpts })
   if (!agent) return config
   if (settings.subagentCapableOnly && !isSubagentCapableMode(agentMode(api, agent))) {
     await showAlert(api.ui, {
@@ -780,24 +897,14 @@ async function editParentFields(
   while (true) {
     const parent = (next.agents[agent] as AgentEntry).parent
     const fieldOpts: FieldListOption[] = [
-      ...EDITABLE_FIELDS.map((field) => fieldListOption({ field, parent, mode: "parent" })),
-      { title: "Propagation: enable all", value: "__propagate_all__", description: "Share all parent parameters", kind: "action" },
-      { title: "Propagation: disable all", value: "__propagate_none__", description: "Keep parent parameters local", kind: "action" },
+      ...EDITABLE_FIELDS.map((field) => fieldListOption(api, { field, parent, mode: "parent" })),
       { title: "< Back", value: "__back__", description: "Return to main menu", kind: "action" },
     ]
 
-    const pickedField = await showFieldList(api, { title: `Edit parent fields - ${agent}`, options: fieldOpts, current: selectedField })
+    const pickedField = await showFieldList(api, { title: `Edit parent fields - ${agent}`, options: fieldOpts, current: selectedField, titleColor: parentColor(api, next, agent) })
     const field = pickedField?.value
     if (!field || field === "__back__") return next
     selectedField = field
-
-    if (field === "__propagate_all__" || field === "__propagate_none__") {
-      parent.propagate = Object.fromEntries(PATCH_FIELDS.map((key) => [key, field === "__propagate_all__"]))
-      markHot(settings)
-      markRestart(settings, `${agent}: restart-required fields changed propagation status.`)
-      await warnRestartField(api, "Bulk propagation", "Hot fields apply on the next matching variant call; description/color propagation changes require restart.")
-      continue
-    }
 
     const picked = fieldDef(field)
     if (!picked) continue
@@ -877,7 +984,7 @@ async function editVariantFields(
         message: `Current: ${variant.color ?? "(not set)"}`,
       })
       if (wantColor) {
-        const picked = await showSelect(api.ui, { title: "Pick color", options: colorOptions() })
+        const picked = await showMenu(api, { title: "Pick color", options: colorOptions(api) })
         if (picked === "__custom__") {
           const hex = await showPrompt(api.ui, { title: "Hex color", placeholder: "#FF5733" })
           if (hex) variant.color = hex
@@ -912,21 +1019,23 @@ async function editVariant(api: TuiPluginApi, config: SidecarConfig, settings: W
     return config
   }
 
-  const agentOpts: TuiDialogSelectOption<string>[] = agentsWithVariants.map(([a, e]) => ({
+  const agentOpts: WizardSelectOption<string>[] = agentsWithVariants.map(([a, e]) => ({
     title: a,
     value: a,
     description: `${Object.keys(e.variants).length} variant(s)`,
+    color: parentColor(api, config, a),
   }))
-  const agent = await showSelect(api.ui, { title: "Edit variant - pick agent", options: agentOpts })
+  const agent = await showMenu(api, { title: "Edit variant - pick agent", options: agentOpts })
   if (!agent) return config
 
   const entries = variantEntries(config.agents[agent] as AgentEntry)
-  const varOpts: TuiDialogSelectOption<string>[] = entries.map(([k, v]) => ({
+  const varOpts: WizardSelectOption<string>[] = entries.map(([k, v]) => ({
     title: `${variantName(agent, k, v)}  (${k})`,
     value: k,
     description: modelDescription(v.model, config),
+    color: variantColor(api, config, agent, k, v),
   }))
-  const key = await showSelect(api.ui, { title: `Edit variant of "${agent}"`, options: varOpts })
+  const key = await showMenu(api, { title: `Edit variant of "${agent}"`, options: varOpts })
   if (!key) return config
 
   const next = structuredClone(config)
@@ -936,7 +1045,7 @@ async function editVariant(api: TuiPluginApi, config: SidecarConfig, settings: W
     const parent = nextEntry.parent
     const target = nextEntry.variants[key] as VariantConfig & Record<string, unknown>
     const fieldOpts: FieldListOption[] = [
-      ...EDITABLE_FIELDS.map((field) => fieldListOption({ field, parent, variant: target, mode: "variant" })),
+      ...EDITABLE_FIELDS.map((field) => fieldListOption(api, { field, parent, variant: target, mode: "variant" })),
       {
         title: "Display name",
         value: "name",
@@ -946,7 +1055,7 @@ async function editVariant(api: TuiPluginApi, config: SidecarConfig, settings: W
       { title: "< Back", value: "__back__", description: "Return to variant picker", kind: "action" },
     ]
 
-    const pickedField = await showFieldList(api, { title: `Edit field - ${variantName(agent, key, target)}`, options: fieldOpts, current: selectedField })
+    const pickedField = await showFieldList(api, { title: `Edit field - ${variantName(agent, key, target)}`, options: fieldOpts, current: selectedField, titleColor: variantColor(api, next, agent, key, target) })
     const field = pickedField?.value
     if (!field || field === "__back__") return next
     selectedField = field
@@ -985,7 +1094,7 @@ async function editVariant(api: TuiPluginApi, config: SidecarConfig, settings: W
 }
 
 async function toggleDisable(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings): Promise<SidecarConfig> {
-  const items: TuiDialogSelectOption<{ agent: string; variant?: string }>[] = []
+  const items: WizardSelectOption<{ agent: string; variant?: string }>[] = []
 
   for (const [agent, raw] of agentEntries(config)) {
     const entry = raw as AgentEntry
@@ -995,6 +1104,8 @@ async function toggleDisable(api: TuiPluginApi, config: SidecarConfig, settings:
       value: { agent },
       description: parentDisabled ? "Disabled - no variants active" : "Enabled",
       category: "Parents",
+      color: parentColor(api, config, agent),
+      danger: parentDisabled,
     })
     for (const [key, rawVar] of variantEntries(entry)) {
       const variant = rawVar as VariantConfig
@@ -1004,6 +1115,8 @@ async function toggleDisable(api: TuiPluginApi, config: SidecarConfig, settings:
         value: { agent, variant: key },
         description: vDisabled ? "Disabled" : "Enabled",
         category: "Variants",
+        color: variantColor(api, config, agent, key, variant),
+        danger: vDisabled,
       })
     }
   }
@@ -1019,7 +1132,7 @@ async function toggleDisable(api: TuiPluginApi, config: SidecarConfig, settings:
     description: "Return to main menu",
   })
 
-  const picked = await showSelect(api.ui, { title: "Toggle disable", options: items })
+  const picked = await showMenu(api, { title: "Toggle disable", options: items })
   if (!picked || picked.agent === "__back__") return config
 
   const next = structuredClone(config)
@@ -1054,21 +1167,24 @@ async function deleteVariant(api: TuiPluginApi, config: SidecarConfig, settings:
     return config
   }
 
-  const agentOpts: TuiDialogSelectOption<string>[] = agentsWithVariants.map(([a]) => ({
+  const agentOpts: WizardSelectOption<string>[] = agentsWithVariants.map(([a]) => ({
     title: a,
     value: a,
+    color: parentColor(api, config, a),
   }))
-  const agent = await showSelect(api.ui, { title: "Delete variant - pick agent", options: agentOpts })
+  const agent = await showMenu(api, { title: "Delete variant - pick agent", options: agentOpts })
   if (!agent) return config
 
   const agentEntry = config.agents[agent] as AgentEntry
   const entries = variantEntries(agentEntry)
-  const varOpts: TuiDialogSelectOption<string>[] = entries.map(([k, v]) => ({
+  const varOpts: WizardSelectOption<string>[] = entries.map(([k, v]) => ({
     title: `${variantName(agent, k, v)}  (${k})`,
     value: k,
     description: modelDescription(v.model, config),
+    color: variantColor(api, config, agent, k, v),
+    danger: true,
   }))
-  const key = await showSelect(api.ui, { title: `Delete variant from "${agent}"`, options: varOpts })
+  const key = await showMenu(api, { title: `Delete variant from "${agent}"`, options: varOpts })
   if (!key) return config
 
   const name = variantName(agent, key, agentEntry.variants[key] as VariantConfig)
@@ -1306,7 +1422,7 @@ async function promptForField(
   }
 
   if (field === "color") {
-    const picked = await showSelect(api.ui, { title: "Pick color", options: [{ title: "< Remove value >", value: "__remove__", description: "Delete this local color override", category: "Current field" }, ...colorOptions()] })
+    const picked = await showMenu(api, { title: "Pick color", options: [{ title: "Default", value: "__remove__", description: "Delete this local color override" }, ...colorOptions(api)] })
     if (picked === "__custom__") {
       return showPrompt(api.ui, { title: "Hex color", placeholder: "#FF5733" })
     }
@@ -1383,7 +1499,7 @@ async function mainMenu(api: TuiPluginApi, config: SidecarConfig, settings: Wiza
   const agentCount = Object.keys(config.agents).length
   const vCount = variantCount(config)
 
-  const opts: TuiDialogSelectOption<string>[] = [
+  const opts: WizardSelectOption<string>[] = [
     { title: "Add variant...", value: "add", description: "Create a new agent variant" },
     { title: "Edit parent fields...", value: "edit-parent", description: "Override fields on an agent parent" },
     { title: "Edit variant...", value: "edit-variant", description: "Change fields on an existing variant" },
@@ -1396,10 +1512,9 @@ async function mainMenu(api: TuiPluginApi, config: SidecarConfig, settings: Wiza
     { title: "Save & exit", value: "save", description: "Write to disk with backup" },
   ]
 
-  const action = await showSelect(api.ui, {
+  const action = await showMenu(api, {
     title: "Agent Variants",
     options: opts,
-    placeholder: "Choose an action...",
   })
 
   switch (action) {
@@ -1434,13 +1549,14 @@ async function mainMenu(api: TuiPluginApi, config: SidecarConfig, settings: Wiza
 
 async function editParentFlow(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings): Promise<SidecarConfig> {
   const agents = selectableParentAgents(api, config, settings)
-  const opts: TuiDialogSelectOption<string>[] = agents.map((a) => {
+  const opts: WizardSelectOption<string>[] = agents.map((a) => {
     const entry = config.agents[a] as AgentEntry | undefined
     const overrides = entry ? Object.keys(entry.parent).length : 0
     return {
       title: a,
       value: a,
       description: `${agentMode(api, a)} - ${overrides > 0 ? `${overrides} parent override(s)` : "No overrides"}`,
+      color: parentColor(api, config, a),
     }
   })
   opts.push({
@@ -1449,7 +1565,7 @@ async function editParentFlow(api: TuiPluginApi, config: SidecarConfig, settings
     description: "Return to main menu",
   })
 
-  const agent = await showSelect(api.ui, { title: "Edit parent fields - pick agent", options: opts })
+  const agent = await showMenu(api, { title: "Edit parent fields - pick agent", options: opts })
   if (!agent || agent === "__back__") return mainMenu(api, config, settings)
 
   const updated = await editParentFields(api, config, agent, settings)
@@ -1473,7 +1589,7 @@ async function debugAdvancedMenu(api: TuiPluginApi, config: SidecarConfig, setti
     { title: "< Back", value: "__back__", description: "Return to main menu" },
   ]
 
-  const action = await showSelect(api.ui, { title: "Debug & advanced", options: opts })
+  const action = await showMenu(api, { title: "Debug & advanced", options: opts })
   switch (action) {
     case "debug":
       return debugAdvancedMenu(api, await toggleDebug(api, config), settings)
