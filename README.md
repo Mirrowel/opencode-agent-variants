@@ -200,7 +200,9 @@ See `docs/CONFIG.md` for the complete config reference and `agent-variants.examp
   "models": {
     "light": {
       "model": "zai-coding-plan/glm-5.1",
-      "label": "GLM 5.1"
+      "label": "GLM 5.1",
+      "variant": "low",
+      "temperature": 0.2
     }
   },
   "agents": {

@@ -71,15 +71,18 @@ const Variant = Patch.extend({
   name: z.string().min(1).optional(),
 })
 
+const ModelShortcut = z.object({
+  model: z.string().min(1),
+  label: z.string().min(1).optional(),
+  variant: z.string().optional(),
+  temperature: z.number().finite().optional(),
+  top_p: z.number().finite().optional(),
+  options: z.record(z.string(), z.unknown()).optional(),
+})
+
 export const SidecarConfig = z.object({
   debug: z.boolean().default(false),
-  models: z.record(
-    z.string(),
-    z.object({
-      model: z.string().min(1),
-      label: z.string().min(1).optional(),
-    }),
-  ).default({}),
+  models: z.record(z.string(), ModelShortcut).default({}),
   agents: z.record(
     z.string(),
     z.object({
@@ -95,6 +98,7 @@ export type HotReloadField = (typeof HOT_RELOAD_FIELDS)[number]
 export type AgentPatch = z.infer<typeof Patch>
 export type ParentPatch = z.infer<typeof ParentPatch>
 export type VariantConfig = z.infer<typeof Variant>
+export type ModelShortcut = z.infer<typeof ModelShortcut>
 export type SidecarConfig = z.infer<typeof SidecarConfig>
 export type DiagnosticLevel = "error" | "warning" | "info"
 export type Diagnostic = {
@@ -241,6 +245,21 @@ export function resolveModel(input: string | undefined, config: SidecarConfig) {
   return config.models[input]?.model ?? input
 }
 
+export function applyModelPresetPatch(patch: AgentPatch, config: SidecarConfig): AgentPatch {
+  const preset = patch.model ? config.models[patch.model] : undefined
+  if (!preset) return patch
+  return Object.fromEntries(
+    PATCH_FIELDS.flatMap((field) => {
+      const value = patchHasValue(patch, field)
+        ? patch[field]
+        : field === "model"
+          ? patch.model
+          : preset[field as keyof ModelShortcut]
+      return value === undefined ? [] : [[field, value]]
+    }),
+  ) as AgentPatch
+}
+
 export function modelLabel(input: string | undefined, config: SidecarConfig) {
   if (!input) return "the configured model"
   return config.models[input]?.label ?? config.models[input]?.model ?? input
@@ -359,5 +378,5 @@ export function hasPromptPatch(patch: AgentPatch) {
 }
 
 export function hasRequestPatch(patch: AgentPatch) {
-  return patch.temperature !== undefined || patch.top_p !== undefined || patch.options !== undefined
+  return patch.model !== undefined || patch.temperature !== undefined || patch.top_p !== undefined || patch.options !== undefined
 }

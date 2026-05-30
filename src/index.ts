@@ -3,6 +3,7 @@ import { appendFileSync } from "node:fs"
 import type { Plugin } from "@opencode-ai/plugin"
 import {
   applyPromptPatch,
+  applyModelPresetPatch,
   applyTextPatch,
   BUILTIN_AGENT_DESCRIPTIONS,
   defaultConfigDir,
@@ -81,6 +82,7 @@ function mergeOptions(target: Record<string, unknown> | undefined, source: Recor
 
 function applyPatch(target: AgentConfig, patch: AgentPatch, config: SidecarConfig, base?: AgentConfig, context?: TemplateContext) {
   const next = target
+  patch = applyModelPresetPatch(patch, config)
   const model = resolveModel(patch.model, config)
   if (model) next.model = model
   if (patch.variant !== undefined) next.variant = patch.variant
@@ -103,6 +105,7 @@ function applyConfigPatch(target: AgentConfig, patch: AgentPatch, config: Sideca
 }
 
 function virtualPatch(alias: string, description: string, patch: VariantConfig, config: SidecarConfig): AgentConfig {
+  patch = applyModelPresetPatch(patch, config) as VariantConfig
   const result: AgentConfig = {
     mode: "subagent",
     description,
@@ -149,13 +152,14 @@ function assembleAgents(cfg: Record<string, any>, sidecar: SidecarConfig) {
       continue
     }
 
-    cfg.agent[parent] = applyConfigPatch({ ...(parentConfig ?? {}) }, entry.parent, sidecar, base, isBuiltin, templateContext(parent, undefined, {}, sidecar))
-    if (isBuiltin && hasPromptPatch(entry.parent)) parentPromptPatches.set(parent, entry.parent)
-    if (isBuiltin && hasRequestPatch(entry.parent)) parentRequestPatches.set(parent, entry.parent)
+    const parentPatch = applyModelPresetPatch(entry.parent, sidecar)
+    cfg.agent[parent] = applyConfigPatch({ ...(parentConfig ?? {}) }, parentPatch, sidecar, base, isBuiltin, templateContext(parent, undefined, {}, sidecar))
+    if (isBuiltin && hasPromptPatch(parentPatch)) parentPromptPatches.set(parent, parentPatch)
+    if (isBuiltin && hasRequestPatch(parentPatch)) parentRequestPatches.set(parent, parentPatch)
 
     for (const [key, variant] of enabledVariants) {
       const alias = variantName(parent, key, variant)
-      const effective = effectiveVariantPatch(entry.parent, variant)
+      const effective = applyModelPresetPatch(effectiveVariantPatch(entry.parent, variant), sidecar)
       const modelIssue = validateModel(effective.model, sidecar, catalog)
       if (modelIssue) {
         diagnostics.push({ level: "warning", agent: parent, variant: key, alias, message: `Variant "${alias}" disabled at runtime: ${modelIssue}` })
@@ -305,7 +309,8 @@ async function warningToast(client: any, diagnostic: Diagnostic) {
   }).catch(() => undefined)
 }
 
-function applyRequestPatch(output: { temperature?: number; topP?: number; options: Record<string, any> }, patch: AgentPatch) {
+function applyRequestPatch(output: { temperature?: number; topP?: number; options: Record<string, any> }, patch: AgentPatch, config: SidecarConfig) {
+  patch = applyModelPresetPatch(patch, config)
   if (patch.temperature !== undefined) output.temperature = patch.temperature
   if (patch.top_p !== undefined) output.topP = patch.top_p
   if (patch.options !== undefined) Object.assign(output.options, patch.options)
@@ -371,7 +376,7 @@ function liveRoute(staticRoute: RuntimeRoute) {
   if (variantName(staticRoute.parent, staticRoute.key, variant) !== staticRoute.alias) {
     throw new Error(`Variant "${staticRoute.alias}" was renamed. Restart OpenCode to update the task list.`)
   }
-  const patch = effectiveVariantPatch(entry.parent, variant)
+  const patch = applyModelPresetPatch(effectiveVariantPatch(entry.parent, variant), config)
   return {
     ...staticRoute,
     patch,
@@ -509,10 +514,10 @@ const plugin: Plugin = async (input) => {
       const parent = parentRequestPatches.get(hookInput.agent)
       if (routed) {
         resetGeneratedRequest(output, routed)
-        applyRequestPatch(output, routed.patch)
+        applyRequestPatch(output, routed.patch, sidecar)
         return
       }
-      if (parent) applyRequestPatch(output, parent)
+      if (parent) applyRequestPatch(output, parent, sidecar)
     },
     "experimental.chat.system.transform": async (hookInput, output) => {
       if (!hookInput.sessionID) return

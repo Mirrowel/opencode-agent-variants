@@ -18,6 +18,7 @@ import {
   saveSidecar,
   variantName,
   type AgentMode,
+  type ModelShortcut,
   type SidecarConfig,
   type VariantConfig,
   type PatchField,
@@ -46,6 +47,7 @@ type DisplayColor = string | TuiPluginApi["theme"]["current"]["text"]
 type WizardSelectOption<Value = unknown> = TuiDialogSelectOption<Value> & {
   color?: DisplayColor
   danger?: boolean
+  help?: string
 }
 type ResolvedModel = {
   providerName: string
@@ -112,6 +114,14 @@ const EDITABLE_FIELDS: FieldDef[] = [
   { key: "color", label: "Color", type: "string" },
 ]
 const EDITABLE_FIELD_KEYS = new Set(EDITABLE_FIELDS.map((field) => field.key))
+const MODEL_PRESET_FIELDS: Array<{ key: keyof ModelShortcut; label: string; type: "string" | "number" | "json"; required?: boolean }> = [
+  { key: "model", label: "Model", type: "string", required: true },
+  { key: "label", label: "Label", type: "string" },
+  { key: "variant", label: "Variant", type: "string" },
+  { key: "temperature", label: "Temperature", type: "number" },
+  { key: "top_p", label: "Top P", type: "number" },
+  { key: "options", label: "Options (JSON)", type: "json" },
+]
 
 const FIELD_HELP: Record<
   PatchField,
@@ -219,15 +229,21 @@ function selectableParentAgents(api: TuiPluginApi, config: SidecarConfig, settin
     .filter((agent) => !settings.subagentCapableOnly || isSubagentCapableMode(agentMode(api, agent)))
 }
 
-function modelOptions(api: TuiPluginApi, config: SidecarConfig): TuiDialogSelectOption<string>[] {
+function modelOptions(api: TuiPluginApi, config: SidecarConfig, input?: { includePresets?: boolean }): TuiDialogSelectOption<string>[] {
   const opts: TuiDialogSelectOption<string>[] = []
 
-  for (const [key, raw] of Object.entries(config.models)) {
+  for (const [key, raw] of input?.includePresets === false ? [] : Object.entries(config.models)) {
     const entry = raw as ModelEntry
     opts.push({
       title: `${key} -> ${entry.model}`,
       value: key,
-      description: entry.label ?? entry.model,
+      description: [
+        entry.label ?? entry.model,
+        entry.variant ? `variant ${entry.variant}` : undefined,
+        entry.temperature !== undefined ? `temp ${entry.temperature}` : undefined,
+        entry.top_p !== undefined ? `top_p ${entry.top_p}` : undefined,
+        entry.options !== undefined ? "options" : undefined,
+      ].filter(Boolean).join(" - "),
       category: "Named shortcuts",
     })
   }
@@ -248,13 +264,38 @@ function modelOptions(api: TuiPluginApi, config: SidecarConfig): TuiDialogSelect
   }
 
   opts.push({
-    title: "Custom model...",
+    title: "Custom model",
     value: "__custom__",
     description: "Type a provider/model ID manually",
     category: "Custom",
   })
 
   return opts
+}
+
+function modelPresetDescription(entry: ModelShortcut | undefined) {
+  if (!entry) return "not configured"
+  return [
+    entry.model,
+    entry.variant ? `variant ${entry.variant}` : undefined,
+    entry.temperature !== undefined ? `temp ${entry.temperature}` : undefined,
+    entry.top_p !== undefined ? `top_p ${entry.top_p}` : undefined,
+    entry.options !== undefined ? "options" : undefined,
+  ].filter(Boolean).join(" - ")
+}
+
+function modelPresetHelp(key: string, entry: ModelShortcut | undefined) {
+  return [
+    `Model preset: ${key}`,
+    "",
+    "A model preset is a reusable shortcut for model-related runtime fields.",
+    "Use the preset key in any Model field, for example light or heavy.",
+    "",
+    "When applied, the preset supplies model, model variant, temperature, top_p, and options.",
+    "A parent or variant can still override any of those fields locally after selecting the preset.",
+    "",
+    `Current: ${modelPresetDescription(entry)}`,
+  ].join("\n")
 }
 
 function resolveModelReference(api: TuiPluginApi, config: SidecarConfig, model: unknown): ResolvedModel | undefined {
@@ -283,7 +324,7 @@ function modelVariantOptions(api: TuiPluginApi, config: SidecarConfig, model: un
     opts.push({ title: variant, value: variant, description: `${resolved.modelName} via ${resolved.providerName}`, category: "Known variants" })
   }
   opts.push({
-    title: "Custom variant...",
+    title: "Custom variant",
     value: "__custom__",
     description: resolved ? "Type a provider-specific variant manually" : "No concrete model selected; type a variant manually",
     category: "Custom",
@@ -308,7 +349,7 @@ function colorOptions(api: TuiPluginApi): WizardSelectOption<string>[] {
     })
   }
   opts.push({
-    title: "Custom hex...",
+    title: "Custom hex",
     value: "__custom__",
     description: "Enter a hex color like #FF5733",
     category: "Custom",
@@ -414,14 +455,25 @@ function fieldResult(input: { parent?: AgentEntry["parent"]; variant?: VariantCo
   return effectiveVariantPatch(input.parent, input.variant)[input.field]
 }
 
-function fieldListOption(api: TuiPluginApi, input: { field: FieldDef; parent?: AgentEntry["parent"]; variant?: VariantConfig; mode: "parent" | "variant" }): FieldListOption {
+function fieldDefaultDescription(input: { field: PatchField; mode: "parent" | "variant"; parentName?: string; variantName?: string }) {
+  if (input.field === "model") return "default: current/session model"
+  if (input.field === "variant") return "default: provider default"
+  if (input.field === "temperature") return "default: provider/model default"
+  if (input.field === "top_p") return "default: provider/model default"
+  if (input.field === "description") return input.mode === "variant" ? `default: Copy of ${input.parentName ?? "parent"} using model` : "default: OpenCode/native description"
+  if (input.field === "color") return "default: OpenCode/default color"
+  if (input.field === "options") return "default: no extra options"
+  return "default: not set"
+}
+
+function fieldListOption(api: TuiPluginApi, input: { field: FieldDef; parent?: AgentEntry["parent"]; variant?: VariantConfig; mode: "parent" | "variant"; parentName?: string; alias?: string }): FieldListOption {
   const source = sourceLabel({ parent: input.parent, variant: input.variant, field: input.field.key, mode: input.mode })
   const value = fieldResult({ parent: input.parent, variant: input.variant, field: input.field.key, mode: input.mode })
   const inherited = source === "SRC:inherit"
   return {
     title: input.field.label,
     value: input.field.key,
-    description: value !== undefined ? `${inherited ? "inherited: " : ""}${truncate(formatInputValue(value) ?? String(value), 76)}` : "not set",
+    description: value !== undefined ? `${inherited ? "inherited: " : ""}${truncate(formatInputValue(value) ?? String(value), 76)}` : fieldDefaultDescription({ field: input.field.key, mode: input.mode, parentName: input.parentName, variantName: input.alias }),
     restart: !isHotReloadField(input.field.key),
     channel: true,
     channelLabel: input.mode === "parent" ? "propagation" : "inheritance",
@@ -469,10 +521,27 @@ function showSelect<Value>(
   })
 }
 
-function showMenu<Value>(api: TuiPluginApi, props: { title: string; options: WizardSelectOption<Value>[]; current?: Value }): Promise<Value | undefined> {
+type MenuChoice<Value> = { action: "select" | "inspect"; value: Value }
+
+async function showMenu<Value>(api: TuiPluginApi, props: { title: string; options: WizardSelectOption<Value>[]; current?: Value }): Promise<Value | undefined> {
+  let current = props.current
+  while (true) {
+    const choice = await showMenuOnce(api, { ...props, current })
+    if (!choice) return undefined
+    current = choice.value
+    if (choice.action === "select") return choice.value
+    const option = props.options.find((item) => item.value === choice.value)
+    await showInfo(api, {
+      title: option?.title ?? props.title,
+      message: option?.help ?? option?.description ?? "No extra help is available for this option.",
+    })
+  }
+}
+
+function showMenuOnce<Value>(api: TuiPluginApi, props: { title: string; options: WizardSelectOption<Value>[]; current?: Value }): Promise<MenuChoice<Value> | undefined> {
   return new Promise((resolve) => {
     let settled = false
-    const done = (value: Value | undefined, clear = true) => {
+    const done = (value: MenuChoice<Value> | undefined, clear = true) => {
       if (settled) return
       settled = true
       resolve(value)
@@ -490,16 +559,22 @@ function MenuDialog<Value>(props: {
   title: string
   options: WizardSelectOption<Value>[]
   current?: Value
-  onDone: (value: Value | undefined) => void
+  onDone: (value: MenuChoice<Value> | undefined) => void
 }) {
   const theme = () => props.api.theme.current
+  const popMode = props.api.mode.push("agent-variants.dialog")
   const [selected, setSelected] = createSignal(Math.max(0, props.options.findIndex((option) => option.value === props.current)))
   const current = createMemo(() => props.options[selected()] ?? props.options[0])
   const move = (delta: number) => setSelected((value) => Math.max(0, Math.min(props.options.length - 1, value + delta)))
   const choose = () => {
     const option = current()
     if (!option || option.disabled) return
-    props.onDone(option.value)
+    props.onDone({ action: "select", value: option.value })
+  }
+  const inspect = () => {
+    const option = current()
+    if (!option || option.disabled) return
+    props.onDone({ action: "inspect", value: option.value })
   }
   const commandPrefix = `agent-variants.menu.${Math.random().toString(36).slice(2)}`
   const unregister = props.api.keymap.registerLayer({
@@ -508,6 +583,7 @@ function MenuDialog<Value>(props: {
       { name: `${commandPrefix}.up`, title: "Previous item", run: () => move(-1) },
       { name: `${commandPrefix}.down`, title: "Next item", run: () => move(1) },
       { name: `${commandPrefix}.select`, title: "Select item", run: choose },
+      { name: `${commandPrefix}.inspect`, title: "Option help", run: inspect },
       { name: `${commandPrefix}.back`, title: "Back", run: () => props.onDone(undefined) },
     ],
     bindings: [
@@ -516,10 +592,14 @@ function MenuDialog<Value>(props: {
       { key: "down", cmd: `${commandPrefix}.down`, desc: "Next item" },
       { key: "ctrl+n", cmd: `${commandPrefix}.down`, desc: "Next item" },
       { key: "enter", cmd: `${commandPrefix}.select`, desc: "Select item" },
+      { key: "i", cmd: `${commandPrefix}.inspect`, desc: "Option help" },
       { key: "escape", cmd: `${commandPrefix}.back`, desc: "Back" },
     ],
   })
-  onCleanup(unregister)
+  onCleanup(() => {
+    unregister()
+    popMode()
+  })
 
   return (
     <box flexDirection="column" width="100%" paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1}>
@@ -530,6 +610,7 @@ function MenuDialog<Value>(props: {
       <box flexDirection="row" gap={3} marginBottom={1}>
         <text fg={theme().textMuted}>enter select</text>
         <text fg={theme().textMuted}>up/down move</text>
+        <text fg={theme().textMuted}>i help</text>
       </box>
       <box flexDirection="column" gap={0}>
         <For each={props.options}>
@@ -547,7 +628,7 @@ function MenuDialog<Value>(props: {
                 backgroundColor={active() ? theme().primary : theme().backgroundPanel}
                 onMouseOver={() => setSelected(index())}
                 onMouseUp={() => {
-                  if (!option.disabled) props.onDone(option.value)
+                  if (!option.disabled) props.onDone({ action: "select", value: option.value })
                 }}
               >
                 <text width={30} flexShrink={0} fg={fg()} wrapMode="none"><b>{option.title}</b></text>
@@ -586,6 +667,7 @@ function FieldListDialog(props: {
   onDone: (value: FieldListChoice | undefined) => void
 }) {
   const theme = () => props.api.theme.current
+  const popMode = props.api.mode.push("agent-variants.dialog")
   const [selected, setSelected] = createSignal(Math.max(0, props.options.findIndex((option) => option.value === props.current)))
   const current = createMemo(() => props.options[selected()] ?? props.options[0])
   const move = (delta: number) => {
@@ -620,7 +702,10 @@ function FieldListDialog(props: {
       { key: "escape", cmd: `${commandPrefix}.back`, desc: "Back" },
     ],
   })
-  onCleanup(unregister)
+  onCleanup(() => {
+    unregister()
+    popMode()
+  })
 
   return (
     <box flexDirection="column" width="100%" paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1}>
@@ -763,6 +848,67 @@ function showAlert(ui: UI, props: { title: string; message: string }): Promise<v
   })
 }
 
+function showInfo(api: TuiPluginApi, props: { title: string; message: string }): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = () => {
+      if (settled) return
+      settled = true
+      resolve()
+      api.ui.dialog.clear()
+    }
+    api.ui.dialog.replace(
+      () => <InfoDialog api={api} title={props.title} message={props.message} onDone={done} />,
+      done,
+    )
+  })
+}
+
+function InfoDialog(props: { api: TuiPluginApi; title: string; message: string; onDone: () => void }) {
+  const theme = () => props.api.theme.current
+  const popMode = props.api.mode.push("agent-variants.dialog")
+  const lines = createMemo(() => props.message.split(/\r?\n/))
+  const commandPrefix = `agent-variants.info.${Math.random().toString(36).slice(2)}`
+  const unregister = props.api.keymap.registerLayer({
+    priority: 10000,
+    commands: [{ name: `${commandPrefix}.close`, title: "Close", run: props.onDone }],
+    bindings: [
+      { key: "enter", cmd: `${commandPrefix}.close`, desc: "Close" },
+      { key: "escape", cmd: `${commandPrefix}.close`, desc: "Close" },
+    ],
+  })
+  onCleanup(() => {
+    unregister()
+    popMode()
+  })
+
+  return (
+    <box flexDirection="column" width="100%" paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1}>
+      <box flexDirection="row" justifyContent="space-between" width="100%" marginBottom={1}>
+        <text fg={theme().accent}><b>{props.title}</b></text>
+        <text fg={theme().textMuted} onMouseUp={props.onDone}>esc</text>
+      </box>
+      <box flexDirection="column" gap={0} marginBottom={1}>
+        <For each={lines()}>
+          {(line) => {
+            const heading = line.length > 0 && !line.startsWith(" ") && (line.endsWith(":") || /^[A-Z][A-Za-z ]+$/.test(line))
+            const warning = /restart|required|red/i.test(line)
+            const positive = /hot reload|yes|saved|enabled/i.test(line)
+            return line.length === 0
+              ? <text> </text>
+              : <text fg={warning ? theme().error : positive ? theme().success : heading ? theme().accent : theme().textMuted} wrapMode="word">{heading ? <b>{line}</b> : line}</text>
+          }}
+        </For>
+      </box>
+      <box flexDirection="row" justifyContent="flex-end" width="100%">
+        <box paddingLeft={3} paddingRight={3} backgroundColor={theme().primary} onMouseUp={props.onDone}>
+          <text fg={theme().background}><b>ok</b></text>
+        </box>
+      </box>
+    </box>
+  )
+}
+
 function showFieldAction(
   api: TuiPluginApi,
   props: { title: string; inspect: () => string; toggleLabel: string },
@@ -884,6 +1030,88 @@ async function addVariant(api: TuiPluginApi, config: SidecarConfig, settings: Wi
   return next
 }
 
+async function manageModelPresets(api: TuiPluginApi, config: SidecarConfig): Promise<SidecarConfig> {
+  const options: WizardSelectOption<string>[] = [
+    {
+      title: "Add model preset",
+      value: "__add__",
+      description: "Create a shortcut like light or heavy",
+      help: "Create a reusable model preset. Presets appear in every Model picker and can include model, model variant, temperature, top_p, and provider options.",
+    },
+    ...Object.entries(config.models).map(([key, entry]) => ({
+      title: key,
+      value: key,
+      description: modelPresetDescription(entry),
+      help: modelPresetHelp(key, entry),
+    })),
+    { title: "< Back", value: "__back__", description: "Return to main menu" },
+  ]
+  const picked = await showMenu(api, { title: "Model presets", options })
+  if (!picked || picked === "__back__") return config
+
+  const next = structuredClone(config)
+  if (picked === "__add__") {
+    const key = await showPrompt(api.ui, { title: "Preset key", placeholder: "light", value: "light" })
+    if (!key) return config
+    if (next.models[key]) {
+      await showAlert(api.ui, { title: "Duplicate preset", message: `Model preset "${key}" already exists.` })
+      return manageModelPresets(api, config)
+    }
+    const edited = await editModelPreset(api, next, key, { model: "" })
+    if (edited.model) next.models[key] = edited
+    return manageModelPresets(api, next)
+  }
+
+  next.models[picked] = await editModelPreset(api, next, picked, next.models[picked] as ModelShortcut)
+  if (!next.models[picked]?.model) delete next.models[picked]
+  return manageModelPresets(api, next)
+}
+
+async function editModelPreset(api: TuiPluginApi, config: SidecarConfig, key: string, initial: ModelShortcut): Promise<ModelShortcut> {
+  const preset: Record<string, unknown> = { ...initial }
+  let selected: string | undefined = "model"
+  while (true) {
+    const options: WizardSelectOption<string>[] = [
+      ...MODEL_PRESET_FIELDS.map((field) => ({
+        title: field.label,
+        value: field.key,
+        description: preset[field.key] === undefined || preset[field.key] === ""
+          ? field.required ? "required" : "default: not set"
+          : truncate(formatInputValue(preset[field.key]) ?? String(preset[field.key]), 76),
+        help: modelPresetFieldHelp(field.key, key),
+      })),
+      { title: "Delete preset", value: "__delete__", description: "Remove this model preset", danger: true, help: "Deletes this preset from the sidecar. Existing variants that still reference it will fail diagnostics until changed." },
+      { title: "< Back", value: "__back__", description: "Return to model presets" },
+    ]
+    const picked: string | undefined = await showMenu(api, { title: `Model preset - ${key}`, options, current: selected })
+    if (!picked || picked === "__back__") return preset as ModelShortcut
+    selected = picked
+    if (picked === "__delete__") {
+      const confirmed = await showConfirm(api.ui, { title: "Delete model preset?", message: `Remove "${key}"?` })
+      if (confirmed) return { model: "" }
+      continue
+    }
+
+    const before = preset[picked]
+    const value = picked === "label"
+      ? await showPrompt(api.ui, { title: "Label", placeholder: key, value: formatInputValue(before) })
+      : await promptForField(api, picked, formatInputValue(before), { config, model: preset.model, includeModelPresets: false })
+    if (value === undefined) continue
+    setField(preset, picked, value)
+    if (picked === "model" && before !== value) delete preset.variant
+  }
+}
+
+function modelPresetFieldHelp(field: keyof ModelShortcut, key: string) {
+  const base = `Model preset "${key}".`
+  if (field === "model") return `${base}\n\nRequired provider/model reference. This is what the preset selects when a parent or variant uses this shortcut in its Model field.`
+  if (field === "label") return `${base}\n\nOptional human label shown in descriptions and pickers.`
+  if (field === "variant") return `${base}\n\nOptional provider model variant, such as low, medium, high, or xhigh when the selected model exposes variants.`
+  if (field === "temperature") return `${base}\n\nOptional temperature applied with the preset unless the parent or variant has a local Temperature override.`
+  if (field === "top_p") return `${base}\n\nOptional top_p applied with the preset unless locally overridden.`
+  return `${base}\n\nOptional provider/model request options JSON object applied with the preset.`
+}
+
 async function editParentFields(
   api: TuiPluginApi,
   config: SidecarConfig,
@@ -897,7 +1125,7 @@ async function editParentFields(
   while (true) {
     const parent = (next.agents[agent] as AgentEntry).parent
     const fieldOpts: FieldListOption[] = [
-      ...EDITABLE_FIELDS.map((field) => fieldListOption(api, { field, parent, mode: "parent" })),
+      ...EDITABLE_FIELDS.map((field) => fieldListOption(api, { field, parent, mode: "parent", parentName: agent })),
       { title: "< Back", value: "__back__", description: "Return to main menu", kind: "action" },
     ]
 
@@ -909,7 +1137,7 @@ async function editParentFields(
     const picked = fieldDef(field)
     if (!picked) continue
     if (pickedField.action === "inspect") {
-      await showAlert(api.ui, { title: picked.label, message: inspectParentField(agent, parent, picked.key) })
+      await showInfo(api, { title: picked.label, message: inspectParentField(agent, parent, picked.key) })
       continue
     }
     if (pickedField.action === "toggle") {
@@ -949,6 +1177,7 @@ async function editVariantFields(
         const custom = await showPrompt(api.ui, {
           title: "Custom model ID",
           placeholder: "provider/model-id",
+          value: variant.model as string | undefined,
         })
         if (custom) variant.model = custom
       } else {
@@ -986,7 +1215,7 @@ async function editVariantFields(
       if (wantColor) {
         const picked = await showMenu(api, { title: "Pick color", options: colorOptions(api) })
         if (picked === "__custom__") {
-          const hex = await showPrompt(api.ui, { title: "Hex color", placeholder: "#FF5733" })
+          const hex = await showPrompt(api.ui, { title: "Hex color", placeholder: "#FF5733", value: variant.color as string | undefined })
           if (hex) variant.color = hex
         } else if (picked) {
           variant.color = picked
@@ -1045,7 +1274,7 @@ async function editVariant(api: TuiPluginApi, config: SidecarConfig, settings: W
     const parent = nextEntry.parent
     const target = nextEntry.variants[key] as VariantConfig & Record<string, unknown>
     const fieldOpts: FieldListOption[] = [
-      ...EDITABLE_FIELDS.map((field) => fieldListOption(api, { field, parent, variant: target, mode: "variant" })),
+      ...EDITABLE_FIELDS.map((field) => fieldListOption(api, { field, parent, variant: target, mode: "variant", parentName: agent, alias: variantName(agent, key, target) })),
       {
         title: "Display name",
         value: "name",
@@ -1074,7 +1303,7 @@ async function editVariant(api: TuiPluginApi, config: SidecarConfig, settings: W
     const picked = fieldDef(field)
     if (!picked) continue
     if (pickedField.action === "inspect") {
-      await showAlert(api.ui, { title: picked.label, message: inspectVariantField(agent, key, nextEntry.parent, target, picked.key) })
+      await showInfo(api, { title: picked.label, message: inspectVariantField(agent, key, nextEntry.parent, target, picked.key) })
       continue
     }
     if (pickedField.action === "toggle") {
@@ -1216,7 +1445,7 @@ async function previewConfig(api: TuiPluginApi, config: SidecarConfig): Promise<
     lines.push("Named models:")
     for (const [key, raw] of Object.entries(config.models)) {
       const entry = raw as ModelEntry
-      lines.push(`  ${key} -> ${entry.model}${entry.label ? `  (${entry.label})` : ""}`)
+      lines.push(`  ${key}: ${modelPresetDescription(entry)}${entry.label ? `  (${entry.label})` : ""}`)
     }
   }
 
@@ -1261,7 +1490,7 @@ async function previewConfig(api: TuiPluginApi, config: SidecarConfig): Promise<
   lines.push(`  File: ${defaultSidecarPath()}`)
   lines.push("=".repeat(50))
 
-  await showAlert(api.ui, { title: "Configuration Preview", message: lines.join("\n") })
+  await showInfo(api, { title: "Configuration Preview", message: lines.join("\n") })
 }
 
 async function toggleDebug(api: TuiPluginApi, config: SidecarConfig): Promise<SidecarConfig> {
@@ -1311,7 +1540,7 @@ async function runDiagnostics(api: TuiPluginApi, config: SidecarConfig): Promise
     title: "Agent Variants diagnostics",
     message: `${errors} error(s), ${warnings} warning(s)`,
   })
-  await showAlert(api.ui, { title: "Diagnostics", message: lines.join("\n") })
+  await showInfo(api, { title: "Diagnostics", message: lines.join("\n") })
 }
 
 async function viewDebugLog(api: TuiPluginApi): Promise<void> {
@@ -1336,17 +1565,26 @@ async function clearDebugLog(api: TuiPluginApi): Promise<void> {
 }
 
 async function showWizardInfo(api: TuiPluginApi): Promise<void> {
-  await showAlert(api.ui, {
+  await showInfo(api, {
     title: "Agent Variants Info",
     message: [
+      "Hot Reload",
       "Hot reload applies to existing variant aliases only. Model, model variant, temperature, top_p, options, and prompt fields apply on the next matching variant call.",
       "",
+      "Restart Required",
       "Restart-required changes affect OpenCode's cached task list or UI metadata: add/delete/disable, display name, description fields, and color.",
+      "Red fields/options need restarting before the task list or UI fully reflects them.",
       "",
+      "Model Presets",
+      "Model presets appear in Model pickers. They can apply model, model variant, temperature, top_p, and options; local parent/variant fields override preset fields.",
+      "",
+      "Inheritance",
       "Parent propagation is off per field by default. Variant inheritance is on per field by default. A variant receives a parent field only when the parent propagates it, the variant accepts it, and the variant has no local value.",
       "",
+      "Built-in Routing",
       "Built-in variants route through their native parent agent, so the footer may show the parent. Task output and expanded inputs show selected_alias/agent_variant, routed_agent, and effective_model.",
       "",
+      "Editing",
       "Submit an empty value while editing a field to remove that local override. Escape cancels without changes.",
     ].join("\n"),
   })
@@ -1387,17 +1625,17 @@ async function promptForField(
   api: TuiPluginApi,
   field: string,
   current: string | undefined,
-  context?: { config: SidecarConfig; model: unknown },
+  context?: { config: SidecarConfig; model: unknown; includeModelPresets?: boolean },
 ): Promise<unknown> {
   if (field === "model") {
-    const config = loadSidecar(defaultSidecarPath())
-    const models = modelOptions(api, config)
+    const config = context?.config ?? loadSidecar(defaultSidecarPath())
+    const models = modelOptions(api, config, { includePresets: context?.includeModelPresets })
     models.unshift({ title: "< Remove value >", value: "__remove__", description: "Delete this local model override", category: "Current field" })
     const picked = await showSelect(api.ui, { title: "Select model", options: models, current })
     if (!picked) return undefined
     if (picked === "__remove__") return ""
     if (picked === "__custom__") {
-      return showPrompt(api.ui, { title: "Custom model ID", placeholder: "provider/model-id" })
+      return showPrompt(api.ui, { title: "Custom model ID", placeholder: "provider/model-id", value: current })
     }
     return picked
   }
@@ -1424,7 +1662,7 @@ async function promptForField(
   if (field === "color") {
     const picked = await showMenu(api, { title: "Pick color", options: [{ title: "Default", value: "__remove__", description: "Delete this local color override" }, ...colorOptions(api)] })
     if (picked === "__custom__") {
-      return showPrompt(api.ui, { title: "Hex color", placeholder: "#FF5733" })
+      return showPrompt(api.ui, { title: "Hex color", placeholder: "#FF5733", value: current })
     }
     if (picked === "__remove__") return ""
     return picked
@@ -1500,16 +1738,17 @@ async function mainMenu(api: TuiPluginApi, config: SidecarConfig, settings: Wiza
   const vCount = variantCount(config)
 
   const opts: WizardSelectOption<string>[] = [
-    { title: "Add variant...", value: "add", description: "Create a new agent variant" },
-    { title: "Edit parent fields...", value: "edit-parent", description: "Override fields on an agent parent" },
-    { title: "Edit variant...", value: "edit-variant", description: "Change fields on an existing variant" },
-    { title: "Toggle disable...", value: "toggle", description: "Enable or disable agents/variants" },
-    { title: "Delete variant...", value: "delete", description: "Remove a variant" },
-    { title: "Info", value: "info", description: "Hot reload, restart boundaries, inheritance, and routing behavior" },
-    { title: "Run diagnostics", value: "diagnostics", description: "Check models, conflicts, plugin install, and task-callability" },
-    { title: "Debug & advanced...", value: "advanced", description: "Debug mode, logs, and wizard-only parent filter" },
-    { title: "Preview configuration", value: "preview", description: `View current config (${agentCount} agents, ${vCount} variants)` },
-    { title: "Save & exit", value: "save", description: "Write to disk with backup" },
+    { title: "Add variant", value: "add", description: "Create a new agent variant", danger: true, help: "Creates a new variant under a parent subagent. New task-list aliases require restart before they appear." },
+    { title: "Model presets", value: "models", description: `${Object.keys(config.models).length} shortcut(s)`, help: "Create reusable model shortcuts like light or heavy. Presets appear in Model pickers and can include model, model variant, temperature, top_p, and options." },
+    { title: "Edit parent fields", value: "edit-parent", description: "Override fields on an agent parent", help: "Parent fields can be propagated per field to variants. Red fields change cached task-list/UI metadata and require restart." },
+    { title: "Edit variant", value: "edit-variant", description: "Change fields on an existing variant", help: "Variant fields override inherited parent values. Red fields require restart before OpenCode's task list/UI reflects them." },
+    { title: "Toggle disable", value: "toggle", description: "Enable or disable agents/variants", danger: true, help: "Disable keeps config without deleting it. Task-list visibility updates after restart, and stale calls are blocked at runtime." },
+    { title: "Delete variant", value: "delete", description: "Remove a variant", danger: true, help: "Deletes a variant from the sidecar. Restart OpenCode to remove it from the cached task list." },
+    { title: "Info", value: "info", description: "Hot reload, restart boundaries, inheritance, and routing behavior", help: "Shows a quick guide. Red options or fields require restarting OpenCode to fully apply." },
+    { title: "Run diagnostics", value: "diagnostics", description: "Check models, conflicts, plugin install, and task-callability", help: "Validates model references, alias conflicts, plugin install state, and parent subagent compatibility." },
+    { title: "Debug & advanced", value: "advanced", description: "Debug mode, logs, and wizard-only parent filter", help: "Advanced tools for routing diagnostics and wizard-local filtering." },
+    { title: "Preview configuration", value: "preview", description: `View current config (${agentCount} agents, ${vCount} variants)`, help: "Shows the current sidecar config summary before saving." },
+    { title: "Save & exit", value: "save", description: "Write to disk with backup", help: "Saves agent-variants.jsonc. Runtime fields hot-reload; red task-list/UI fields require restart." },
   ]
 
   const action = await showMenu(api, {
@@ -1520,6 +1759,8 @@ async function mainMenu(api: TuiPluginApi, config: SidecarConfig, settings: Wiza
   switch (action) {
     case "add":
       return mainMenu(api, await addVariant(api, config, settings), settings)
+    case "models":
+      return mainMenu(api, await manageModelPresets(api, config), settings)
     case "edit-parent":
       return editParentFlow(api, config, settings)
     case "edit-variant":

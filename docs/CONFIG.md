@@ -7,7 +7,7 @@ See `agent-variants.example.jsonc` for a fully commented starter file.
 ## Top-Level Fields
 
 - `debug`: boolean. Enables routing/model diagnostic toasts and file logging. This is hot-read by the server plugin, so toggling it from the wizard takes effect immediately for future variant calls.
-- `models`: named model shortcuts. Each shortcut has `model` and optional `label`.
+- `models`: named model presets. Each preset has `model` and can also provide `label`, `variant`, `temperature`, `top_p`, and `options`.
 - `agents`: parent-agent entries. Each key is a built-in or configured OpenCode agent name.
 
 ## Model Shortcuts
@@ -16,12 +16,16 @@ See `agent-variants.example.jsonc` for a fully commented starter file.
 "models": {
   "light": {
     "model": "zai-coding-plan/glm-5.1",
-    "label": "GLM 5.1"
+    "label": "GLM 5.1",
+    "variant": "low",
+    "temperature": 0.2,
+    "top_p": 0.95,
+    "options": { "reasoningEffort": "low" }
   }
 }
 ```
 
-Variant `model` fields can use either `"light"` or the full `"provider/model"` reference.
+Parent and variant `model` fields can use either `"light"` or the full `"provider/model"` reference. Selecting a preset applies its model-related fields; local parent/variant fields still win. For example, `model: "light"` can supply `temperature: 0.2`, but a variant with its own `temperature` uses the variant value.
 
 If a variant resolves to a model that is definitely missing, the plugin skips that variant at startup and shows a warning toast. The sidecar is not modified automatically.
 

@@ -4,17 +4,26 @@
   // ~/.config/opencode/agent-variants.debug.log.
   "debug": false,
 
-  // Optional model shortcuts. Variants can use either a shortcut key like
-  // "light" or a full provider/model reference like "anthropic/claude-sonnet-4-6".
+  // Optional model presets. Parent/variant model fields can use either a
+  // preset key like "light" or a full provider/model reference like
+  // "anthropic/claude-sonnet-4-6". Preset fields apply together, but local
+  // parent/variant fields can override them later.
   "models": {
     "light": {
       "model": "zai-coding-plan/glm-5.1",
-      "label": "GLM 5.1"
+      "label": "GLM 5.1",
+      // Optional model-related preset fields:
+      // "variant": "low",
+      // "temperature": 0.2,
+      // "top_p": 0.95,
+      // "options": { "reasoningEffort": "low" }
     }
 
     // "heavy": {
     //   "model": "anthropic/claude-opus-4-5",
-    //   "label": "Opus 4.5"
+    //   "label": "Opus 4.5",
+    //   "variant": "high",
+    //   "temperature": 0.3
     // }
   },
 
