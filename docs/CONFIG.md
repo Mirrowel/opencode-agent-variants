@@ -11,6 +11,8 @@ See `agent-variants.example.jsonc` for a fully commented starter file.
 - `models`: named model presets. Each preset has `model` and can also provide `label`, `variant`, `temperature`, `top_p`, and `options`.
 - `agents`: parent-agent entries. Each key is a built-in or configured OpenCode agent name.
 
+Debug and UI-only saves do not create backup entries. Meaningful config saves are backed up in `~/.config/opencode/agent-variants.backup.json` as a reverse-patch journal, capped to the latest 50 patch restore points. The wizard's `Debug & advanced` > `Config backups` menu can create full snapshots, preview valid restore points, restore them, and delete full snapshots. Full snapshots are not auto-pruned.
+
 ## Model Shortcuts
 
 ```jsonc

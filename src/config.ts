@@ -100,6 +100,38 @@ export const SidecarConfig = z.object({
   ).default({}),
 })
 
+const BackupOperation = z.object({
+  op: z.enum(["add", "remove", "replace"]),
+  path: z.array(z.union([z.string(), z.number()])),
+  value: z.unknown().optional(),
+})
+
+const PatchBackupEntry = z.object({
+  type: z.literal("patch"),
+  id: z.string(),
+  timestamp: z.string(),
+  before_hash: z.string(),
+  after_hash: z.string(),
+  changed_paths: z.array(z.string()),
+  reverse_patch: z.array(BackupOperation),
+})
+
+const FullBackupEntry = z.object({
+  type: z.literal("full"),
+  id: z.string(),
+  timestamp: z.string(),
+  hash: z.string(),
+  label: z.string().optional(),
+  config: SidecarConfig,
+})
+
+export const BackupJournal = z.object({
+  version: z.literal(1).default(1),
+  patch_limit: z.number().int().min(1).default(50),
+  patches: z.array(PatchBackupEntry).default([]),
+  full: z.array(FullBackupEntry).default([]),
+})
+
 export type PatchField = (typeof PATCH_FIELDS)[number]
 export type HotReloadField = (typeof HOT_RELOAD_FIELDS)[number]
 export type AgentPatch = z.infer<typeof Patch>
@@ -108,6 +140,10 @@ export type VariantConfig = z.infer<typeof Variant>
 export type ModelShortcut = z.infer<typeof ModelShortcut>
 export type UiSettings = z.infer<typeof UiSettings>
 export type SidecarConfig = z.infer<typeof SidecarConfig>
+export type BackupOperation = z.infer<typeof BackupOperation>
+export type PatchBackupEntry = z.infer<typeof PatchBackupEntry>
+export type FullBackupEntry = z.infer<typeof FullBackupEntry>
+export type BackupJournal = z.infer<typeof BackupJournal>
 export type DiagnosticLevel = "error" | "warning" | "info"
 export type Diagnostic = {
   level: DiagnosticLevel
@@ -188,6 +224,10 @@ export function debugLogPath(configDir = defaultConfigDir()) {
   return join(configDir, "agent-variants.debug.log")
 }
 
+export function backupJournalPath(configDir = defaultConfigDir()) {
+  return join(configDir, "agent-variants.backup.json")
+}
+
 export function emptyConfig(): SidecarConfig {
   return { debug: false, ui: { width: "large", height: "normal" }, models: {}, agents: {} }
 }
@@ -197,16 +237,161 @@ export function loadSidecar(filePath = defaultSidecarPath()) {
   return SidecarConfig.parse(parse(readFileSync(filePath, "utf8")))
 }
 
-export function saveSidecar(config: SidecarConfig, filePath = defaultSidecarPath()) {
-  const parsed = SidecarConfig.parse(config)
+export function emptyBackupJournal(): BackupJournal {
+  return { version: 1, patch_limit: 50, patches: [], full: [] }
+}
+
+export function loadBackupJournal(filePath = backupJournalPath()) {
+  if (!existsSync(filePath)) return emptyBackupJournal()
+  return BackupJournal.parse(JSON.parse(readFileSync(filePath, "utf8")))
+}
+
+export function saveBackupJournal(journal: BackupJournal, filePath = backupJournalPath()) {
+  const parsed = BackupJournal.parse(journal)
   mkdirSync(dirname(filePath), { recursive: true })
-  if (existsSync(filePath)) {
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-")
-    writeFileSync(`${filePath}.${stamp}.bak`, readFileSync(filePath))
+  const temp = `${filePath}.tmp`
+  writeFileSync(temp, `${JSON.stringify(parsed, null, 2)}\n`)
+  renameSync(temp, filePath)
+}
+
+export function hashConfig(config: SidecarConfig) {
+  return createHash("sha256").update(stableStringify(SidecarConfig.parse(config))).digest("hex")
+}
+
+export function createFullBackup(config: SidecarConfig, input?: { label?: string; filePath?: string }) {
+  const journal = loadBackupJournal(input?.filePath)
+  journal.full.unshift({
+    type: "full",
+    id: new Date().toISOString(),
+    timestamp: new Date().toISOString(),
+    hash: hashConfig(config),
+    label: input?.label,
+    config: SidecarConfig.parse(config),
+  })
+  saveBackupJournal(journal, input?.filePath)
+  return journal
+}
+
+export function deleteFullBackup(id: string, filePath = backupJournalPath()) {
+  const journal = loadBackupJournal(filePath)
+  journal.full = journal.full.filter((entry) => entry.id !== id)
+  saveBackupJournal(journal, filePath)
+  return journal
+}
+
+export function deleteAllFullBackups(filePath = backupJournalPath()) {
+  const journal = loadBackupJournal(filePath)
+  journal.full = []
+  saveBackupJournal(journal, filePath)
+  return journal
+}
+
+export function reconstructPatchBackup(index: number, current: SidecarConfig, journal = loadBackupJournal()) {
+  let config = SidecarConfig.parse(current)
+  for (const [entryIndex, entry] of journal.patches.entries()) {
+    const currentHash = hashConfig(config)
+    if (currentHash !== entry.after_hash) {
+      return { ok: false as const, message: `Hash mismatch at patch ${entryIndex + 1}. Current config is ${currentHash.slice(0, 8)}, expected ${entry.after_hash.slice(0, 8)}.` }
+    }
+    config = applyBackupOperations(config, entry.reverse_patch)
+    const restoredHash = hashConfig(config)
+    if (restoredHash !== entry.before_hash) {
+      return { ok: false as const, message: `Patch ${entryIndex + 1} restored ${restoredHash.slice(0, 8)}, expected ${entry.before_hash.slice(0, 8)}.` }
+    }
+    if (entryIndex === index) return { ok: true as const, config, consumed: entryIndex + 1 }
   }
+  return { ok: false as const, message: "Patch backup was not found." }
+}
+
+export function restorePatchBackup(index: number, config: SidecarConfig, input?: { journal?: BackupJournal; filePath?: string }) {
+  const journal = input?.journal ?? loadBackupJournal(input?.filePath)
+  const restored = reconstructPatchBackup(index, config, journal)
+  if (!restored.ok) return restored
+  journal.patches = journal.patches.slice(restored.consumed)
+  saveBackupJournal(journal, input?.filePath)
+  return restored
+}
+
+export function saveSidecar(config: SidecarConfig, filePath = defaultSidecarPath(), options?: { backup?: boolean }) {
+  const parsed = SidecarConfig.parse(config)
+  const previous = existsSync(filePath) ? loadSidecar(filePath) : undefined
+  if (previous && stableStringify(previous) === stableStringify(parsed)) return { changed: false }
+  mkdirSync(dirname(filePath), { recursive: true })
+  if (previous && options?.backup !== false) writePatchBackup(previous, parsed, backupJournalPath(dirname(filePath)))
   const temp = `${filePath}.tmp`
   writeFileSync(temp, `${stringify(parsed, null, 2)}\n`)
   renameSync(temp, filePath)
+  return { changed: true }
+}
+
+function writePatchBackup(previous: SidecarConfig, next: SidecarConfig, filePath: string) {
+  const reverse = diffReverse(previous, next)
+  if (reverse.operations.length === 0) return
+  const journal = loadBackupJournal(filePath)
+  const now = new Date().toISOString()
+  journal.patches.unshift({
+    type: "patch",
+    id: now,
+    timestamp: now,
+    before_hash: hashConfig(previous),
+    after_hash: hashConfig(next),
+    changed_paths: reverse.changed_paths,
+    reverse_patch: reverse.operations,
+  })
+  journal.patches = journal.patches.slice(0, journal.patch_limit)
+  saveBackupJournal(journal, filePath)
+}
+
+function diffReverse(previous: unknown, next: unknown, path: BackupOperation["path"] = []): { operations: BackupOperation[]; changed_paths: string[] } {
+  if (stableStringify(previous) === stableStringify(next)) return { operations: [], changed_paths: [] }
+  if (!isPlainObject(previous) || !isPlainObject(next)) {
+    return {
+      operations: [{ op: previous === undefined ? "remove" : next === undefined ? "add" : "replace", path, value: previous }],
+      changed_paths: [formatPath(path)],
+    }
+  }
+  return [...new Set([...Object.keys(previous), ...Object.keys(next)])]
+    .map((key) => diffReverse(previous[key], next[key], [...path, key]))
+    .reduce(
+      (acc, item) => ({ operations: [...acc.operations, ...item.operations], changed_paths: [...acc.changed_paths, ...item.changed_paths] }),
+      { operations: [] as BackupOperation[], changed_paths: [] as string[] },
+    )
+}
+
+function applyBackupOperations(config: SidecarConfig, operations: BackupOperation[]) {
+  const result = structuredClone(config) as Record<string, unknown>
+  for (const operation of operations) applyBackupOperation(result, operation)
+  return SidecarConfig.parse(result)
+}
+
+function applyBackupOperation(target: Record<string, unknown>, operation: BackupOperation) {
+  const parent = operation.path.slice(0, -1).reduce((cursor, segment) => {
+    if (!isPlainObject(cursor[segment])) cursor[segment] = {}
+    return cursor[segment] as Record<string | number, unknown>
+  }, target as Record<string | number, unknown>)
+  const key = operation.path.at(-1)
+  if (key === undefined) return
+  if (operation.op === "remove") {
+    delete parent[key]
+    return
+  }
+  parent[key] = operation.value
+}
+
+function stableStringify(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`
+  if (isPlainObject(value)) {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(",")}}`
+  }
+  return JSON.stringify(value)
+}
+
+function isPlainObject(value: unknown): value is Record<string | number, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+function formatPath(path: BackupOperation["path"]) {
+  return path.length === 0 ? "<root>" : path.join(".")
 }
 
 export function renderTemplate(input: string | undefined, context?: TemplateContext) {

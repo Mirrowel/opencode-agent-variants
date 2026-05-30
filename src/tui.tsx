@@ -5,6 +5,10 @@ import { useTerminalDimensions } from "@opentui/solid"
 import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js"
 import {
   BUILTIN_AGENT_DESCRIPTIONS,
+  backupJournalPath,
+  createFullBackup,
+  deleteAllFullBackups,
+  deleteFullBackup,
   debugLogPath,
   defaultConfigDir,
   defaultSidecarPath,
@@ -15,13 +19,18 @@ import {
   inheritedPatch,
   isHotReloadField,
   isSubagentCapableMode,
+  loadBackupJournal,
   loadSidecar,
   patchHasValue,
   propagationEnabled,
+  reconstructPatchBackup,
   saveSidecar,
+  saveBackupJournal,
   variantName,
   type AgentMode,
+  type BackupJournal,
   type ModelShortcut,
+  type FullBackupEntry,
   type SidecarConfig,
   type VariantConfig,
   type PatchField,
@@ -57,6 +66,12 @@ type ResolvedModel = {
   modelName: string
   variants: string[]
 }
+type BackupListItem =
+  | { kind: "patch"; index: number; title: string; description: string; valid: boolean }
+  | { kind: "full"; id: string; title: string; description: string; entry: FullBackupEntry }
+type BackupListChoice =
+  | { action: "select"; item: BackupListItem }
+  | { action: "delete"; item: BackupListItem }
 
 type WizardSettings = {
   subagentCapableOnly: boolean
@@ -1015,6 +1030,119 @@ function FieldListDialog(props: {
   )
 }
 
+function showBackupList(api: TuiPluginApi, items: BackupListItem[]): Promise<BackupListChoice | undefined> {
+  return new Promise((resolve) => {
+    let settled = false
+    const done = (value: BackupListChoice | undefined, clear = true) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+      if (clear) api.ui.dialog.clear()
+    }
+    api.ui.dialog.replace(
+      () => <BackupListDialog api={api} items={items} onDone={done} />,
+      () => done(undefined, false),
+    )
+  })
+}
+
+function BackupListDialog(props: { api: TuiPluginApi; items: BackupListItem[]; onDone: (value: BackupListChoice | undefined) => void }) {
+  const theme = () => props.api.theme.current
+  useWizardDialogSize(props.api)
+  useHidePromptCursor(props.api)
+  const dimensions = useTerminalDimensions()
+  const listHeight = createMemo(() => cappedHeight(props.items.length, wizardMaxRows(props.api, dimensions().height, 15, 8)))
+  let scroll: ScrollBoxRenderable | undefined
+  const popMode = props.api.mode.push("agent-variants.dialog")
+  const [selected, setSelected] = createSignal(0)
+  const [pendingDelete, setPendingDelete] = createSignal<string | undefined>()
+  const current = createMemo(() => props.items[selected()])
+  const move = (delta: number) => setSelected((value) => {
+    const next = Math.max(0, Math.min(props.items.length - 1, value + delta))
+    if (next !== value) setPendingDelete(undefined)
+    scroll?.scrollTo(Math.max(0, next - 2))
+    return next
+  })
+  const select = () => {
+    const item = current()
+    if (item) props.onDone({ action: "select", item })
+  }
+  const deleteFull = () => {
+    const item = current()
+    if (!item || item.kind !== "full") return
+    if (pendingDelete() !== item.id) {
+      setPendingDelete(item.id)
+      return
+    }
+    props.onDone({ action: "delete", item })
+  }
+  const commandPrefix = `agent-variants.backups.${Math.random().toString(36).slice(2)}`
+  const unregister = props.api.keymap.registerLayer({
+    priority: 10000,
+    commands: [
+      { name: `${commandPrefix}.up`, title: "Previous backup", run: (ctx: KeyContext) => { blockKey(ctx); move(-1) } },
+      { name: `${commandPrefix}.down`, title: "Next backup", run: (ctx: KeyContext) => { blockKey(ctx); move(1) } },
+      { name: `${commandPrefix}.select`, title: "Preview backup", run: (ctx: KeyContext) => { blockKey(ctx); select() } },
+      { name: `${commandPrefix}.delete`, title: "Delete full backup", run: (ctx: KeyContext) => { blockKey(ctx); deleteFull() } },
+      { name: `${commandPrefix}.back`, title: "Back", run: (ctx: KeyContext) => { blockKey(ctx); props.onDone(undefined) } },
+      { name: `${commandPrefix}.shield`, title: "Block background input", run: blockKey },
+    ],
+    bindings: [
+      { key: "up", cmd: `${commandPrefix}.up`, desc: "Previous backup" },
+      { key: "ctrl+p", cmd: `${commandPrefix}.up`, desc: "Previous backup" },
+      { key: "down", cmd: `${commandPrefix}.down`, desc: "Next backup" },
+      { key: "ctrl+n", cmd: `${commandPrefix}.down`, desc: "Next backup" },
+      { key: "enter", cmd: `${commandPrefix}.select`, desc: "Preview backup" },
+      { key: "ctrl+d", cmd: `${commandPrefix}.delete`, desc: "Delete full backup" },
+      { key: "escape", cmd: `${commandPrefix}.back`, desc: "Back" },
+      ...shieldBindings(`${commandPrefix}.shield`),
+    ],
+  })
+  onCleanup(() => {
+    unregister()
+    popMode()
+  })
+
+  return (
+    <box flexDirection="column" width="100%" paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1}>
+      <box flexDirection="row" justifyContent="space-between" width="100%" marginBottom={1}>
+        <text fg={theme().accent}><b>Config backups</b></text>
+        <text fg={theme().textMuted}>esc</text>
+      </box>
+      <scrollbox maxHeight={listHeight()} ref={(element: ScrollBoxRenderable) => (scroll = element)}>
+      <box flexDirection="column" gap={0}>
+        <For each={props.items}>
+          {(item, index) => {
+            const active = createMemo(() => selected() === index())
+            const confirming = createMemo(() => item.kind === "full" && pendingDelete() === item.id)
+            const fg = createMemo(() => active() || confirming() ? theme().background : item.kind === "patch" && !item.valid ? theme().error : item.kind === "full" ? theme().success : theme().text)
+            return (
+              <box
+                flexDirection="row"
+                width="100%"
+                gap={1}
+                paddingLeft={1}
+                paddingRight={1}
+                backgroundColor={confirming() ? theme().error : active() ? theme().primary : theme().backgroundPanel}
+                onMouseOver={() => { setSelected(index()); setPendingDelete(undefined) }}
+                onMouseUp={() => props.onDone({ action: "select", item })}
+              >
+                <text width={34} flexShrink={0} fg={fg()} wrapMode="none" overflow="hidden"><b>{confirming() ? "Press ctrl+d again to confirm" : item.title}</b></text>
+                <text flexGrow={1} fg={active() || confirming() ? theme().background : theme().textMuted} wrapMode="none" overflow="hidden">{item.description}</text>
+              </box>
+            )
+          }}
+        </For>
+      </box>
+      </scrollbox>
+      <box flexDirection="row" gap={3} marginTop={1}>
+        <text fg={theme().textMuted}>enter preview</text>
+        <text fg={theme().textMuted}>delete full backup ctrl+d</text>
+      </box>
+    </box>
+  )
+}
+
 function showPrompt(
   ui: UI,
   props: {
@@ -1950,7 +2078,7 @@ async function toggleDebug(api: TuiPluginApi, config: SidecarConfig): Promise<Si
   const next = structuredClone(config)
   next.debug = !next.debug
   try {
-    saveSidecar(next, defaultSidecarPath())
+    saveSidecar(next, defaultSidecarPath(), { backup: false })
   } catch (err) {
     await showAlert(api.ui, { title: "Save failed", message: String(err instanceof Error ? err.message : err) })
     return config
@@ -1972,7 +2100,7 @@ async function updateUiSettings(api: TuiPluginApi, config: SidecarConfig, ui: Pa
   setWizardDialogHeight(api, next.ui.height)
   setWizardDialogHeightPercent(api, effectiveUiHeightPercent(next.ui))
   try {
-    saveSidecar(next, defaultSidecarPath())
+    saveSidecar(next, defaultSidecarPath(), { backup: false })
   } catch (err) {
     await showAlert(api.ui, { title: "Save failed", message: String(err instanceof Error ? err.message : err) })
     setWizardDialogSize(api, config.ui.width)
@@ -2038,6 +2166,118 @@ async function clearDebugLog(api: TuiPluginApi): Promise<void> {
   if (!confirmed) return
   writeFileSync(file, "")
   api.ui.toast({ variant: "success", title: "Debug log cleared", message: file })
+}
+
+async function configBackupsMenu(api: TuiPluginApi, config: SidecarConfig): Promise<SidecarConfig> {
+  const journal = loadBackupJournal()
+  const action = await showMenu(api, {
+    title: "Config backups",
+    options: [
+      { title: "Browse backups", value: "browse", description: `${journal.patches.length} patch restore point(s), ${journal.full.length} full backup(s)` },
+      { title: "Create full backup", value: "create", description: "Snapshot the current sidecar config now" },
+      { title: "Delete all full backups", value: "delete-full", description: `${journal.full.length} full backup(s), patches are untouched`, danger: journal.full.length > 0 },
+      { title: "< Back", value: "__back__", description: "Return to Debug & advanced" },
+    ],
+  })
+  if (!action || action === "__back__") return config
+  if (action === "create") {
+    createFullBackup(loadSidecar(defaultSidecarPath()), { label: "Manual backup" })
+    api.ui.toast({ variant: "success", title: "Full backup created", message: backupJournalPath(defaultConfigDir()) })
+    return configBackupsMenu(api, config)
+  }
+  if (action === "delete-full") {
+    if (journal.full.length === 0) return configBackupsMenu(api, config)
+    const confirmed = await showConfirm(api.ui, { title: "Delete all full backups?", message: "This removes full snapshots only. Patch restore points are kept." })
+    if (confirmed) {
+      deleteAllFullBackups()
+      api.ui.toast({ variant: "warning", title: "Full backups deleted", message: "All full snapshots were removed." })
+    }
+    return configBackupsMenu(api, config)
+  }
+  return browseConfigBackups(api, config)
+}
+
+async function browseConfigBackups(api: TuiPluginApi, config: SidecarConfig): Promise<SidecarConfig> {
+  const journal = loadBackupJournal()
+  const items = backupListItems(config, journal)
+  if (items.length === 0) {
+    await showInfo(api, { title: "Config backups", message: `No backups found.\n\nJournal: ${backupJournalPath(defaultConfigDir())}` })
+    return configBackupsMenu(api, config)
+  }
+  const choice = await showBackupList(api, items)
+  if (!choice) return configBackupsMenu(api, config)
+  if (choice.action === "delete" && choice.item.kind === "full") {
+    deleteFullBackup(choice.item.id)
+    api.ui.toast({ variant: "warning", title: "Full backup deleted", message: choice.item.title })
+    return browseConfigBackups(api, config)
+  }
+  if (choice.action !== "select") return browseConfigBackups(api, config)
+  const restored = choice.item.kind === "patch"
+    ? reconstructPatchBackup(choice.item.index, loadSidecar(defaultSidecarPath()), journal)
+    : { ok: true as const, config: choice.item.entry.config }
+  if (!restored.ok) {
+    await showAlert(api.ui, { title: "Backup chain invalid", message: restored.message })
+    return browseConfigBackups(api, config)
+  }
+  await showInfo(api, { title: choice.item.title, message: backupPreview(choice.item, restored.config) })
+  const shouldRestore = await showConfirm(api.ui, { title: "Restore this backup?", message: "This writes agent-variants.jsonc to the previewed state." })
+  if (!shouldRestore) return browseConfigBackups(api, config)
+  const hardBackup = await showConfirm(api.ui, { title: "Create full backup first?", message: "Optional safety snapshot of the current config before restoring. Default is No." })
+  if (hardBackup) createFullBackup(loadSidecar(defaultSidecarPath()), { label: "Before restore" })
+  if (choice.item.kind === "patch") {
+    const latest = loadBackupJournal()
+    const result = reconstructPatchBackup(choice.item.index, loadSidecar(defaultSidecarPath()), latest)
+    if (!result.ok) {
+      await showAlert(api.ui, { title: "Restore failed", message: result.message })
+      return browseConfigBackups(api, config)
+    }
+    saveSidecar(result.config, defaultSidecarPath(), { backup: false })
+    latest.patches = latest.patches.slice(result.consumed)
+    saveBackupJournal(latest)
+    api.ui.toast({ variant: "success", title: "Config restored", message: `${choice.item.title}; consumed patches were removed.` })
+    return result.config
+  }
+  const latest = loadBackupJournal()
+  saveSidecar(restored.config, defaultSidecarPath(), { backup: false })
+  latest.patches = []
+  saveBackupJournal(latest)
+  api.ui.toast({ variant: "success", title: "Full backup restored", message: "Patch restore chain was reset for the restored state." })
+  return restored.config
+}
+
+function backupListItems(config: SidecarConfig, journal: BackupJournal): BackupListItem[] {
+  return [
+    ...journal.patches.map((entry, index): BackupListItem => {
+      const restored = reconstructPatchBackup(index, config, journal)
+      return {
+        kind: "patch",
+        index,
+        valid: restored.ok,
+        title: `Patch ${index + 1} ${formatBackupTime(entry.timestamp)}`,
+        description: restored.ok ? entry.changed_paths.slice(0, 3).join(", ") || "config change" : "invalid hash chain",
+      }
+    }),
+    ...journal.full.map((entry): BackupListItem => ({
+      kind: "full",
+      id: entry.id,
+      title: `Full ${formatBackupTime(entry.timestamp)}`,
+      description: entry.label ?? entry.hash.slice(0, 8),
+      entry,
+    })),
+  ]
+}
+
+function backupPreview(item: BackupListItem, config: SidecarConfig) {
+  return [
+    item.title,
+    item.description,
+    "",
+    JSON.stringify(config, null, 2),
+  ].join("\n")
+}
+
+function formatBackupTime(timestamp: string) {
+  return timestamp.replace("T", " ").replace(/\.\d+Z$/, "Z")
 }
 
 async function showWizardInfo(api: TuiPluginApi): Promise<void> {
@@ -2298,6 +2538,7 @@ async function debugAdvancedMenu(api: TuiPluginApi, config: SidecarConfig, setti
     },
     { title: "View debug log", value: "view-log", description: "Show recent agent-variants.debug.log entries" },
     { title: "Clear debug log", value: "clear-log", description: "Empty agent-variants.debug.log" },
+    { title: "Config backups", value: "backups", description: "Preview, restore, and snapshot sidecar config" },
     {
       title: `Wizard UI width: ${wizardDialogSize(api)}`,
       value: "ui-size",
@@ -2328,6 +2569,8 @@ async function debugAdvancedMenu(api: TuiPluginApi, config: SidecarConfig, setti
     case "clear-log":
       await clearDebugLog(api)
       return debugAdvancedMenu(api, config, settings)
+    case "backups":
+      return debugAdvancedMenu(api, await configBackupsMenu(api, config), settings)
     case "ui-size":
       return debugAdvancedMenu(api, await updateUiSettings(api, config, { width: nextWizardDialogSize(api) }), settings)
     case "ui-height": {

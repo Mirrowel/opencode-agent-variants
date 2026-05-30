@@ -2,9 +2,11 @@
   // Toggle route/model diagnostics. This can be changed from the wizard and
   // takes effect immediately for future variant calls. Logs are written to
   // ~/.config/opencode/agent-variants.debug.log.
+  // Debug changes do not create config backup entries.
   "debug": false,
 
   // Wizard display preferences. These are changed from Debug & advanced.
+  // UI changes do not create config backup entries.
   "ui": {
     "width": "large",
     // Legacy preset/reference value. Presets are compact=32, normal=50,
