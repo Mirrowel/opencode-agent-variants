@@ -13,6 +13,7 @@ import {
   effectiveVariantPatch,
   fingerprint,
   generatedVariantDescription,
+  generatedParentDescription,
   hasPromptPatch,
   hasRequestPatch,
   loadSidecar,
@@ -190,6 +191,7 @@ function assembleAgents(cfg: Record<string, any>, sidecar: SidecarConfig) {
     if (isBuiltin && hasPromptPatch(parentPatch)) parentPromptPatches.set(parent, parentPatch)
     if (isBuiltin && hasRequestPatch(parentPatch)) parentRequestPatches.set(parent, parentPatch)
 
+    const parentAliases: string[] = []
     for (const [key, variant] of enabledVariants) {
       const alias = variantName(parent, key, variant)
       const effective = applyModelPresetPatch(effectiveVariantPatch(entry.parent, variant), sidecar)
@@ -212,6 +214,7 @@ function assembleAgents(cfg: Record<string, any>, sidecar: SidecarConfig) {
         continue
       }
       generatedAliases.set(alias, `${parent}.${key}`)
+      parentAliases.push(alias)
       const description = generatedVariantDescription(parent, key, { ...variant, ...effective }, sidecar)
       if (isBuiltin) {
         cfg.agent[alias] = virtualPatch(alias, description, effective as VariantConfig, sidecar, parentConfig)
@@ -248,6 +251,13 @@ function assembleAgents(cfg: Record<string, any>, sidecar: SidecarConfig) {
           options: parentConfig?.options,
         },
       })
+    }
+    if (parentAliases.length > 0) {
+      const current = cfg.agent[parent] as AgentConfig | undefined
+      cfg.agent[parent] = {
+        ...(current ?? {}),
+        description: generatedParentDescription(current?.description ?? base?.description, parent, parentAliases),
+      }
     }
   }
 
@@ -295,8 +305,10 @@ function takePending(list: PendingRoute[], input: { parentSessionID?: string; ag
     (item) => item.parentSessionID === input.parentSessionID && item.targetAgent === input.agent && item.fingerprint === input.fingerprint,
   )
   if (exact >= 0) return list.splice(exact, 1)[0]
-  const fallback = list.findIndex((item) => item.parentSessionID === input.parentSessionID && item.targetAgent === input.agent)
-  if (fallback >= 0) return list.splice(fallback, 1)[0]
+  const fallbackCandidates = list
+    .map((item, index) => ({ item, index }))
+    .filter(({ item }) => item.parentSessionID === input.parentSessionID && item.targetAgent === input.agent)
+  if (fallbackCandidates.length === 1) return list.splice(fallbackCandidates[0].index, 1)[0]
 }
 
 function getData<T>(value: T | { data?: T } | undefined): T | undefined {

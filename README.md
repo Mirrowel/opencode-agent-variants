@@ -55,9 +55,9 @@ After configuration, the main model sees ordinary task agents with distinct name
 
 ```txt
 general         Strong default reasoning agent.
-general-light   Copy of general using GLM 5.1. Use for routine implementation work.
+general-light   Variant agent general-light. Runs general using GLM 5.1. Use this exact alias for routine low-cost work.
 explore         Codebase exploration agent.
-explore-light   Copy of explore using GLM 5.1. Use for search, reading, and summarization.
+explore-heavy   Variant agent explore-heavy. Runs explore using GPT-5.5. Use this exact alias for deep verification or a second opinion.
 ```
 
 When the model calls `task` with `general-light`, the plugin routes execution through the native `general` agent and applies the configured model override to the child session.
@@ -256,6 +256,8 @@ See `docs/CONFIG.md` for the complete config reference and `agent-variants.examp
 Variant names default to `${parent}-${variantKey}`. In the example above, `general` plus variant key `light` becomes `general-light`.
 
 Description and prompt fields support template variables such as `{parent}`, `{alias}`, `{variant_key}`, `{model}`, `{model_label}`, and `{routed_agent}`.
+
+Variant descriptions are generated with selection guidance by default. The wizard can infer light/heavy/verification/parallel/strict-review style guidance from the variant key, alias, model preset, resolved model name, model label, and provider model variant. You can also pick a built-in guidance preset during variant creation or press `ctrl+p` while editing the `Description` field to insert preset text. Press `i` on a preset to preview the full text it adds.
 
 ## Supported Fields
 

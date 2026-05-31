@@ -175,6 +175,63 @@ export type TemplateContext = {
   routed_agent?: string
 }
 export type AgentMode = "primary" | "subagent" | "all"
+export type SelectionPreset = {
+  key: string
+  title: string
+  summary: string
+  text: string
+}
+
+export const SELECTION_PRESETS: SelectionPreset[] = [
+  {
+    key: "light",
+    title: "Light / low-cost",
+    summary: "Cheaper, faster, routine, or lower-stakes pass",
+    text: "Use {alias} for routine, low-cost, or fast-turnaround work. If the user explicitly asks for {alias}, call this exact subagent instead of {parent}.",
+  },
+  {
+    key: "heavy",
+    title: "Heavy / strongest",
+    summary: "Hard, deep, high-stakes, or strongest-model pass",
+    text: "Use {alias} for difficult investigations, high-stakes checks, deep reasoning, or when the user asks for a heavy/stronger pass. Do not substitute {parent} when {alias} is requested.",
+  },
+  {
+    key: "verification",
+    title: "Verification / second opinion",
+    summary: "Independent review after another subagent worked",
+    text: "Use {alias} as an independent verification or second-opinion subagent, especially in parallel with {parent} or after another agent has produced an answer.",
+  },
+  {
+    key: "parallel",
+    title: "Parallel comparison",
+    summary: "Run alongside sibling agents and compare results",
+    text: "Use {alias} when the user asks for parallel subagent calls, comparison, or cross-checking. It is intended to be called alongside sibling agents, not replaced by {parent}.",
+  },
+  {
+    key: "strict-review",
+    title: "Strict review / adversarial",
+    summary: "Skeptical bug, risk, and assumption checking",
+    text: "Use {alias} for a skeptical review that looks for bugs, hidden risks, weak assumptions, and behavioral regressions. Prefer it when the user asks for a strict or adversarial pass.",
+  },
+  {
+    key: "conservative",
+    title: "Conservative / minimal-change",
+    summary: "Small, safe, compatibility-preserving pass",
+    text: "Use {alias} when the user wants a cautious, minimal-change pass that preserves existing behavior and avoids unnecessary refactors.",
+  },
+  {
+    key: "creative",
+    title: "Creative / alternatives",
+    summary: "Alternative approaches and broader solution search",
+    text: "Use {alias} when the user wants alternatives, design space exploration, or a more creative pass before committing to one solution.",
+  },
+  {
+    key: "synthesis",
+    title: "Synthesis / summarizer",
+    summary: "Combine findings from multiple agents into a concise view",
+    text: "Use {alias} to synthesize, reconcile, or summarize findings from multiple agents or large investigations into a clear final view.",
+  },
+]
 
 export function isHotReloadField(field: string): field is HotReloadField {
   return HOT_RELOAD_FIELDS.includes(field as HotReloadField)
@@ -478,6 +535,61 @@ export function variantName(parent: string, key: string, variant: Pick<VariantCo
   return variant.name?.trim() || `${parent}-${key}`
 }
 
+function presetByKey(key: string | undefined) {
+  return SELECTION_PRESETS.find((preset) => preset.key === key)
+}
+
+function normalizePresetText(input: string) {
+  return input.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim()
+}
+
+function hasAnyToken(input: string, tokens: string[]) {
+  const padded = ` ${normalizePresetText(input)} `
+  return tokens.some((token) => padded.includes(` ${normalizePresetText(token)} `))
+}
+
+function hasAnyPhrase(input: string, phrases: string[]) {
+  const normalized = normalizePresetText(input)
+  return phrases.some((phrase) => normalized.includes(normalizePresetText(phrase)))
+}
+
+export function inferredSelectionPreset(parent: string, key: string, variant: Pick<VariantConfig, "name" | "model" | "variant">, config: SidecarConfig) {
+  const explicitSource = [key, variant.name].filter(Boolean).join(" ")
+  const modelSource = [variant.model, resolveModel(variant.model, config), modelLabel(variant.model, config)].filter(Boolean).join(" ")
+  const modelVariant = variant.variant ?? ""
+
+  if (hasAnyToken(explicitSource, ["verify", "verification", "review", "check", "audit", "critic", "second", "judge"]) || hasAnyPhrase(explicitSource, ["second opinion"])) return presetByKey("verification")
+  if (hasAnyToken(explicitSource, ["parallel", "compare", "crosscheck", "dual", "multi"]) || hasAnyPhrase(explicitSource, ["cross check", "side by side"])) return presetByKey("parallel")
+  if (hasAnyToken(explicitSource, ["strict", "adversarial", "skeptic", "skeptical", "risk", "regression"])) return presetByKey("strict-review")
+  if (hasAnyToken(explicitSource, ["conservative", "safe", "minimal", "compat", "compatibility", "lowrisk"]) || hasAnyPhrase(explicitSource, ["low risk", "minimal change"])) return presetByKey("conservative")
+  if (hasAnyToken(explicitSource, ["creative", "alternative", "alternatives", "brainstorm", "broad", "design"])) return presetByKey("creative")
+  if (hasAnyToken(explicitSource, ["synthesis", "synthesize", "summary", "summarize", "reconcile", "combine"])) return presetByKey("synthesis")
+
+  const explicitLight = hasAnyToken(explicitSource, ["light", "lite", "fast", "flash", "haiku", "small", "mini", "nano", "micro", "cheap", "budget", "economy", "low"])
+  const explicitHeavy = hasAnyToken(explicitSource, ["heavy", "deep", "strong", "strongest", "pro", "max", "opus", "reason", "reasoning", "thinking"])
+  if (explicitHeavy) return presetByKey("heavy")
+  if (explicitLight) return presetByKey("light")
+
+  const modelLooksLight = hasAnyToken(modelSource, ["light", "lite", "fast", "flash", "haiku", "small", "mini", "nano", "micro", "cheap", "budget", "economy", "low"])
+  if (modelLooksLight) return presetByKey("light")
+
+  if (hasAnyToken(modelVariant, ["low", "fast", "lite", "light", "economy", "small", "mini", "nano"])) return presetByKey("light")
+  if (hasAnyToken(modelVariant, ["high", "xhigh", "max", "pro", "reasoning", "thinking"])) return presetByKey("heavy")
+
+  if (hasAnyToken(modelSource, ["heavy", "deep", "strong", "strongest", "pro", "max", "opus", "xhigh"]) || hasAnyPhrase(modelSource, ["gpt 5", "gpt 5 5", "gpt5", "sonnet", "reasoning"])) return presetByKey("heavy")
+}
+
+export function selectionPresetText(parent: string, key: string, variant: VariantConfig, config: SidecarConfig, presetKey?: string) {
+  const preset = presetByKey(presetKey) ?? inferredSelectionPreset(parent, key, variant, config)
+  if (!preset) return `Use {alias} when this configured variant is a better fit than {parent}. If the user explicitly asks for {alias}, call this exact subagent.`
+  return preset.text
+}
+
+export function generatedVariantBase(parent: string, key: string, variant: VariantConfig, config: SidecarConfig, presetKey?: string) {
+  const alias = variantName(parent, key, variant)
+  return `Variant agent ${alias}. Runs the ${parent} workflow using ${modelLabel(variant.model, config)}. ${selectionPresetText(parent, key, variant, config, presetKey)}`
+}
+
 export function templateContext(parent: string, key: string | undefined, variant: Pick<VariantConfig, "name" | "model">, config: SidecarConfig) {
   const model = resolveModel(variant.model, config)
   const alias = key ? variantName(parent, key, variant) : parent
@@ -493,12 +605,20 @@ export function templateContext(parent: string, key: string | undefined, variant
 
 export function generatedVariantDescription(parent: string, key: string, variant: VariantConfig, config: SidecarConfig) {
   const context = templateContext(parent, key, variant, config)
-  const base = variant.description ?? `Copy of the ${parent} agent using ${modelLabel(variant.model, config)}.`
+  const base = variant.description ?? generatedVariantBase(parent, key, variant, config)
   return [variant.description_prepend, base, variant.description_append]
     .map((item) => renderTemplate(item, context))
     .filter((item) => item && item.length > 0)
     .join(" ")
     .trim()
+}
+
+export function generatedParentDescription(baseDescription: string | undefined, parent: string, aliases: string[]) {
+  const base = baseDescription?.trim() || BUILTIN_AGENT_DESCRIPTIONS[parent] || ""
+  if (aliases.length === 0) return base
+  const suffix = `Available variants: ${aliases.join(", ")}. If the user explicitly asks for one of these aliases, call that exact variant alias instead of ${parent}.`
+  if (base.includes(suffix)) return base
+  return [base, suffix].filter(Boolean).join(" ")
 }
 
 export function modelCatalogFromProviders(providers: unknown): ModelCatalog {

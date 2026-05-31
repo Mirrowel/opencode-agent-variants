@@ -145,10 +145,14 @@ Agent Variants are intended for agents callable by OpenCode's `task` tool. The w
 If a variant does not set `description`, the plugin generates:
 
 ```txt
-Copy of the <parent> agent using <model label>.
+Variant agent <alias>. Runs the <parent> workflow using <model label>. <selection guidance>
 ```
 
-Then it applies `description_prepend` and `description_append`.
+Selection guidance comes from built-in variant-intent presets. If `description` is not set, the plugin infers guidance from the variant key, alias, model preset key, resolved model name, model label, and provider model variant.
+
+Built-in presets cover light/low-cost variants (`light`, `lite`, `flash`, `haiku`, `small`, `mini`, `nano`, etc.), heavy/strong variants, verification/second-opinion variants, parallel comparison, strict review, conservative/minimal-change passes, creative alternatives, and synthesis. Press `i` on a preset in the wizard to see its full guidance text and the Description value it will insert.
+
+If `description` is manually set, it replaces the generated base text. While editing `description`, press `ctrl+p` to insert a preset-generated Description value, or choose Auto to remove the local `description` and rely on built-in inference. Then `description_prepend` and `description_append` apply around the base text. Parent descriptions also receive a small safe appended note listing available variant aliases so models are more likely to call the exact alias requested by the user.
 
 ## Template Variables
 

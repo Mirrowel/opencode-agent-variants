@@ -14,7 +14,9 @@ import {
   defaultSidecarPath,
   diagnoseConfig,
   effectiveVariantPatch,
+  generatedVariantBase,
   generatedVariantDescription,
+  inferredSelectionPreset,
   inheritanceEnabled,
   inheritedPatch,
   isHotReloadField,
@@ -24,8 +26,11 @@ import {
   patchHasValue,
   propagationEnabled,
   reconstructPatchBackup,
+  renderTemplate,
   saveSidecar,
   saveBackupJournal,
+  SELECTION_PRESETS,
+  templateContext,
   variantName,
   type AgentMode,
   type BackupJournal,
@@ -1178,6 +1183,50 @@ function showPrompt(
   })
 }
 
+function showDescriptionPrompt(
+  api: TuiPluginApi,
+  props: {
+    title: string
+    placeholder?: string
+    value?: string
+  },
+): Promise<string | "__preset__" | undefined> {
+  return new Promise((resolve) => {
+    let unregister: (() => void) | undefined
+    let settled = false
+    const done = (value: string | "__preset__" | undefined) => {
+      if (settled) return
+      settled = true
+      unregister?.()
+      resolve(value)
+    }
+    const commandPrefix = `agent-variants.description.${Math.random().toString(36).slice(2)}`
+    unregister = api.keymap.registerLayer({
+      priority: 10000,
+      commands: [
+        { name: `${commandPrefix}.preset`, title: "Pick description preset", run: (ctx: KeyContext) => { blockKey(ctx); done("__preset__"); api.ui.dialog.clear() } },
+      ],
+      bindings: [{ key: "ctrl+p", cmd: `${commandPrefix}.preset`, desc: "Pick description preset" }],
+    })
+    api.ui.dialog.replace(() =>
+      api.ui.DialogPrompt({
+        title: props.title,
+        placeholder: props.placeholder ?? "Enter text, or press ctrl+p for presets",
+        value: props.value ?? "",
+        onConfirm: (val) => {
+          done(val)
+          api.ui.dialog.clear()
+        },
+        onCancel: () => {
+          done(undefined)
+          api.ui.dialog.clear()
+        },
+      }),
+      () => done(undefined),
+    )
+  })
+}
+
 function showConfirm(
   ui: UI,
   props: {
@@ -1503,6 +1552,18 @@ function inspectVariantField(api: TuiPluginApi, config: SidecarConfig, agent: st
   const local = variant[field]
   const result = effectiveVariantPatch(parent, variant)[field]
   const defaultValue = defaultFieldValue(api, config, { field, mode: "variant", parentName: agent, variantKey: key, parent, variant })
+  const materializedPreset = field === "description" && typeof local === "string"
+    ? SELECTION_PRESETS.find((preset) => local === generatedVariantBase(agent, key, variant, config, preset.key))
+    : undefined
+  const preset = field === "description" ? materializedPreset ?? inferredSelectionPreset(agent, key, variant, config) : undefined
+  const presetState = field === "description"
+    ? local !== undefined
+      ? materializedPreset ? `${materializedPreset.title} (materialized in local Description)` : "overwritten by local Description value"
+      : preset
+        ? `${preset.title} (auto-inferred)`
+        : "generic exact-alias guidance (auto)"
+    : undefined
+  const presetText = field === "description" && preset ? renderedSelectionPresetText(config, agent, key, variant, preset.key) : undefined
   return [
     `${def?.label ?? field} (${variantName(agent, key, variant)})`,
     "",
@@ -1518,6 +1579,12 @@ function inspectVariantField(api: TuiPluginApi, config: SidecarConfig, agent: st
     `Inherited value: ${inherited === undefined ? "not available" : formatInputValue(inherited)}`,
     `Resulting value: ${result === undefined ? "not set" : formatInputValue(result)}`,
     `Source: ${local !== undefined ? "local variant override" : inherited !== undefined ? "inherited parent override" : "none"}`,
+    ...(field === "description" ? [
+      `Selection preset: ${presetState}`,
+      ...(presetText ? ["Preset text:", presetText] : []),
+      "Resulting task-list description:",
+      generatedVariantDescription(agent, key, variant, config),
+    ] : []),
     "",
     help.empty,
     "Submitting an empty value in the editor removes the local override. Escape cancels without changes.",
@@ -1773,6 +1840,18 @@ async function editVariantFields(
     if (name) variant.name = name
   }
 
+  const inferred = inferredSelectionPreset(agent, key, variant as VariantConfig, config)
+  const presetChoice = await pickSelectionPreset(api, config, agent, key, variant as VariantConfig, true)
+  if (presetChoice && presetChoice !== "__auto__") {
+    variant.description = generatedVariantBase(agent, key, variant as VariantConfig, config, presetChoice)
+  } else if (inferred) {
+    api.ui.toast({
+      variant: "info",
+      title: "Description guidance auto-selected",
+      message: `${variantName(agent, key, variant as VariantConfig)} will use ${inferred.title} unless you replace Description.`,
+    })
+  }
+
   const more = await showConfirm(api.ui, {
     title: "Edit more fields?",
     message: "Set temperature, prompt overrides, color, etc.?",
@@ -1806,7 +1885,7 @@ async function editVariantFields(
     })
     if (!want) continue
 
-    const value = await promptForField(api, field.key, formatInputValue(variant[field.key]), { config, model: variant.model })
+    const value = await promptForField(api, field.key, formatInputValue(variant[field.key]), { config, model: variant.model, descriptionVariant: { agent, key, variant: variant as VariantConfig } })
     if (value !== undefined && value !== "") {
       variant[field.key] = value
     }
@@ -1892,7 +1971,11 @@ async function editVariant(api: TuiPluginApi, config: SidecarConfig, settings: W
       if (!isHotReloadField(picked.key)) await warnRestartField(api, picked.label, "Inheritance for this field affects cached task-list/UI metadata.")
       continue
     }
-    const val = await promptForField(api, field, formatInputValue(target[picked.key]), { config: next, model: effectiveVariantPatch(nextEntry.parent, target).model })
+    const val = await promptForField(api, field, formatInputValue(target[picked.key]), {
+      config: next,
+      model: effectiveVariantPatch(nextEntry.parent, target).model,
+      descriptionVariant: { agent, key, variant: target },
+    })
     if (val === undefined) continue
     const previous = target[picked.key]
     if (!fieldValueChanged(previous, val)) continue
@@ -2337,11 +2420,67 @@ async function saveConfig(api: TuiPluginApi, config: SidecarConfig, settings: Wi
 
 // Field prompting.
 
+function renderedSelectionPresetText(config: SidecarConfig, agent: string, key: string, variant: VariantConfig, presetKey: string) {
+  const preset = SELECTION_PRESETS.find((item) => item.key === presetKey)
+  if (!preset) return ""
+  return renderTemplate(preset.text, templateContext(agent, key, variant, config))
+}
+
+function selectionPresetHelp(config: SidecarConfig, agent: string, key: string, variant: VariantConfig, presetKey: string) {
+  const preset = SELECTION_PRESETS.find((item) => item.key === presetKey)
+  if (!preset) return "No preset details available."
+  return [
+    preset.title,
+    "",
+    preset.summary,
+    "",
+    "Preset guidance text:",
+    renderedSelectionPresetText(config, agent, key, variant, preset.key),
+    "",
+    "Materialized Description value:",
+    generatedVariantBase(agent, key, variant, config, preset.key),
+  ].join("\n")
+}
+
+function selectionPresetOptions(config: SidecarConfig, agent: string, key: string, variant: VariantConfig, includeAuto = true): WizardSelectOption<string>[] {
+  const inferred = inferredSelectionPreset(agent, key, variant, config)
+  const options: WizardSelectOption<string>[] = []
+  if (includeAuto) {
+    options.push({
+      title: inferred ? `Auto: ${inferred.title}` : "Auto: generic variant guidance",
+      value: "__auto__",
+      description: inferred ? inferred.summary : "No keyword match; use generic exact-alias guidance",
+      help: inferred
+        ? ["Automatic preset selection", "", `The wizard inferred ${inferred.title} from the variant key/name/model/model variant. Choosing Auto removes any local Description override and lets the built-in generator keep inferring.`, "", selectionPresetHelp(config, agent, key, variant, inferred.key)].join("\n")
+        : "Automatic preset selection did not find a variant-intent keyword. Choosing Auto removes any local Description override and keeps generic exact-alias guidance.",
+    })
+  }
+  for (const preset of SELECTION_PRESETS) {
+    options.push({
+      title: preset.title,
+      value: preset.key,
+      description: preset.summary,
+      help: selectionPresetHelp(config, agent, key, variant, preset.key),
+    })
+  }
+  return options
+}
+
+async function pickSelectionPreset(api: TuiPluginApi, config: SidecarConfig, agent: string, key: string, variant: VariantConfig, includeAuto = true) {
+  const picked = await showMenu(api, {
+    title: `Description guidance - ${variantName(agent, key, variant)}`,
+    options: [...selectionPresetOptions(config, agent, key, variant, includeAuto), { title: "< Back", value: "__back__", description: "Keep current description behavior" }],
+    current: inferredSelectionPreset(agent, key, variant, config)?.key ?? "__auto__",
+  })
+  if (!picked || picked === "__back__") return undefined
+  return picked
+}
+
 async function promptForField(
   api: TuiPluginApi,
   field: string,
   current: string | undefined,
-  context?: { config: SidecarConfig; model: unknown; includeModelPresets?: boolean },
+  context?: { config: SidecarConfig; model: unknown; includeModelPresets?: boolean; descriptionVariant?: { agent: string; key: string; variant: VariantConfig } },
 ): Promise<unknown> {
   if (field === "model") {
     const config = context?.config ?? loadSidecar(defaultSidecarPath())
@@ -2397,6 +2536,23 @@ async function promptForField(
     } catch {
       await showAlert(api.ui, { title: "Invalid JSON", message: "Please enter a valid JSON object." })
       return undefined
+    }
+  }
+
+  if (field === "description" && context?.descriptionVariant) {
+    const { agent, key, variant } = context.descriptionVariant
+    while (true) {
+      const val = await showDescriptionPrompt(api, {
+        title: "Description (replace)",
+        value: current,
+      })
+      if (val === "__preset__") {
+        const preset = await pickSelectionPreset(api, context.config, agent, key, variant, true)
+        if (!preset) continue
+        if (preset === "__auto__") return ""
+        return generatedVariantBase(agent, key, variant, context.config, preset)
+      }
+      return val
     }
   }
 

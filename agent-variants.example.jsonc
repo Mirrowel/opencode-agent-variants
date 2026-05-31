@@ -76,6 +76,9 @@
           // Variant names default to parent-key, so this becomes general-light.
           // "name": "general-cheap",
           "model": "light",
+          // If description is omitted, the plugin infers selection guidance from
+          // key/name/model/variant words such as light, lite, flash, haiku,
+          // small, mini, nano, heavy, pro, verify, or parallel.
           "description_append": "Use {alias} for most tasks that do not need {parent}'s strongest model. Runs on {model_label}.",
           "inherit": {
             // Variant inheritance is on by default. Set a field to false to
@@ -91,7 +94,7 @@
           // "prompt": "Replace the prompt/system prompt for this variant only.",
           // "prompt_prepend": "Text before this variant prompt/system prompt.",
           // "prompt_append": "Text after this variant prompt/system prompt.",
-          // "description": "Replace the generated copy-of description.",
+          // "description": "Replace the generated selection-guided description.",
           // "description_prepend": "Text before the generated description.",
           // "options": { "reasoningEffort": "medium" },
           // "color": "secondary",
