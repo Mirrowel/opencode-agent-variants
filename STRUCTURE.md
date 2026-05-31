@@ -59,7 +59,7 @@ agent-variants/
 
 **Entry Points:** `src/server.ts`: Server plugin entry (re-exports `src/index.ts` as `{ id, server }`); `src/tui.tsx`: TUI plugin entry (exports `{ id, tui }`)
 **Configuration:** `tsconfig.json`: TypeScript compiler options (ES2022, NodeNext, JSX with Solid); `package.json`: npm package config with `"oc-plugin": ["server", "tui"]` manifest
-**Core Logic:** `src/index.ts`: Hook factory with route assembly, marker injection, session correlation; `src/config.ts`: All schemas, config I/O, model resolution, backup system, diagnostics
+**Core Logic:** `src/index.ts`: Hook factory with route assembly, metadata-based session correlation, optional legacy prompt-marker fallback; `src/config.ts`: All schemas, config I/O, model resolution, backup system, diagnostics
 **Config Example:** `agent-variants.example.jsonc`: Annotated example of the sidecar config format
 **Tests:** No test files exist in this project currently
 **CI/CD:** `.github/workflows/ci.yml`: Lint, typecheck, build, pack dry-run; `.github/workflows/release.yml`: Automated npm publish and GitHub release

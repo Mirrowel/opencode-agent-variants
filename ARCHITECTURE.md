@@ -7,17 +7,17 @@
 **Key Characteristics:**
 - Dual-entry plugin architecture: server hooks for runtime routing + TUI for configuration
 - Sidecar config file (`agent-variants.jsonc`) separate from OpenCode's own config
-- Marker-based token routing: variant calls embed HTML-comment tokens in prompts to correlate sessions
+- Markerless route correlation by default: child sessions are matched through OpenCode task metadata (`sessionId`) and task call IDs; legacy prompt markers are an opt-in debug fallback
 - Hot-reload boundary: runtime fields (model, prompt, temperature) apply per-call; structural fields (description, color, name) require restart
 - Automatic config backups with patch-chain reversal on every save
-- Internal-only routing metadata: variant routing tokens and markers are stripped from model-visible output; stored task parts are auto-repaired to remove residual artifacts
+- Internal-only routing metadata: route state stays in memory and task `state.metadata`; legacy markers and residual artifacts are stripped from model-visible output; stored task parts are auto-repaired when needed
 
 ## Layers
 
 **Server Plugin (Hook Layer):**
 - Purpose: Intercepts OpenCode lifecycle hooks to inject agent variants into the task tool and route model/parameter overrides
 - Location: `src/index.ts`
-- Contains: Plugin factory, route assembly, marker injection, session correlation, request patching, chat history sanitization
+- Contains: Plugin factory, route assembly, metadata/optional-marker session correlation, request patching, chat history sanitization
 - Depends on: `src/config.ts` for config loading, validation, and model resolution
 - Used by: OpenCode runtime via `src/server.ts` entry point
 
@@ -50,16 +50,16 @@
 2. `loadSidecar()` reads `~/.config/opencode/agent-variants.jsonc` — `src/config.ts`
 3. `assembleAgents()` merges parent patches, variant patches, model presets, and auto-inferred selection-guidance descriptions into `cfg.agent` entries — `src/index.ts`, `src/config.ts`
 4. Parent descriptions get appended variant alias list and selection guidance via `generatedParentDescription()` when variants exist — `src/index.ts`, `src/config.ts`
-5. Generated aliases are registered as virtual routes with token-based routing (built-ins) or cloned agents (custom agents) — `src/index.ts`
+5. Generated aliases are registered as virtual routes with metadata-based routing (built-ins) or cloned agents (custom agents) — `src/index.ts`
 6. Diagnostics are emitted as toast warnings for invalid model references, conflicts, or disabled parents — `src/index.ts`
 
 **Variant Call Routing (Runtime):**
 
 1. `tool.execute.before` hook intercepts `task` tool calls targeting a variant alias — `src/index.ts`
 2. `liveRoute()` re-validates the variant against current sidecar config (hot reload) — `src/index.ts`
-3. A UUID token is generated as an internal HTML comment marker injected into the task prompt; the marker is stripped from model-visible output before storage — `src/index.ts`
+3. A pending route is stored by task call ID; when `routing.prompt_markers` is enabled, a legacy HTML marker token is also injected as fallback — `src/index.ts`
 4. `subagent_type` is rewritten to the parent agent so OpenCode routes to the correct agent — `src/index.ts`
-5. `chat.message` hook extracts the marker from the response to correlate session → route — `src/index.ts`
+5. `chat.message` correlates child session → parent task part via OpenCode task metadata (`state.metadata.sessionId`) and task call ID; legacy marker extraction remains as fallback — `src/index.ts`
 6. `applyMessageModel()` sets the provider/model/variant on the response message — `src/index.ts`
 7. `chat.params` hook patches temperature, top_p, and options on API requests — `src/index.ts`
 8. `experimental.chat.system.transform` hook patches the system prompt with variant prepend/append — `src/index.ts`

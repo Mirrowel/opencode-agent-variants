@@ -94,8 +94,13 @@ const UiSettings = z.object({
   height_percent: z.number().int().min(25).max(100).optional(),
 }).default({ width: "large", height: "normal" })
 
+const RoutingSettings = z.object({
+  prompt_markers: z.boolean().default(false),
+}).default({ prompt_markers: false })
+
 export const SidecarConfig = z.object({
   debug: z.boolean().default(false),
+  routing: RoutingSettings,
   ui: UiSettings,
   models: z.record(z.string(), ModelShortcut).default({}),
   agents: z.record(
@@ -295,7 +300,7 @@ export function backupJournalPath(configDir = defaultConfigDir()) {
 }
 
 export function emptyConfig(): SidecarConfig {
-  return { debug: false, ui: { width: "large", height: "normal" }, models: {}, agents: {} }
+  return { debug: false, routing: { prompt_markers: false }, ui: { width: "large", height: "normal" }, models: {}, agents: {} }
 }
 
 export function loadSidecar(filePath = defaultSidecarPath()) {

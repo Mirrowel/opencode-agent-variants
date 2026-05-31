@@ -2103,6 +2103,7 @@ async function previewConfig(api: TuiPluginApi, config: SidecarConfig): Promise<
   lines.push("=".repeat(50))
   lines.push("")
   lines.push(`Debug mode: ${config.debug ? "enabled" : "disabled"}`)
+  lines.push(`Prompt route markers: ${config.routing.prompt_markers ? "enabled" : "disabled"}`)
 
   if (Object.keys(config.models).length > 0) {
     lines.push("")
@@ -2176,6 +2177,25 @@ async function toggleDebug(api: TuiPluginApi, config: SidecarConfig): Promise<Si
   return next
 }
 
+async function togglePromptMarkers(api: TuiPluginApi, config: SidecarConfig): Promise<SidecarConfig> {
+  const next = structuredClone(config)
+  next.routing = { ...next.routing, prompt_markers: !next.routing.prompt_markers }
+  try {
+    saveSidecar(next, defaultSidecarPath(), { backup: false })
+  } catch (err) {
+    await showAlert(api.ui, { title: "Save failed", message: String(err instanceof Error ? err.message : err) })
+    return config
+  }
+  api.ui.toast({
+    variant: next.routing.prompt_markers ? "warning" : "success",
+    title: `Prompt route markers ${next.routing.prompt_markers ? "enabled" : "disabled"}`,
+    message: next.routing.prompt_markers
+      ? "Legacy prompt-marker routing is enabled immediately for future variant calls."
+      : "Markerless metadata routing is enabled immediately for future variant calls.",
+  })
+  return next
+}
+
 async function updateUiSettings(api: TuiPluginApi, config: SidecarConfig, ui: Partial<SidecarConfig["ui"]>): Promise<SidecarConfig> {
   const next = structuredClone(config)
   next.ui = { ...next.ui, ...ui }
@@ -2217,6 +2237,7 @@ async function runDiagnostics(api: TuiPluginApi, config: SidecarConfig): Promise
     `Agents configured: ${Object.keys(config.agents).length}`,
     `Variants configured: ${variantCount(config)}`,
     `Debug mode: ${config.debug ? "enabled" : "disabled"}`,
+    `Prompt route markers: ${config.routing.prompt_markers ? "enabled" : "disabled"}`,
     `Debug log: ${debugLogPath(defaultConfigDir())}`,
     `Summary: ${errors} error(s), ${warnings} warning(s), ${infos} info`,
     "",
@@ -2381,7 +2402,8 @@ async function showWizardInfo(api: TuiPluginApi): Promise<void> {
       "Parent propagation is off per field by default. Variant inheritance is on per field by default. A variant receives a parent field only when the parent propagates it, the variant accepts it, and the variant has no local value.",
       "",
       "Built-in Routing",
-      "Built-in variants route through their native parent agent, so the footer may show the parent. Task output and expanded inputs show selected_alias/agent_variant, routed_agent, and effective_model.",
+      "Built-in variants route through their native parent agent, so the footer may show the parent. Runtime route details stay internal; model-visible task history is repaired back to the selected alias.",
+      "Markerless metadata routing is the default. The legacy prompt-marker path is available only as an advanced debug fallback.",
       "",
       "Editing",
       "Submit an empty value while editing a field to remove that local override. Escape cancels without changes.",
@@ -2692,6 +2714,13 @@ async function debugAdvancedMenu(api: TuiPluginApi, config: SidecarConfig, setti
       value: "debug",
       description: "Toggle routing/model diagnostic toasts immediately",
     },
+    {
+      title: `Prompt route markers: ${config.routing.prompt_markers ? "on" : "off"}`,
+      value: "prompt-markers",
+      description: config.routing.prompt_markers ? "Legacy prompt-marker correlation is active" : "Default markerless metadata correlation is active",
+      danger: config.routing.prompt_markers,
+      help: "Default off. Markerless routing matches the child session through OpenCode's task metadata and avoids putting random route tokens in prompts. Enable only as a legacy debug fallback if markerless routing fails.",
+    },
     { title: "View debug log", value: "view-log", description: "Show recent agent-variants.debug.log entries" },
     { title: "Clear debug log", value: "clear-log", description: "Empty agent-variants.debug.log" },
     { title: "Config backups", value: "backups", description: "Preview, restore, and snapshot sidecar config" },
@@ -2719,6 +2748,8 @@ async function debugAdvancedMenu(api: TuiPluginApi, config: SidecarConfig, setti
   switch (action) {
     case "debug":
       return debugAdvancedMenu(api, await toggleDebug(api, config), settings)
+    case "prompt-markers":
+      return debugAdvancedMenu(api, await togglePromptMarkers(api, config), settings)
     case "view-log":
       await viewDebugLog(api)
       return debugAdvancedMenu(api, config, settings)

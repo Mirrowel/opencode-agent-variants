@@ -5,6 +5,14 @@
   // Debug changes do not create config backup entries.
   "debug": false,
 
+  // Runtime routing preferences. The default markerless path correlates child
+  // sessions through OpenCode's task metadata and avoids putting random route
+  // tokens in prompts. Enable prompt_markers only as a legacy debug fallback.
+  // Routing toggle changes do not create config backup entries.
+  "routing": {
+    "prompt_markers": false
+  },
+
   // Wizard display preferences. These are changed from Debug & advanced.
   // UI changes do not create config backup entries.
   "ui": {

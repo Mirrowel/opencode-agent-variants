@@ -7,11 +7,12 @@ See `agent-variants.example.jsonc` for a fully commented starter file.
 ## Top-Level Fields
 
 - `debug`: boolean. Enables routing/model diagnostic toasts and file logging. This is hot-read by the server plugin, so toggling it from the wizard takes effect immediately. When disabled, debug toasts and debug log writes are suppressed.
+- `routing`: runtime routing preferences. `routing.prompt_markers` defaults to `false`; the default markerless path correlates child sessions through OpenCode task metadata and avoids putting random route tokens in prompts. Enable prompt markers only as a legacy debug fallback.
 - `ui`: wizard display preferences. `width` is `medium`, `large`, or `xlarge`; `height_percent` is a fine-grained max-height percentage clamped to 25-100. `height` is kept as a preset/reference fallback (`compact` = 32, `normal` = 50, `tall` = 68, `max` = 100).
 - `models`: named model presets. Each preset has `model` and can also provide `label`, `variant`, `temperature`, `top_p`, and `options`.
 - `agents`: parent-agent entries. Each key is a built-in or configured OpenCode agent name.
 
-Debug and UI-only saves do not create backup entries. Meaningful config saves are backed up in `~/.config/opencode/agent-variants.backup.json` as a reverse-patch journal, capped to the latest 50 patch restore points. The wizard's `Debug & advanced` > `Config backups` menu can create full snapshots, preview valid restore points, restore them, optionally create a full backup before restore, and delete full snapshots. Full snapshots are not auto-pruned.
+Debug, routing-toggle, and UI-only saves do not create backup entries. Meaningful config saves are backed up in `~/.config/opencode/agent-variants.backup.json` as a reverse-patch journal, capped to the latest 50 patch restore points. The wizard's `Debug & advanced` > `Config backups` menu can create full snapshots, preview valid restore points, restore them, optionally create a full backup before restore, and delete full snapshots. Full snapshots are not auto-pruned.
 
 ## Model Shortcuts
 
@@ -31,6 +32,20 @@ Debug and UI-only saves do not create backup entries. Meaningful config saves ar
 Parent and variant `model` fields can use either `"light"` or the full `"provider/model"` reference. Selecting a preset applies its model-related fields; local parent/variant fields still win. For example, `model: "light"` can supply `temperature: 0.2`, but a variant with its own `temperature` uses the variant value.
 
 If a variant resolves to a model that is definitely missing, the plugin skips that variant at startup and shows a warning toast. The sidecar is not modified automatically.
+
+## Routing Settings
+
+```jsonc
+"routing": {
+  "prompt_markers": false
+}
+```
+
+- `prompt_markers`: legacy correlation fallback. Defaults to `false`.
+
+With the default markerless path, the plugin matches child sessions back to variant calls through OpenCode's stored task metadata (`sessionId`) and the original task call ID. This avoids adding random route markers to prompts and is better for prompt-cache stability.
+
+When `prompt_markers` is `true`, the plugin also appends a hidden HTML route marker to the task prompt and strips it before model replay/storage. This path is kept as a debug fallback only.
 
 ## Parent Entries
 

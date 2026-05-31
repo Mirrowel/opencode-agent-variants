@@ -218,6 +218,9 @@ See `docs/CONFIG.md` for the complete config reference and `agent-variants.examp
 ```jsonc
 {
   "debug": false,
+  "routing": {
+    "prompt_markers": false
+  },
   "models": {
     "light": {
       "model": "zai-coding-plan/glm-5.1",
@@ -292,6 +295,7 @@ Built-in agents such as `general` and `explore` cannot be copied externally with
 - The plugin routes the call to the native parent before execution.
 - The plugin applies configured model, request parameter, and explicit prompt overrides.
 - The plugin keeps routing metadata internal and exposes only a small natural alias hint in the task title.
+- By default, child-session correlation uses OpenCode task metadata instead of prompt markers. A legacy prompt-marker fallback can be enabled from `Debug & advanced` if needed.
 
 This preserves native prompts and permissions. The child session may internally show the parent agent name for built-in variants; that is expected.
 
@@ -317,7 +321,7 @@ Debug mode is off by default. Enable it from the wizard through `Debug & advance
 When enabled, the server plugin emits diagnostic log lines and TUI toast notifications for built-in virtual variants:
 
 - when a variant is routed, such as `general-light -> general`
-- the short internal route token used for correlation
+- whether markerless metadata routing or legacy prompt-marker routing was used
 - the target model and model variant
 - when the model override is applied to the child session message
 - when old model-visible routing artifacts are sanitized; dirty task-tool parts are repaired in stored session history, while plain text is scrubbed only for replay
@@ -325,6 +329,8 @@ When enabled, the server plugin emits diagnostic log lines and TUI toast notific
 When debug mode is enabled, logs are written to `~/.config/opencode/agent-variants.debug.log`. The plugin does not write debug lines to stdout, because that can corrupt the terminal UI.
 
 Debug mode is stored in `agent-variants.jsonc` and takes effect immediately for future variant calls. The wizard can also view and clear the debug log from `Debug & advanced`.
+
+`routing.prompt_markers` is off by default. Leave it off for cache hygiene; it avoids random route tokens in subagent prompts. Turn it on only as a temporary legacy correlation fallback while debugging routing issues.
 
 ## Development
 
