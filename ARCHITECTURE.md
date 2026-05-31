@@ -56,13 +56,14 @@
 
 1. `tool.execute.before` hook intercepts `task` tool calls targeting a variant alias — `src/index.ts`
 2. `liveRoute()` re-validates the variant against current sidecar config (hot reload) — `src/index.ts`
-3. A UUID token is generated and embedded as an HTML comment marker in the prompt — `src/index.ts`
+3. A UUID token is generated as an internal HTML comment marker and aggressively scrubbed before message save/replay — `src/index.ts`
 4. `subagent_type` is rewritten to the parent agent so OpenCode routes to the correct agent — `src/index.ts`
 5. `chat.message` hook extracts the marker from the response to correlate session → route — `src/index.ts`
 6. `applyMessageModel()` sets the provider/model/variant on the response message — `src/index.ts`
 7. `chat.params` hook patches temperature, top_p, and options on API requests — `src/index.ts`
 8. `experimental.chat.system.transform` hook patches the system prompt with variant prepend/append — `src/index.ts`
-9. `tool.execute.after` hook annotates task output with variant metadata — `src/index.ts`
+9. `tool.execute.after` hook stores minimal route proof metadata and scrubs plugin-only task output — `src/index.ts`
+10. `experimental.chat.messages.transform` strips old route markers and metadata from replayed history before any model sees it, then repairs changed stored task parts when possible — `src/index.ts`
 
 **Wizard Config Editing:**
 

@@ -179,9 +179,9 @@ Built-in agents such as `general` and `explore` cannot be externally copied with
 - the main model calls `task` once with the variant name,
 - the plugin routes execution to the native parent,
 - model/request/prompt overrides are applied,
-- task output is annotated with `agent_variant`, `routed_agent`, and `effective_model`.
+- route metadata stays internal and model-visible task history is scrubbed of plugin-only fields. When old polluted task-tool history is found, the plugin attempts to repair the stored task part so the same cleanup is not needed again. Plain text history is only scrubbed in the replay copy, not rewritten on disk.
 
-This preserves native prompts and permissions while making variant selection clear in the transcript.
+This preserves native prompts and permissions while keeping variant selection clear through the alias and a small natural task-title hint, without exposing internal route fields to the model.
 
 ## Config Or Markdown Agents
 

@@ -291,7 +291,7 @@ Built-in agents such as `general` and `explore` cannot be copied externally with
 - The main model can call `task` once with the variant name.
 - The plugin routes the call to the native parent before execution.
 - The plugin applies configured model, request parameter, and explicit prompt overrides.
-- The plugin annotates task result metadata/output with the selected variant alias, routed native agent, and effective model.
+- The plugin keeps routing metadata internal and exposes only a small natural alias hint in the task title.
 
 This preserves native prompts and permissions. The child session may internally show the parent agent name for built-in variants; that is expected.
 
@@ -320,6 +320,7 @@ When enabled, the server plugin emits diagnostic log lines and TUI toast notific
 - the short internal route token used for correlation
 - the target model and model variant
 - when the model override is applied to the child session message
+- when old model-visible routing artifacts are sanitized; dirty task-tool parts are repaired in stored session history, while plain text is scrubbed only for replay
 
 Logs are written to `~/.config/opencode/agent-variants.debug.log`. The plugin does not write debug lines to stdout, because that can corrupt the terminal UI.
 

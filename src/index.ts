@@ -50,11 +50,19 @@ type PendingRoute = RuntimeRoute & {
   fingerprint: string
   createdAt: number
 }
+type ScrubContext = { routes?: Map<string, RuntimeRoute> }
+type ScrubResult = { count: number; token?: string; alias?: string; proof?: string }
+type ChangedPart = { part: any; before: string; after: string; cleaned: number }
 
 const BUILTIN_AGENTS = new Set(Object.keys(BUILTIN_AGENT_DESCRIPTIONS))
 const ROUTE_TTL = 10 * 60 * 1000
 const MARKER_PREFIX = "<!-- agent-variants-route"
 const MARKER_SUFFIX = " -->"
+const ROUTE_MARKER_RE = /<!--\s*agent-variants-route([\s\S]*?)-->/g
+const ROUTE_ATTR_RE = /\s+(?:agent_variant|routed_agent|parent_agent|effective_model|model_variant)="[^"]*"/g
+const ROUTE_STANDALONE_RE = /\n?\s*<agent_variant\b[^>]*\/?>\s*\n?/g
+const ROUTE_ARG_FRAGMENT_RE = /\s*(?:selected_alias|agent_variant|routed_agent|parent_agent|effective_model|model_variant)=(?:"[^"]*"|\\"[^\\]*\\")/g
+const PLUGIN_ARG_KEYS = ["selected_alias", "agent_variant", "routed_agent", "parent_agent", "effective_model", "model_variant"] as const
 
 function attr(value: string | undefined) {
   return (value ?? "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -62,6 +70,173 @@ function attr(value: string | undefined) {
 
 function marker(token: string, route: RuntimeRoute) {
   return `${MARKER_PREFIX} token="${attr(token)}" selected_alias="${attr(route.alias)}" routed_agent="${attr(route.targetAgent)}" parent_agent="${attr(route.parent)}" effective_model="${attr(routeModel(route))}" model_variant="${attr(route.variant ?? "default")}"${MARKER_SUFFIX}`
+}
+
+function markerInfo(body: string) {
+  const trimmed = body.trim()
+  const token = trimmed.startsWith(":") ? trimmed.slice(1).trim().split(/\s+/)[0] : /\btoken="([^"]+)"/.exec(body)?.[1]
+  const alias = /\bselected_alias="([^"]+)"/.exec(body)?.[1] ?? /\bagent_variant="([^"]+)"/.exec(body)?.[1]
+  return { token, alias }
+}
+
+function stripRouteMarkers(text: string) {
+  let count = 0
+  let token: string | undefined
+  let alias: string | undefined
+  const stripped = text.replace(ROUTE_MARKER_RE, (_match, body: string) => {
+    count++
+    const info = markerInfo(body)
+    token ??= info.token
+    alias ??= info.alias
+    return ""
+  })
+  return { text: stripped.replace(/\n{3,}/g, "\n\n").trim(), count, token, alias }
+}
+
+function routeForAlias(alias: string | undefined, routes?: Map<string, RuntimeRoute>) {
+  if (!alias) return
+  return routes?.get(alias)
+}
+
+function validAlias(alias: string | undefined, routes?: Map<string, RuntimeRoute>) {
+  return routeForAlias(alias, routes)?.alias
+}
+
+function inputMatchesRoute(args: Record<string, unknown>, route: RuntimeRoute) {
+  return args.subagent_type === route.alias || args.subagent_type === route.targetAgent || args.subagent_type === route.parent
+}
+
+function suffixAlias(description: unknown) {
+  if (typeof description !== "string") return
+  return /\(@([^()\s]+) variant\)/.exec(description)?.[1]
+}
+
+function metadataAlias(metadata: unknown, routes?: Map<string, RuntimeRoute>) {
+  if (!metadata || typeof metadata !== "object") return
+  const value = (metadata as Record<string, unknown>).agentVariants
+  if (!value || typeof value !== "object") return
+  const alias = (value as Record<string, unknown>).alias
+  return validAlias(typeof alias === "string" ? alias : undefined, routes)
+}
+
+function legacyOutputAlias(text: string, routes?: Map<string, RuntimeRoute>) {
+  const alias = /\bagent_variant="([^"]+)"/.exec(text)?.[1]
+  return validAlias(alias, routes)
+}
+
+function scrubTaskOutput(text: string, context: ScrubContext = {}): ScrubResult & { text: string } {
+  const legacyAlias = legacyOutputAlias(text, context.routes)
+  const markerResult = stripRouteMarkers(text)
+  const textWithoutStandalone = markerResult.text.replace(ROUTE_STANDALONE_RE, "\n")
+  const textWithoutArgFragments = textWithoutStandalone.replace(ROUTE_ARG_FRAGMENT_RE, "")
+  const textWithoutAttrs = textWithoutArgFragments.replace(/^<task\b([^>]*)>/, (match) => match.replace(ROUTE_ATTR_RE, ""))
+  const output = textWithoutAttrs.replace(/\n{3,}/g, "\n\n").trim()
+  const markerAlias = validAlias(markerResult.alias, context.routes)
+  return {
+    text: output,
+    count: markerResult.count + (output === markerResult.text ? 0 : 1),
+    token: markerResult.token,
+    alias: markerAlias ?? legacyAlias,
+    proof: markerAlias ? "marker" : legacyAlias ? "legacy-output" : undefined,
+  }
+}
+
+function scrubParts(parts: any[], context: ScrubContext = {}) {
+  let count = 0
+  let token: string | undefined
+  let alias: string | undefined
+  let proof: string | undefined
+  for (const part of parts) {
+    if (part?.type === "text" && typeof part.text === "string") {
+      const result = stripRouteMarkers(part.text)
+      if (result.count > 0) {
+        part.text = result.text
+        count += result.count
+        token ??= result.token
+        const markerAlias = validAlias(result.alias, context.routes)
+        if (markerAlias) {
+          alias ??= markerAlias
+          proof ??= "marker"
+        }
+      }
+    }
+    if (part?.type === "tool" && part.tool === "task") {
+      let partAlias = metadataAlias(part.state?.metadata, context.routes)
+      let partProof = partAlias ? "metadata" : undefined
+      if (partAlias) {
+        alias ??= partAlias
+        proof ??= partProof
+      }
+      const inputResult = scrubTaskInput(part.state?.input, context, partAlias)
+      count += inputResult.count
+      partAlias ??= inputResult.alias
+      partProof ??= inputResult.proof
+      if (typeof part.state?.output === "string") {
+        const result = scrubTaskOutput(part.state.output, context)
+        part.state.output = result.text
+        count += result.count
+        partAlias ??= result.alias
+        partProof ??= result.proof
+      }
+      if (typeof part.state?.error === "string") {
+        const result = scrubTaskOutput(part.state.error, context)
+        part.state.error = result.text
+        count += result.count
+        partAlias ??= result.alias
+        partProof ??= result.proof
+      }
+      if (partAlias) {
+        const retry = scrubTaskInput(part.state?.input, context, partAlias)
+        count += retry.count
+      }
+      alias ??= partAlias
+      proof ??= partProof
+    }
+  }
+  return { count, token, alias, proof }
+}
+
+function scrubTaskInput(input: unknown, context: ScrubContext = {}, provenAlias?: string): ScrubResult {
+  if (!input || typeof input !== "object") return { count: 0 }
+  const args = input as Record<string, unknown>
+  let count = 0
+  let proof: string | undefined
+  let alias = validAlias(provenAlias, context.routes)
+  const legacyAlias = validAlias(typeof args.selected_alias === "string" ? args.selected_alias : typeof args.agent_variant === "string" ? args.agent_variant : undefined, context.routes)
+  if (!alias && legacyAlias) {
+    alias = legacyAlias
+    proof = "legacy-input"
+  }
+  if (typeof args.prompt === "string") {
+    const result = stripRouteMarkers(args.prompt)
+    if (result.count > 0) {
+      args.prompt = result.text
+      count += result.count
+      const markerAlias = validAlias(result.alias, context.routes)
+      if (!alias && markerAlias) {
+        alias = markerAlias
+        proof = "marker"
+      }
+    }
+  }
+  if (!alias) {
+    const route = routeForAlias(suffixAlias(args.description), context.routes)
+    if (route && inputMatchesRoute(args, route)) {
+      alias = route.alias
+      proof = "description-suffix"
+    }
+  }
+  for (const key of PLUGIN_ARG_KEYS) {
+    if (key in args) {
+      delete args[key]
+      count++
+    }
+  }
+  if (alias && args.subagent_type !== alias) {
+    args.subagent_type = alias
+    count++
+  }
+  return { count, alias, proof }
 }
 
 function routeModel(route: RuntimeRoute) {
@@ -271,20 +446,11 @@ function textFromParts(parts: any[]) {
 }
 
 function takeMarkerRoute(parts: any[], routes: Map<string, RuntimeRoute>) {
-  for (const part of parts) {
-    if (part?.type !== "text" || typeof part.text !== "string") continue
-    const start = part.text.indexOf(MARKER_PREFIX)
-    if (start < 0) continue
-    const end = part.text.indexOf(MARKER_SUFFIX, start)
-    if (end < 0) continue
-    const body = part.text.slice(start + MARKER_PREFIX.length, end)
-    const token = body.startsWith(":") ? body.slice(1) : /\btoken="([^"]+)"/.exec(body)?.[1]
-    if (!token) continue
-    const route = routes.get(token)
-    part.text = `${part.text.slice(0, start)}${part.text.slice(end + MARKER_SUFFIX.length)}`.trim()
-    routes.delete(token)
-    if (route) return { token, route }
-  }
+  const result = scrubParts(parts)
+  if (!result.token) return result.count > 0 ? { stripped: result.count } : undefined
+  const route = routes.get(result.token)
+  routes.delete(result.token)
+  return route ? { token: result.token, route, stripped: result.count } : { token: result.token, stripped: result.count }
 }
 
 function removePendingToken(list: PendingRoute[], token: string) {
@@ -337,6 +503,134 @@ async function debugToast(client: any, enabled: boolean, title: string, message:
   }).catch(() => undefined)
 }
 
+function debugLog(enabled: boolean, title: string, message: string) {
+  if (!enabled && !debugEnabled()) return
+  try {
+    appendFileSync(debugLogPath(defaultConfigDir()), `${new Date().toISOString()} ${title}: ${message}\n`)
+  } catch {
+    // Debug logging should never affect routing.
+  }
+}
+
+function serial(value: unknown) {
+  return JSON.stringify(value)
+}
+
+function debugSnippet(value: unknown, max = 900) {
+  const text = typeof value === "string" ? value : serial(value)
+  if (!text) return ""
+  return text.length > max ? `${text.slice(0, max)}...<truncated ${text.length - max} chars>` : text
+}
+
+function debugPartSnapshot(part: any) {
+  return debugSnippet({
+    id: part?.id,
+    messageID: part?.messageID,
+    sessionID: part?.sessionID,
+    tool: part?.tool,
+    status: part?.state?.status,
+    input: part?.state?.input,
+    title: part?.state?.title,
+    metadata: part?.state?.metadata,
+    output: typeof part?.state?.output === "string" ? debugSnippet(part.state.output, 500) : part?.state?.output,
+    error: typeof part?.state?.error === "string" ? debugSnippet(part.state.error, 500) : part?.state?.error,
+  })
+}
+
+function formatRepairError(error: unknown) {
+  if (error instanceof Error) return error.message
+  if (typeof error === "string") return error
+  if (error && typeof error === "object") {
+    const data = (error as Record<string, any>).data
+    if (typeof data?.message === "string") return data.message
+    if (typeof (error as Record<string, any>).message === "string") return (error as Record<string, any>).message
+    if (typeof (error as Record<string, any>).name === "string") return (error as Record<string, any>).name
+  }
+  try {
+    return JSON.stringify(error)
+  } catch {
+    return String(error)
+  }
+}
+
+async function getStoredPart(client: any, directory: string, part: any) {
+  const response = await client.session
+    ?.message?.({
+      path: { id: part.sessionID, messageID: part.messageID },
+      query: { directory },
+    })
+    .catch(() => undefined)
+  const message = getData(response) as { parts?: any[] } | undefined
+  return message?.parts?.find((item) => item?.id === part.id)
+}
+
+function partIsClean(part: any, routes: Map<string, RuntimeRoute>) {
+  const copy = structuredClone(part)
+  const before = serial(copy)
+  const result = scrubParts([copy], { routes })
+  return { clean: result.count === 0 && before === serial(copy), cleaned: result.count, after: copy }
+}
+
+function changedMessageParts(messages: any[], routes: Map<string, RuntimeRoute>) {
+  const changed: ChangedPart[] = []
+  const replayOnly: string[] = []
+  let cleaned = 0
+  for (const message of messages) {
+    for (const part of message.parts ?? []) {
+      const before = serial(part)
+      const result = scrubParts([part], { routes })
+      cleaned += result.count
+      const after = serial(part)
+      if (before === after) continue
+      if (typeof part?.id !== "string" || typeof part.messageID !== "string" || typeof part.sessionID !== "string") continue
+      if (part?.type !== "tool" || part.tool !== "task") {
+        replayOnly.push(part.id)
+        continue
+      }
+      changed.push({ part: structuredClone(part), before, after, cleaned: result.count })
+    }
+  }
+  return { cleaned, changed, replayOnly }
+}
+
+async function persistCleanedParts(client: any, directory: string, parts: ChangedPart[], routes: Map<string, RuntimeRoute>, debugEnabledFlag: boolean) {
+  const failures: Array<{ id: string; message: string }> = []
+  const rawClient = client?._client
+  if (!rawClient?.patch) {
+    return {
+      repaired: 0,
+      failures: parts.map((entry) => ({ id: entry.part.id, message: "OpenCode SDK raw client is unavailable" })),
+    }
+  }
+  for (const entry of parts) {
+    const part = entry.part
+    debugLog(debugEnabledFlag, "Agent variant repair before", `${part.id}: cleaned=${entry.cleaned}; before=${debugSnippet(entry.before)}; after=${debugSnippet(entry.after)}`)
+    try {
+      const result = await rawClient.patch({
+        url: "/session/{sessionID}/message/{messageID}/part/{partID}",
+        path: { sessionID: part.sessionID, messageID: part.messageID, partID: part.id },
+        query: { directory },
+        body: part,
+        headers: { "content-type": "application/json" },
+      })
+      if (result?.error) failures.push({ id: part.id, message: formatRepairError(result.error) })
+      else if (result?.response && !result.response.ok) failures.push({ id: part.id, message: `${result.response.status} ${result.response.statusText}` })
+      if (failures.some((failure) => failure.id === part.id)) continue
+      const stored = await getStoredPart(client, directory, part)
+      if (!stored) {
+        failures.push({ id: part.id, message: "part update returned success but stored part could not be read back" })
+        continue
+      }
+      const verification = partIsClean(stored, routes)
+      debugLog(debugEnabledFlag, "Agent variant repair verify", `${part.id}: clean=${verification.clean}; stored=${debugPartSnapshot(stored)}; verificationAfter=${debugPartSnapshot(verification.after)}`)
+      if (!verification.clean) failures.push({ id: part.id, message: `persistent repair did not stick; ${verification.cleaned} artifact(s) still detected after read-back` })
+    } catch (error) {
+      failures.push({ id: part.id, message: error instanceof Error ? error.message : String(error) })
+    }
+  }
+  return { repaired: parts.length - failures.length, failures }
+}
+
 async function warningToast(client: any, diagnostic: Diagnostic) {
   try {
     appendFileSync(debugLogPath(defaultConfigDir()), `${new Date().toISOString()} ${diagnostic.level.toUpperCase()}: ${diagnostic.message}\n`)
@@ -367,13 +661,8 @@ function applySystemPatch(system: string[], patch: AgentPatch, context?: Templat
   system[0] = applyPromptPatch(current, patch, context)
 }
 
-function annotateTaskOutput(text: string, route: RuntimeRoute) {
-  const annotated = text.replace(
-    /^<task\b([^>]*)>/,
-    `<task$1 agent_variant="${attr(route.alias)}" routed_agent="${attr(route.targetAgent)}" parent_agent="${attr(route.parent)}" effective_model="${attr(routeModel(route))}" model_variant="${attr(route.variant ?? "default")}">`,
-  )
-  if (annotated !== text) return annotated
-  return [`<agent_variant alias="${attr(route.alias)}" routed_agent="${attr(route.targetAgent)}" parent_agent="${attr(route.parent)}" effective_model="${attr(routeModel(route))}" model_variant="${attr(route.variant ?? "default")}" />`, text].join("\n")
+function cleanTaskOutput(text: string) {
+  return scrubTaskOutput(text).text
 }
 
 function resetGeneratedRequest(output: { temperature?: number; topP?: number; options: Record<string, any> }, route: RuntimeRoute) {
@@ -442,6 +731,8 @@ const plugin: Plugin = async (input) => {
   const tokenRoutes = new Map<string, RuntimeRoute>()
   const bySession = new Map<string, RuntimeRoute>()
   const byCall = new Map<string, RuntimeRoute>()
+  const repairFailureToasts = new Set<string>()
+  const replayOnlySanitized = new Set<string>()
 
   return {
     config: async (cfg) => {
@@ -458,11 +749,6 @@ const plugin: Plugin = async (input) => {
         subagent_type?: string
         prompt?: string
         description?: string
-        selected_alias?: string
-        agent_variant?: string
-        routed_agent?: string
-        effective_model?: string
-        model_variant?: string
       }
       if (!args?.subagent_type || !args.prompt) return
       const staticRoute = virtualRoutes.get(args.subagent_type)
@@ -486,11 +772,6 @@ const plugin: Plugin = async (input) => {
         }),
         createdAt: Date.now(),
       })
-      args.selected_alias = route.alias
-      args.agent_variant = route.alias
-      args.routed_agent = route.targetAgent
-      args.effective_model = routeModel(route)
-      args.model_variant = route.variant ?? "default"
       if (args.description && !args.description.includes(`@${route.alias} variant`)) {
         args.description = `${args.description} (@${route.alias} variant)`
       }
@@ -508,24 +789,25 @@ const plugin: Plugin = async (input) => {
       const route = byCall.get(hookInput.callID)
       if (!route) return
       byCall.delete(hookInput.callID)
+      if (hookInput.args && typeof hookInput.args === "object") {
+        const args = hookInput.args as Record<string, unknown>
+        args.subagent_type = route.alias
+      }
+      const cleanedArgs = scrubTaskInput(hookInput.args, { routes: virtualRoutes }, route.alias)
       output.title = `${output.title} (@${route.alias} variant)`
       output.metadata = {
         ...output.metadata,
-        agentVariant: {
+        agentVariants: {
           alias: route.alias,
           routedAgent: route.targetAgent,
-          parentAgent: route.parent,
-          effectiveModel: routeModel(route),
-          modelVariant: route.variant ?? "default",
         },
-        model: splitModelRef(route.model) ?? output.metadata?.model,
       }
-      output.output = annotateTaskOutput(output.output, route)
-      await debugToast(input.client, sidecar.debug, "Agent variant result annotated", routeSummary(route))
+      output.output = cleanTaskOutput(output.output)
+      await debugToast(input.client, sidecar.debug, "Agent variant result annotated", `${routeSummary(route)}; cleaned task input fields=${cleanedArgs.count}`)
     },
     "chat.message": async (hookInput, output) => {
       const markerRoute = takeMarkerRoute(output.parts as any[], tokenRoutes)
-      if (markerRoute) {
+      if (markerRoute?.route) {
         removePendingToken(pending, markerRoute.token)
         bySession.set(hookInput.sessionID, markerRoute.route)
         applyMessageModel(output, markerRoute.route)
@@ -536,6 +818,9 @@ const plugin: Plugin = async (input) => {
           `${routeSummary(markerRoute.route)}; session=${hookInput.sessionID}; token=${markerRoute.token.slice(0, 8)}`,
         )
         return
+      }
+      if (markerRoute?.stripped) {
+        await debugToast(input.client, sidecar.debug, "Agent variant marker stripped", `stripped ${markerRoute.stripped} route marker(s) without token match; session=${hookInput.sessionID}`)
       }
       const session = await getSession(input.client, hookInput.sessionID)
       const fp = fingerprint({
@@ -556,6 +841,42 @@ const plugin: Plugin = async (input) => {
         sidecar.debug,
         "Agent variant model applied (fallback)",
         `${routeSummary(route)}; session=${hookInput.sessionID}`,
+      )
+    },
+    "experimental.chat.messages.transform": async (_hookInput, output) => {
+      const { cleaned, changed, replayOnly } = changedMessageParts(output.messages as any[], virtualRoutes)
+      if (cleaned === 0) return
+      const newReplayOnly = replayOnly.filter((partID) => !replayOnlySanitized.has(partID))
+      for (const partID of newReplayOnly) replayOnlySanitized.add(partID)
+      if (changed.length === 0) {
+        if (newReplayOnly.length > 0) {
+          debugLog(
+            sidecar.debug,
+            "Agent variant replay sanitized",
+            `removed ${cleaned} model-visible routing artifact(s) from replay-only non-task part(s): ${newReplayOnly.slice(0, 5).join(", ")}`,
+          )
+        }
+        return
+      }
+      const repair = await persistCleanedParts(input.client, input.directory, changed, virtualRoutes, sidecar.debug)
+      const newFailures = repair.failures.filter((failure) => !repairFailureToasts.has(failure.id))
+      for (const failure of newFailures) repairFailureToasts.add(failure.id)
+      const failureText = newFailures.length
+        ? `; failed repairs: ${newFailures.slice(0, 3).map((failure) => `${failure.id}: ${failure.message}`).join("; ")}`
+        : repair.failures.length
+          ? `; ${repair.failures.length} repeated repair failure(s) suppressed`
+          : ""
+      const replayOnlyText = replayOnly.length ? `; replay-only non-task part(s): ${replayOnly.length}` : ""
+      const message = `removed ${cleaned} model-visible routing artifact(s), repaired ${repair.repaired}/${changed.length} stored task part(s)${replayOnlyText}${failureText}`
+      if (repair.repaired === 0 && repair.failures.length > 0 && newFailures.length === 0) {
+        debugLog(sidecar.debug, "Agent variant history sanitized", message)
+        return
+      }
+      await debugToast(
+        input.client,
+        sidecar.debug,
+        "Agent variant history sanitized",
+        message,
       )
     },
     "chat.params": async (hookInput, output) => {
