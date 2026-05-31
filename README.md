@@ -322,7 +322,7 @@ When enabled, the server plugin emits diagnostic log lines and TUI toast notific
 - when the model override is applied to the child session message
 - when old model-visible routing artifacts are sanitized; dirty task-tool parts are repaired in stored session history, while plain text is scrubbed only for replay
 
-Logs are written to `~/.config/opencode/agent-variants.debug.log`. The plugin does not write debug lines to stdout, because that can corrupt the terminal UI.
+When debug mode is enabled, logs are written to `~/.config/opencode/agent-variants.debug.log`. The plugin does not write debug lines to stdout, because that can corrupt the terminal UI.
 
 Debug mode is stored in `agent-variants.jsonc` and takes effect immediately for future variant calls. The wizard can also view and clear the debug log from `Debug & advanced`.
 

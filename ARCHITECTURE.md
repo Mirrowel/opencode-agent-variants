@@ -10,27 +10,28 @@
 - Marker-based token routing: variant calls embed HTML-comment tokens in prompts to correlate sessions
 - Hot-reload boundary: runtime fields (model, prompt, temperature) apply per-call; structural fields (description, color, name) require restart
 - Automatic config backups with patch-chain reversal on every save
+- Internal-only routing metadata: variant routing tokens and markers are stripped from model-visible output; stored task parts are auto-repaired to remove residual artifacts
 
 ## Layers
 
 **Server Plugin (Hook Layer):**
 - Purpose: Intercepts OpenCode lifecycle hooks to inject agent variants into the task tool and route model/parameter overrides
 - Location: `src/index.ts`
-- Contains: Plugin factory, route assembly, marker injection, session correlation, request patching
+- Contains: Plugin factory, route assembly, marker injection, session correlation, request patching, chat history sanitization
 - Depends on: `src/config.ts` for config loading, validation, and model resolution
 - Used by: OpenCode runtime via `src/server.ts` entry point
 
 **Config & Schema Layer:**
 - Purpose: Defines Zod schemas for sidecar config, backup journal, and patches; loads/saves JSONC config; validates model references
 - Location: `src/config.ts`
-- Contains: Zod schemas (`SidecarConfig`, `Patch`, `Variant`, `ModelShortcut`, `BackupJournal`), config I/O, model catalog builder, diagnostics engine, template rendering
+- Contains: Zod schemas (`SidecarConfig`, `Patch`, `Variant`, `ModelShortcut`, `BackupJournal`), config I/O, model catalog builder, diagnostics engine, template rendering, selection presets
 - Depends on: `zod`, `comment-json`, `node:crypto`, `node:fs`, `node:path`, `node:os`
 - Used by: `src/index.ts` and `src/tui.tsx`
 
 **TUI Plugin (Wizard UI):**
 - Purpose: Interactive terminal UI for creating, editing, and managing agent variants and model presets
 - Location: `src/tui.tsx`
-- Contains: Solid JSX components for menus, field editors, backup browser, diagnostics viewer; dialog orchestration loops
+- Contains: Solid JSX components for menus, field editors, backup browser, diagnostics viewer, selection preset picker; dialog orchestration loops
 - Depends on: `src/config.ts`, `@opencode-ai/plugin/tui`, `@opentui/solid`, `solid-js`
 - Used by: OpenCode TUI runtime via the `"tui"` export in `package.json`
 
@@ -47,8 +48,8 @@
 
 1. OpenCode loads plugin via `src/server.ts` — `src/server.ts`
 2. `loadSidecar()` reads `~/.config/opencode/agent-variants.jsonc` — `src/config.ts`
-3. `assembleAgents()` merges parent patches, variant patches, model presets, and generated selection-guidance descriptions into `cfg.agent` entries — `src/index.ts`
-4. Parent descriptions get a small appended alias nudge when variants exist — `src/index.ts`
+3. `assembleAgents()` merges parent patches, variant patches, model presets, and auto-inferred selection-guidance descriptions into `cfg.agent` entries — `src/index.ts`, `src/config.ts`
+4. Parent descriptions get appended variant alias list and selection guidance via `generatedParentDescription()` when variants exist — `src/index.ts`, `src/config.ts`
 5. Generated aliases are registered as virtual routes with token-based routing (built-ins) or cloned agents (custom agents) — `src/index.ts`
 6. Diagnostics are emitted as toast warnings for invalid model references, conflicts, or disabled parents — `src/index.ts`
 
@@ -56,14 +57,14 @@
 
 1. `tool.execute.before` hook intercepts `task` tool calls targeting a variant alias — `src/index.ts`
 2. `liveRoute()` re-validates the variant against current sidecar config (hot reload) — `src/index.ts`
-3. A UUID token is generated as an internal HTML comment marker and aggressively scrubbed before message save/replay — `src/index.ts`
+3. A UUID token is generated as an internal HTML comment marker injected into the task prompt; the marker is stripped from model-visible output before storage — `src/index.ts`
 4. `subagent_type` is rewritten to the parent agent so OpenCode routes to the correct agent — `src/index.ts`
 5. `chat.message` hook extracts the marker from the response to correlate session → route — `src/index.ts`
 6. `applyMessageModel()` sets the provider/model/variant on the response message — `src/index.ts`
 7. `chat.params` hook patches temperature, top_p, and options on API requests — `src/index.ts`
 8. `experimental.chat.system.transform` hook patches the system prompt with variant prepend/append — `src/index.ts`
-9. `tool.execute.after` hook stores minimal route proof metadata and scrubs plugin-only task output — `src/index.ts`
-10. `experimental.chat.messages.transform` strips old route markers and metadata from replayed history before any model sees it, then repairs changed stored task parts when possible — `src/index.ts`
+9. `tool.execute.after` hook stores minimal internal metadata (`agentVariants.alias`, `agentVariants.routedAgent`) and scrubs all routing artifacts from task output — `src/index.ts`
+10. `experimental.chat.messages.transform` strips route markers and routing metadata from replayed chat history before any model sees it; when stored task parts contain residual artifacts, they are repaired via the session message API with read-back verification — `src/index.ts`
 
 **Wizard Config Editing:**
 
@@ -101,9 +102,9 @@
 - Pattern: Lookup table in `SidecarConfig.models`; resolved via `resolveModel()` and `applyModelPresetPatch()`
 
 **SelectionPreset:**
-- Purpose: Built-in task-list guidance presets that make variants easier for the main model to choose correctly, especially light/heavy/verification/parallel variants
-- Location: `src/config.ts` (`SELECTION_PRESETS`, `inferredSelectionPreset()`, `generatedVariantDescription()`)
-- Pattern: Auto-inference from key/name/model/model-variant when `description` is unset; the wizard can also materialize preset text into the Description field
+- Purpose: Built-in task-list guidance presets that make variants easier for the main model to choose correctly
+- Location: `src/config.ts` (`SELECTION_PRESETS`, `inferredSelectionPreset()`, `selectionPresetText()`, `generatedVariantBase()`)
+- Pattern: 8 presets (light, heavy, verification, parallel, strict-review, conservative, creative, synthesis) auto-inferred from variant key/name/model/model-variant; the wizard can materialize preset text into the Description field or leave it auto-inferred
 
 **BackupJournal:**
 - Purpose: Tracks config change history with reverse-patch operations and full snapshots for rollback
@@ -139,7 +140,7 @@
 
 ## Cross-Cutting Concerns
 
-**Logging:** Debug mode writes to `~/.config/opencode/agent-variants.debug.log` and shows toast notifications. Controlled by `sidecar.debug` flag or runtime toggle in wizard.
+**Logging:** Debug mode writes to `~/.config/opencode/agent-variants.debug.log` and shows toast notifications only while enabled. Controlled by `sidecar.debug` flag or runtime toggle in wizard, and hot-read by server hooks.
 
 **Caching:** OpenCode caches the task list at startup. Structural changes (add/delete/disable variant, description, color) require restart. Runtime fields (model, prompt, temperature, top_p, options) hot-reload per call.
 

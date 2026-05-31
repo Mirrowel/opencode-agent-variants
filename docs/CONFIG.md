@@ -6,7 +6,7 @@ See `agent-variants.example.jsonc` for a fully commented starter file.
 
 ## Top-Level Fields
 
-- `debug`: boolean. Enables routing/model diagnostic toasts and file logging. This is hot-read by the server plugin, so toggling it from the wizard takes effect immediately for future variant calls.
+- `debug`: boolean. Enables routing/model diagnostic toasts and file logging. This is hot-read by the server plugin, so toggling it from the wizard takes effect immediately. When disabled, debug toasts and debug log writes are suppressed.
 - `ui`: wizard display preferences. `width` is `medium`, `large`, or `xlarge`; `height_percent` is a fine-grained max-height percentage clamped to 25-100. `height` is kept as a preset/reference fallback (`compact` = 32, `normal` = 50, `tall` = 68, `max` = 100).
 - `models`: named model presets. Each preset has `model` and can also provide `label`, `variant`, `temperature`, `top_p`, and `options`.
 - `agents`: parent-agent entries. Each key is a built-in or configured OpenCode agent name.
