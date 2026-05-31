@@ -5,6 +5,8 @@
   Let the main model call <code>general-light</code>, <code>explore-fast</code>, or any other generated variant through the normal <code>task</code> tool.
 </p>
 
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/C0C0UZS4P)
+
 <p align="center">
   <a href="https://www.npmjs.com/package/@mirrowel/opencode-agent-variants"><img src="https://img.shields.io/npm/v/%40mirrowel%2Fopencode-agent-variants/latest?label=latest&style=flat-square&color=blue" alt="npm latest version"></a>
   <a href="https://www.npmjs.com/package/@mirrowel/opencode-agent-variants"><img src="https://img.shields.io/npm/v/%40mirrowel%2Fopencode-agent-variants/dev?label=dev&style=flat-square&color=orange" alt="npm dev version"></a>
