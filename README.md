@@ -110,7 +110,7 @@ Agent Variants: Configure
 
 After that, the main model can call the generated variant through the normal `task` tool. No agent-facing management tools are added.
 
-> **Tip:** Use the wizard's `Run diagnostics` action after editing. It checks model and model-variant availability, model presets, alias conflicts, parent task-callability, disabled entries, inheritance/propagation typos, backup journal health, and plugin installation state.
+> **Tip:** Use the wizard's `Run diagnostics` action after editing. It checks model and model-variant availability against OpenCode's merged provider catalog, plus model presets, alias conflicts, parent task-callability, disabled entries, inheritance/propagation typos, backup journal health, and plugin installation state.
 
 ## Manual Install
 
@@ -311,7 +311,7 @@ Agents defined in `opencode.json`, `.opencode/agent/*.md`, or global agent markd
 - If a sidecar parent has `disable: true`, the parent override and all variants are skipped.
 - If a variant has `disable: true`, only that variant is skipped.
 - Parent overrides apply only when the parent has at least one enabled variant.
-- If a variant resolves to a definitely missing model or model variant, it is skipped for that run and a warning toast is shown.
+- Malformed model references are skipped immediately; provider/model existence is validated after OpenCode exposes its merged provider catalog, then warning toasts are shown and invalid runtime calls fail before execution.
 - Conflicting aliases are skipped instead of overwriting existing agents.
 
 Use the wizard's `Run diagnostics` action to inspect model validation, preset issues, alias conflicts, disabled parents, task-callability, inheritance/propagation typos, backup journal health, and plugin installation state.

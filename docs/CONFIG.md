@@ -211,11 +211,14 @@ The plugin skips problematic variants instead of producing ambiguous agents:
 - variant alias equals parent name,
 - two variants generate the same alias,
 - generated alias conflicts with an existing agent,
-- variant model or configured model variant is definitely missing.
+- variant model reference is malformed and cannot be resolved to `provider/model` format.
+
+Provider/model existence is validated after OpenCode exposes its merged provider catalog. This matters because built-in providers can have config overrides, and raw `opencode.json` provider entries are not the full model list. Post-merge model warnings are shown as toasts when possible and invalid hot-reloaded variants fail before execution once the merged catalog is available.
 
 Diagnostics also warn about non-skipping issues:
 
 - broken or unused model presets,
+- missing provider/model references after OpenCode provider merge,
 - invalid parent model overrides,
 - unknown `parent.propagate` or `variant.inherit` keys,
 - suspicious alias names with whitespace or control characters,

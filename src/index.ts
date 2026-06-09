@@ -22,6 +22,7 @@ import {
   splitModelRef,
   templateContext,
   validateModel,
+  validateModelShape,
   validateModelVariant,
   type AgentPatch,
   type Diagnostic,
@@ -65,6 +66,10 @@ const ROUTE_STANDALONE_RE = /\n?\s*<agent_variant\b[^>]*\/?>\s*\n?/g
 const ROUTE_ARG_FRAGMENT_RE = /\s*(?:selected_alias|agent_variant|routed_agent|parent_agent|effective_model|model_variant)=(?:"[^"]*"|\\"[^\\]*\\")/g
 const PLUGIN_ARG_KEYS = ["selected_alias", "agent_variant", "routed_agent", "parent_agent", "effective_model", "model_variant"] as const
 const LIVE_REPAIR_DELAYS = [0, 50, 250, 1000]
+const TOAST_TIMEOUT = 1500
+const CATALOG_FETCH_TIMEOUT = 3000
+const DIAGNOSTIC_RETRY_DELAYS = [750, 1500, 3000, 6000, 12000]
+const CATALOG_RETRY_DELAYS = [250, 750, 1500, 3000, 6000]
 
 function attr(value: string | undefined) {
   return (value ?? "").replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
@@ -298,14 +303,18 @@ function validatePatchModel(label: string, patch: AgentPatch, config: SidecarCon
     .map((issue) => `${label}: ${issue}`)
 }
 
-function removeInvalidModelFields(patch: AgentPatch, config: SidecarConfig, catalog: ModelCatalog) {
+function validatePatchModelShape(label: string, patch: AgentPatch, config: SidecarConfig) {
+  return [validateModelShape(patch.model, config)]
+    .filter((item): item is string => !!item)
+    .map((issue) => `${label}: ${issue}`)
+}
+
+function removeInvalidModelFields(patch: AgentPatch, config: SidecarConfig) {
   const result = { ...patch }
-  if (validateModel(result.model, config, catalog)) {
+  if (validateModelShape(result.model, config)) {
     delete result.model
     delete result.variant
-    return result
   }
-  if (validateModelVariant(result.model, result.variant, config, catalog)) delete result.variant
   return result
 }
 
@@ -340,7 +349,6 @@ function assembleAgents(cfg: Record<string, any>, sidecar: SidecarConfig) {
   const parentPromptPatches = new Map<string, AgentPatch>()
   const parentRequestPatches = new Map<string, AgentPatch>()
   const diagnostics: Diagnostic[] = []
-  const catalog = modelCatalogFromProviders(cfg.provider)
   const originalAgents = new Set([...Object.keys(cfg.agent), ...Object.keys(BUILTIN_AGENT_DESCRIPTIONS)])
   const generatedAliases = new Map<string, string>()
 
@@ -368,8 +376,8 @@ function assembleAgents(cfg: Record<string, any>, sidecar: SidecarConfig) {
       continue
     }
 
-    const parentPatch = removeInvalidModelFields(applyModelPresetPatch(entry.parent, sidecar), sidecar, catalog)
-    for (const issue of validatePatchModel(`Parent "${parent}"`, applyModelPresetPatch(entry.parent, sidecar), sidecar, catalog)) {
+    const parentPatch = removeInvalidModelFields(applyModelPresetPatch(entry.parent, sidecar), sidecar)
+    for (const issue of validatePatchModelShape(`Parent "${parent}"`, applyModelPresetPatch(entry.parent, sidecar), sidecar)) {
       diagnostics.push({ level: "warning", agent: parent, message: `${issue}; model fields skipped for parent override.` })
     }
     cfg.agent[parent] = applyConfigPatch({ ...(parentConfig ?? {}) }, parentPatch, sidecar, base, isBuiltin, templateContext(parent, undefined, {}, sidecar))
@@ -380,9 +388,9 @@ function assembleAgents(cfg: Record<string, any>, sidecar: SidecarConfig) {
     for (const [key, variant] of enabledVariants) {
       const alias = variantName(parent, key, variant)
       const effective = applyModelPresetPatch(effectiveVariantPatch(entry.parent, variant), sidecar)
-      const modelIssues = validatePatchModel(`Variant "${alias}"`, effective, sidecar, catalog)
+      const modelIssues = validatePatchModelShape(`Variant "${alias}"`, effective, sidecar)
       if (modelIssues.length > 0) {
-        diagnostics.push({ level: "warning", agent: parent, variant: key, alias, message: `Variant "${alias}" disabled at runtime: ${modelIssues.join(" ")}` })
+        diagnostics.push({ level: "warning", agent: parent, variant: key, alias, message: `Variant "${alias}" skipped: ${modelIssues.join(" ")}` })
         continue
       }
       if (alias === parent) {
@@ -746,6 +754,33 @@ async function delay(ms: number) {
   await new Promise((resolve) => setTimeout(resolve, ms))
 }
 
+async function timeout<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), ms)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+function diagnosticKey(diagnostic: Diagnostic) {
+  return [diagnostic.level, diagnostic.agent ?? "", diagnostic.variant ?? "", diagnostic.alias ?? "", diagnostic.message].join("\0")
+}
+
+function toastTitle(diagnostic: Diagnostic) {
+  if (diagnostic.level === "error") return "Agent variant error"
+  return "Agent variant warning"
+}
+
+function toastVariant(diagnostic: Diagnostic) {
+  return diagnostic.level === "error" ? "error" : "warning"
+}
+
 async function repairLiveTaskPart(input: { client: any; directory: string; sessionID: string; callID: string; route: RuntimeRoute; routes: Map<string, RuntimeRoute>; debug: boolean }) {
   for (const wait of LIVE_REPAIR_DELAYS) {
     await delay(wait)
@@ -776,15 +811,24 @@ async function warningToast(client: any, diagnostic: Diagnostic) {
       // Diagnostics should never affect startup.
     }
   }
-  if (diagnostic.level === "info") return
-  await client.tui?.showToast?.({
-    body: {
-      title: diagnostic.level === "error" ? "Agent variant skipped" : "Agent variant disabled",
-      message: diagnostic.message,
-      variant: diagnostic.level === "error" ? "error" : "warning",
-      duration: 15000,
-    },
-  }).catch(() => undefined)
+  if (diagnostic.level === "info") return true
+  if (typeof client?.tui?.showToast !== "function") return false
+  try {
+    const delivered = await timeout(
+      client.tui.showToast({
+        body: {
+          title: toastTitle(diagnostic),
+          message: diagnostic.message,
+          variant: toastVariant(diagnostic),
+          duration: 15000,
+        },
+      }).then(() => true, () => false),
+      TOAST_TIMEOUT,
+    )
+    return delivered === true
+  } catch {
+    return false
+  }
 }
 
 function applyRequestPatch(output: { temperature?: number; topP?: number; options: Record<string, any> }, patch: AgentPatch, config: SidecarConfig) {
@@ -839,7 +883,42 @@ function applyMessageModel(output: { message: { model?: { providerID: string; mo
   if (route.targetAgent !== route.parent) delete output.message.model
 }
 
-function liveRoute(staticRoute: RuntimeRoute, catalog: ModelCatalog) {
+function responseData(response: unknown) {
+  if (response && typeof response === "object" && "data" in response) return (response as { data?: unknown }).data
+  return response
+}
+
+async function fetchMergedCatalog(client: any) {
+  const providerList = await timeout(Promise.resolve(client?.provider?.list?.()).then(responseData, () => undefined), CATALOG_FETCH_TIMEOUT)
+  if (providerList) return modelCatalogFromProviders(providerList)
+  const configProviders = await timeout(Promise.resolve(client?.config?.providers?.()).then(responseData, () => undefined), CATALOG_FETCH_TIMEOUT)
+  if (configProviders) return modelCatalogFromProviders(configProviders)
+}
+
+function catalogDiagnostics(config: SidecarConfig, catalog: ModelCatalog) {
+  const diagnostics: Diagnostic[] = []
+  for (const [key, preset] of Object.entries(config.models)) {
+    for (const issue of validatePatchModel(`Model preset "${key}"`, preset, config, catalog)) {
+      diagnostics.push({ level: "warning", message: issue })
+    }
+  }
+  for (const [parent, entry] of Object.entries(config.agents)) {
+    if (entry.disable === true) continue
+    for (const issue of validatePatchModel(`Parent "${parent}"`, applyModelPresetPatch(entry.parent, config), config, catalog)) {
+      diagnostics.push({ level: "warning", agent: parent, message: `${issue}; model fields may fail until fixed.` })
+    }
+    for (const [key, variant] of Object.entries(entry.variants)) {
+      if (variant.disable === true) continue
+      const alias = variantName(parent, key, variant)
+      for (const issue of validatePatchModel(`Variant "${alias}"`, applyModelPresetPatch(effectiveVariantPatch(entry.parent, variant), config), config, catalog)) {
+        diagnostics.push({ level: "warning", agent: parent, variant: key, alias, message: `Variant "${alias}" is invalid after provider catalog merge: ${issue}. Calls to this variant will fail until fixed.` })
+      }
+    }
+  }
+  return diagnostics
+}
+
+function liveRoute(staticRoute: RuntimeRoute, catalog: ModelCatalog | undefined) {
   const config = loadSidecar(defaultSidecarPath())
   const entry = config.agents[staticRoute.parent]
   const variant = entry?.variants[staticRoute.key]
@@ -850,8 +929,12 @@ function liveRoute(staticRoute: RuntimeRoute, catalog: ModelCatalog) {
     throw new Error(`Variant "${staticRoute.alias}" was renamed. Restart OpenCode to update the task list.`)
   }
   const patch = applyModelPresetPatch(effectiveVariantPatch(entry.parent, variant), config)
-  const issues = validatePatchModel(`Variant "${staticRoute.alias}"`, patch, config, catalog)
-  if (issues.length > 0) throw new Error(`Variant "${staticRoute.alias}" is invalid after hot reload: ${issues.join(" ")}`)
+  const shapeIssues = validatePatchModelShape(`Variant "${staticRoute.alias}"`, patch, config)
+  if (shapeIssues.length > 0) throw new Error(`Variant "${staticRoute.alias}" is invalid after hot reload: ${shapeIssues.join(" ")}`)
+  if (catalog) {
+    const issues = validatePatchModel(`Variant "${staticRoute.alias}"`, patch, config, catalog)
+    if (issues.length > 0) throw new Error(`Variant "${staticRoute.alias}" is invalid after provider catalog merge: ${issues.join(" ")}`)
+  }
   return {
     ...staticRoute,
     patch,
@@ -865,22 +948,88 @@ const plugin: Plugin = async (input) => {
   let virtualRoutes = new Map<string, RuntimeRoute>()
   let parentPromptPatches = new Map<string, AgentPatch>()
   let parentRequestPatches = new Map<string, AgentPatch>()
-  let catalog = modelCatalogFromProviders(undefined)
+  let catalog: ModelCatalog | undefined
   const pending: PendingRoute[] = []
   const tokenRoutes = new Map<string, RuntimeRoute>()
   const bySession = new Map<string, RuntimeRoute>()
   const byCall = new Map<string, RuntimeRoute>()
   const repairFailureToasts = new Set<string>()
   const replayOnlySanitized = new Set<string>()
+  const diagnosticQueue = new Map<string, { diagnostic: Diagnostic; attempts: number }>()
+  let diagnosticTimer: ReturnType<typeof setTimeout> | undefined
+  let diagnosticFlushing = false
+
+  const scheduleDiagnosticFlush = (delayMs = DIAGNOSTIC_RETRY_DELAYS[0]) => {
+    if (diagnosticTimer) return
+    diagnosticTimer = setTimeout(() => {
+      diagnosticTimer = undefined
+      void flushDiagnosticQueue()
+    }, delayMs)
+  }
+
+  const queueDiagnostics = (diagnostics: Diagnostic[]) => {
+    for (const diagnostic of diagnostics) {
+      if (diagnostic.level === "info") continue
+      const key = diagnosticKey(diagnostic)
+      if (!diagnosticQueue.has(key)) diagnosticQueue.set(key, { diagnostic, attempts: 0 })
+    }
+    if (diagnosticQueue.size > 0) scheduleDiagnosticFlush()
+  }
+
+  const flushDiagnosticQueue = async () => {
+    if (diagnosticFlushing) return
+    diagnosticFlushing = true
+    try {
+      for (const [key, item] of Array.from(diagnosticQueue.entries())) {
+        const delivered = await warningToast(input.client, item.diagnostic)
+        if (delivered) {
+          diagnosticQueue.delete(key)
+          continue
+        }
+        item.attempts++
+        if (item.attempts >= DIAGNOSTIC_RETRY_DELAYS.length) {
+          debugLog(debugEnabled(), "Agent variant diagnostic toast deferred", `failed to deliver after ${item.attempts} attempt(s): ${item.diagnostic.message}`)
+          diagnosticQueue.delete(key)
+          continue
+        }
+      }
+    } finally {
+      diagnosticFlushing = false
+    }
+    if (diagnosticQueue.size > 0) {
+      const nextAttempts = Math.min(...Array.from(diagnosticQueue.values()).map((item) => item.attempts))
+      scheduleDiagnosticFlush(DIAGNOSTIC_RETRY_DELAYS[Math.min(nextAttempts, DIAGNOSTIC_RETRY_DELAYS.length - 1)])
+    }
+  }
+
+  const refreshMergedCatalog = async () => {
+    for (const wait of CATALOG_RETRY_DELAYS) {
+      await delay(wait)
+      const nextCatalog = await fetchMergedCatalog(input.client)
+      if (!nextCatalog || nextCatalog.providers.size === 0) {
+        debugLog(debugEnabled(), "Agent variant provider catalog pending", `merged catalog unavailable after ${wait}ms`)
+        continue
+      }
+      catalog = nextCatalog
+      debugLog(
+        debugEnabled(),
+        "Agent variant provider catalog ready",
+        `${nextCatalog.providers.size} provider(s), ${nextCatalog.refs.size} model reference(s), ${nextCatalog.variants.size} variant set(s)`,
+      )
+      queueDiagnostics(catalogDiagnostics(loadSidecar(defaultSidecarPath()), nextCatalog))
+      return
+    }
+    debugLog(debugEnabled(), "Agent variant provider catalog unavailable", "deferred model validation could not obtain OpenCode's merged provider catalog")
+  }
 
   return {
     config: async (cfg) => {
-      catalog = modelCatalogFromProviders((cfg as Record<string, any>).provider)
       const assembled = assembleAgents(cfg as Record<string, any>, sidecar)
       virtualRoutes = assembled.virtualRoutes
       parentPromptPatches = assembled.parentPromptPatches
       parentRequestPatches = assembled.parentRequestPatches
-      for (const diagnostic of assembled.diagnostics) await warningToast(input.client, diagnostic)
+      queueDiagnostics(assembled.diagnostics)
+      void refreshMergedCatalog()
     },
     "tool.execute.before": async (hookInput, output) => {
       if (hookInput.tool !== "task") return
@@ -893,6 +1042,7 @@ const plugin: Plugin = async (input) => {
       const staticRoute = virtualRoutes.get(args.subagent_type)
       if (!staticRoute) return
       const route = liveRoute(staticRoute, catalog)
+      if (!catalog) debugLog(debugEnabled(), "Agent variant validation deferred", `${route.alias}: merged provider catalog is not ready; OpenCode provider validation will be used if needed`)
       cleanupPending(pending, tokenRoutes)
       const usePromptMarker = promptMarkersEnabled()
       const token = usePromptMarker ? randomUUID() : undefined

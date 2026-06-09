@@ -628,7 +628,16 @@ export function generatedParentDescription(baseDescription: string | undefined, 
 
 export function modelCatalogFromProviders(providers: unknown): ModelCatalog {
   const catalog: ModelCatalog = { providers: new Set(), providersWithModelList: new Set(), refs: new Set(), variants: new Map() }
-  const list = Array.isArray(providers) ? providers : Object.entries((providers ?? {}) as Record<string, unknown>).map(([id, value]) => ({ id, ...(value as object) }))
+  const source = (() => {
+    if (Array.isArray(providers)) return providers
+    if (providers && typeof providers === "object") {
+      const record = providers as Record<string, unknown>
+      if (Array.isArray(record.providers)) return record.providers
+      if (Array.isArray(record.all)) return record.all
+    }
+    return Object.entries((providers ?? {}) as Record<string, unknown>).map(([id, value]) => ({ id, ...(value as object) }))
+  })()
+  const list = source
   for (const provider of list as Array<Record<string, unknown>>) {
     const providerID = typeof provider.id === "string" ? provider.id : undefined
     if (!providerID) continue
@@ -647,11 +656,20 @@ export function modelCatalogFromProviders(providers: unknown): ModelCatalog {
   return catalog
 }
 
-export function validateModel(modelInput: string | undefined, config: SidecarConfig, catalog: ModelCatalog) {
+export function validateModelShape(modelInput: string | undefined, config: SidecarConfig) {
   const model = resolveModel(modelInput, config)
   if (!model) return
   const split = splitModelRef(model)
   if (!split) return `Model "${model}" must use provider/model format.`
+}
+
+export function validateModel(modelInput: string | undefined, config: SidecarConfig, catalog: ModelCatalog) {
+  const shapeIssue = validateModelShape(modelInput, config)
+  if (shapeIssue) return shapeIssue
+  const model = resolveModel(modelInput, config)
+  if (!model) return
+  const split = splitModelRef(model)
+  if (!split) return
   if (!catalog.providers.has(split.providerID)) return `Provider "${split.providerID}" is not configured for model "${model}".`
   if (catalog.providersWithModelList.has(split.providerID) && !catalog.refs.has(model)) return `Model "${model}" was not found in provider "${split.providerID}".`
 }
