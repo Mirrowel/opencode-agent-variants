@@ -68,6 +68,7 @@ const PLUGIN_ARG_KEYS = ["selected_alias", "agent_variant", "routed_agent", "par
 const LIVE_REPAIR_DELAYS = [0, 50, 250, 1000]
 const TOAST_TIMEOUT = 1500
 const CATALOG_FETCH_TIMEOUT = 3000
+const CLIENT_CALL_TIMEOUT = 3000
 const DIAGNOSTIC_RETRY_DELAYS = [750, 1500, 3000, 6000, 12000]
 const CATALOG_RETRY_DELAYS = [250, 750, 1500, 3000, 6000]
 
@@ -246,6 +247,13 @@ function scrubTaskInput(input: unknown, context: ScrubContext = {}, provenAlias?
   return { count, alias, proof }
 }
 
+export const __testInternals = {
+  marker,
+  scrubParts,
+  scrubTaskInput,
+  scrubTaskOutput,
+}
+
 function routeModel(route: RuntimeRoute) {
   return route.model ?? "inherit"
 }
@@ -343,7 +351,7 @@ function virtualPatch(alias: string, description: string, patch: VariantConfig, 
   return result
 }
 
-function assembleAgents(cfg: Record<string, any>, sidecar: SidecarConfig) {
+export function __testAssembleAgents(cfg: Record<string, any>, sidecar: SidecarConfig) {
   cfg.agent = cfg.agent ?? {}
   const virtualRoutes = new Map<string, RuntimeRoute>()
   const parentPromptPatches = new Map<string, AgentPatch>()
@@ -507,7 +515,7 @@ function getData<T>(value: T | { data?: T } | undefined): T | undefined {
 }
 
 async function getSession(client: any, sessionID: string) {
-  return getData(await client.session.get({ path: { id: sessionID } }).catch(() => undefined)) as { parentID?: string; agent?: string } | undefined
+  return getData(await safeClientCall(() => client?.session?.get?.({ path: { id: sessionID } }))) as { parentID?: string; agent?: string } | undefined
 }
 
 async function debugToast(client: any, _enabled: boolean, title: string, message: string) {
@@ -517,14 +525,22 @@ async function debugToast(client: any, _enabled: boolean, title: string, message
   } catch {
     // Debug logging should never affect routing.
   }
-  await client.tui?.showToast?.({
-    body: {
-      title,
-      message,
-      variant: "info",
-      duration: 12000,
-    },
-  }).catch(() => undefined)
+  if (typeof client?.tui?.showToast !== "function") return
+  await timeout(
+    Promise.resolve()
+      .then(() =>
+        client.tui.showToast({
+          body: {
+            title,
+            message,
+            variant: "info",
+            duration: 12000,
+          },
+        }),
+      )
+      .catch(() => undefined),
+    TOAST_TIMEOUT,
+  )
 }
 
 function debugLog(_enabled: boolean, title: string, message: string) {
@@ -607,23 +623,23 @@ function formatRepairError(error: unknown) {
 }
 
 async function getStoredPart(client: any, directory: string, part: any) {
-  const response = await client.session
-    ?.message?.({
+  const response = await safeClientCall(() =>
+    client?.session?.message?.({
       path: { id: part.sessionID, messageID: part.messageID },
       query: { directory },
-    })
-    .catch(() => undefined)
+    }),
+  )
   const message = getData(response) as { parts?: any[] } | undefined
   return message?.parts?.find((item) => item?.id === part.id)
 }
 
 async function getStoredMessages(client: any, directory: string, sessionID: string) {
-  const response = await client.session
-    ?.messages?.({
+  const response = await safeClientCall(() =>
+    client?.session?.messages?.({
       path: { id: sessionID },
       query: { directory },
-    })
-    .catch(() => undefined)
+    }),
+  )
   return getData(response) as Array<{ info?: unknown; parts?: any[] }> | undefined
 }
 
@@ -724,13 +740,19 @@ async function persistCleanedParts(client: any, directory: string, parts: Change
     const part = entry.part
     debugLog(debugEnabledFlag, `Agent variant ${label} repair diff`, `${part.id}: cleaned=${entry.cleaned}; ${diffSnippet(entry.before, entry.after)}`)
     try {
-      const result = await rawClient.patch({
-        url: "/session/{sessionID}/message/{messageID}/part/{partID}",
-        path: { sessionID: part.sessionID, messageID: part.messageID, partID: part.id },
-        query: { directory },
-        body: part,
-        headers: { "content-type": "application/json" },
-      })
+      const result = await safeClientCall(() =>
+        rawClient.patch({
+          url: "/session/{sessionID}/message/{messageID}/part/{partID}",
+          path: { sessionID: part.sessionID, messageID: part.messageID, partID: part.id },
+          query: { directory },
+          body: part,
+          headers: { "content-type": "application/json" },
+        }),
+      )
+      if (!result) {
+        failures.push({ id: part.id, message: "part update timed out or failed" })
+        continue
+      }
       if (result?.error) failures.push({ id: part.id, message: formatRepairError(result.error) })
       else if (result?.response && !result.response.ok) failures.push({ id: part.id, message: `${result.response.status} ${result.response.statusText}` })
       if (failures.some((failure) => failure.id === part.id)) continue
@@ -766,6 +788,15 @@ async function timeout<T>(promise: Promise<T>, ms: number): Promise<T | undefine
   } finally {
     if (timer) clearTimeout(timer)
   }
+}
+
+async function safeClientCall<T>(call: () => Promise<T> | T, ms = CLIENT_CALL_TIMEOUT): Promise<T | undefined> {
+  return timeout(
+    Promise.resolve()
+      .then(call)
+      .catch(() => undefined),
+    ms,
+  )
 }
 
 function diagnosticKey(diagnostic: Diagnostic) {
@@ -889,9 +920,9 @@ function responseData(response: unknown) {
 }
 
 async function fetchMergedCatalog(client: any) {
-  const providerList = await timeout(Promise.resolve(client?.provider?.list?.()).then(responseData, () => undefined), CATALOG_FETCH_TIMEOUT)
+  const providerList = responseData(await safeClientCall(() => client?.provider?.list?.(), CATALOG_FETCH_TIMEOUT))
   if (providerList) return modelCatalogFromProviders(providerList)
-  const configProviders = await timeout(Promise.resolve(client?.config?.providers?.()).then(responseData, () => undefined), CATALOG_FETCH_TIMEOUT)
+  const configProviders = responseData(await safeClientCall(() => client?.config?.providers?.(), CATALOG_FETCH_TIMEOUT))
   if (configProviders) return modelCatalogFromProviders(configProviders)
 }
 
@@ -1024,12 +1055,14 @@ const plugin: Plugin = async (input) => {
 
   return {
     config: async (cfg) => {
-      const assembled = assembleAgents(cfg as Record<string, any>, sidecar)
+      const assembled = __testAssembleAgents(cfg as Record<string, any>, sidecar)
       virtualRoutes = assembled.virtualRoutes
       parentPromptPatches = assembled.parentPromptPatches
       parentRequestPatches = assembled.parentRequestPatches
       queueDiagnostics(assembled.diagnostics)
-      void refreshMergedCatalog()
+      void refreshMergedCatalog().catch((error) => {
+        debugLog(debugEnabled(), "Agent variant provider catalog error", error instanceof Error ? error.message : String(error))
+      })
     },
     "tool.execute.before": async (hookInput, output) => {
       if (hookInput.tool !== "task") return

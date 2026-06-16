@@ -106,17 +106,9 @@ jobs:
         if: steps.version.outputs.should_release == 'true'
         run: npm version "${{ steps.version.outputs.version }}" --no-git-tag-version --allow-same-version
 
-      - name: Typecheck
+      - name: Typecheck, build, test, and verify package contents
         if: steps.version.outputs.should_release == 'true'
-        run: npm run typecheck
-
-      - name: Build
-        if: steps.version.outputs.should_release == 'true'
-        run: npm run build
-
-      - name: Verify package contents
-        if: steps.version.outputs.should_release == 'true'
-        run: npm pack --dry-run
+        run: npm run ci:package
 
       - name: Check npm version
         if: steps.version.outputs.should_release == 'true'

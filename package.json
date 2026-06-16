@@ -56,12 +56,14 @@
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc --outDir dist --declaration",
-    "ci": "npm run release:intent:check && npm run typecheck && npm run build && npm pack --dry-run",
+    "ci": "npm run release:intent:check && npm run ci:package",
+    "ci:package": "npm run typecheck && npm run build && npm run test:regression && npm run pack:dry-run",
     "commit:check": "npm run ci",
     "hooks:install": "node scripts/install-git-hooks.mjs",
-    "pack:dry-run": "npm pack --dry-run",
+    "pack:dry-run": "node scripts/pack-dry-run.mjs",
     "release:intent": "node scripts/set-release-intent.mjs",
     "release:intent:check": "node scripts/check-release-intent.mjs",
+    "test:regression": "node scripts/regression-tests.mjs",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run typecheck && npm run build"
   },

@@ -32,14 +32,14 @@ agent-variants/
 
 **`dist/`:**
 - Purpose: Compiled JavaScript and type declaration output for npm distribution
-- Contains: `.js` files (compiled from `src/*.ts`) and `.d.ts` type declarations
-- Key files: `server.js`, `index.js`, `config.js`, `tui.d.ts`, `server.d.ts`, `index.d.ts`, `config.d.ts`
-- Note: `tui.tsx` is served directly from source (listed in `package.json` `"files"`)
+- Contains: `.js` files (compiled from `src/*.ts` and `src/*.tsx`) and `.d.ts` type declarations
+- Key files: `server.js`, `index.js`, `config.js`, `tui.js`, `tui.d.ts`, `server.d.ts`, `index.d.ts`, `config.d.ts`
+- Note: `src/` is also shipped in the published package (listed in `package.json` `"files"` alongside `dist`) so the TUI runtime can load `tui.tsx` directly
 
 **`docs/`:**
 - Purpose: User-facing documentation for configuration, releases, and plugin behavior
 - Contains: Markdown guides
-- Key files: `CONFIG.md`, `WALKTHROUGH.md`, `PLUGIN_DESCRIPTION.md`, `RELEASE.md`, `PLAN.md`
+- Key files: `CONFIG.md`, `WALKTHROUGH.md`, `PLUGIN_DESCRIPTION.md`, `RELEASE.md`, `PLAN.md`, `ALIAS_UNDERSTANDING_TEST.md`
 
 **`scripts/`:**
 - Purpose: Build and release automation scripts

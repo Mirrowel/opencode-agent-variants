@@ -31,7 +31,7 @@ Debug, routing-toggle, and UI-only saves do not create backup entries. Meaningfu
 
 Parent and variant `model` fields can use either `"light"` or the full `"provider/model"` reference. Selecting a preset applies its model-related fields; local parent/variant fields still win. For example, `model: "light"` can supply `temperature: 0.2`, but a variant with its own `temperature` uses the variant value.
 
-If a variant resolves to a model that is definitely missing, the plugin skips that variant at startup and shows a warning toast. The sidecar is not modified automatically.
+Malformed model references are skipped at startup. Provider/model existence is checked later against OpenCode's merged provider catalog because built-in provider config can be a partial override, not the full model list. Missing models are reported as warning toasts when the catalog is available, and invalid runtime calls fail before launching the subagent.
 
 ## Routing Settings
 
