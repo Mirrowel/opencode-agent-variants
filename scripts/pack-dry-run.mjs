@@ -23,6 +23,7 @@ const required = [
   "src/config.ts",
   "src/index.ts",
   "src/server.ts",
+  "tsconfig.json",
   "docs/CONFIG.md",
 ]
 

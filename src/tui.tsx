@@ -1,3 +1,5 @@
+/** @jsxImportSource @opentui/solid */
+
 import { existsSync, readFileSync, writeFileSync } from "node:fs"
 import type { TuiPlugin, TuiPluginApi, TuiDialogSelectOption } from "@opencode-ai/plugin/tui"
 import type { ScrollBoxRenderable } from "@opentui/core"

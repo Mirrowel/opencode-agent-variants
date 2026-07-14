@@ -32,6 +32,7 @@
   "files": [
     "dist",
     "src",
+    "tsconfig.json",
     "docs/CONFIG.md",
     "agent-variants.example.jsonc",
     "README.md",
@@ -57,19 +58,20 @@
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc --outDir dist --declaration",
     "ci": "npm run release:intent:check && npm run ci:package",
-    "ci:package": "npm run typecheck && npm run build && npm run test:regression && npm run pack:dry-run",
+    "ci:package": "npm run typecheck && npm run build && npm run test:regression && npm run pack:dry-run && npm run test:tui-package",
     "commit:check": "npm run ci",
     "hooks:install": "node scripts/install-git-hooks.mjs",
     "pack:dry-run": "node scripts/pack-dry-run.mjs",
     "release:intent": "node scripts/set-release-intent.mjs",
     "release:intent:check": "node scripts/check-release-intent.mjs",
     "test:regression": "node scripts/regression-tests.mjs",
+    "test:tui-package": "node scripts/tui-package-smoke.mjs",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "npm run typecheck && npm run build"
   },
   "dependencies": {
     "@opencode-ai/plugin": ">=1.14.0",
-    "@opentui/solid": "^0.2.16",
+    "@opentui/solid": "^0.4.1",
     "comment-json": "^4.2.5",
     "solid-js": "1.9.12",
     "zod": "^4.1.8"

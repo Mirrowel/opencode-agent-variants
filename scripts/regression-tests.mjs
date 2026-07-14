@@ -128,8 +128,11 @@ function testMarkerlessDefaultAndLegacyScrub() {
 function testRuntimeDependencyMetadata() {
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"))
   assert(pkg.files.includes("src"), "published package must include runtime TUI source imports")
-  assert(pkg.dependencies?.["@opentui/solid"], "@opentui/solid must be a runtime dependency")
+  assert(pkg.files.includes("tsconfig.json"), "published TUI source must include its JSX compiler configuration")
+  assert(pkg.dependencies?.["@opentui/solid"] === "^0.4.1", "@opentui/solid must stay within the compatible packaged JSX runtime line")
   assert(pkg.dependencies?.["solid-js"] === "1.9.12", "solid-js must stay pinned to the @opentui/solid peer version")
+  const tui = readFileSync(new URL("../src/tui.tsx", import.meta.url), "utf8")
+  assert(tui.startsWith("/** @jsxImportSource @opentui/solid */"), "published TUI source must explicitly select the Solid JSX runtime")
 }
 
 function testSelectionTierInference() {
