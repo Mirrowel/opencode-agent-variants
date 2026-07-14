@@ -1,9 +1,12 @@
 import { existsSync, unlinkSync } from "node:fs"
 import { spawnSync } from "node:child_process"
 
-const result = spawnSync("npm", ["pack", "--dry-run", "--json"], {
+const npmCli = process.env.npm_execpath
+const executable = npmCli ? process.execPath : process.platform === "win32" ? "npm.cmd" : "npm"
+const args = npmCli ? [npmCli, "pack", "--dry-run", "--json"] : ["pack", "--dry-run", "--json"]
+const result = spawnSync(executable, args, {
   encoding: "utf8",
-  shell: process.platform === "win32",
+  shell: false,
 })
 
 if (result.stderr) process.stderr.write(result.stderr)
@@ -13,7 +16,10 @@ if (result.status !== 0) {
 }
 
 const packs = JSON.parse(result.stdout)
-const pack = packs[0]
+const pack = Array.isArray(packs) ? packs[0] : Object.values(packs)[0]
+if (!pack || !Array.isArray(pack.files)) {
+  throw new Error("npm pack returned an unsupported JSON result")
+}
 const files = new Set(pack.files.map((file) => file.path))
 const required = [
   "dist/server.js",

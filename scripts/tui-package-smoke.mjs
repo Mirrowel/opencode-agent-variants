@@ -26,7 +26,9 @@ function run(command, args, options = {}) {
 }
 
 try {
-  const packed = JSON.parse(run("npm", ["pack", "--json", "--pack-destination", temp]))[0]
+  const packs = JSON.parse(run("npm", ["pack", "--json", "--pack-destination", temp]))
+  const packed = Array.isArray(packs) ? packs[0] : Object.values(packs)[0]
+  if (!packed?.filename) throw new Error("npm pack returned an unsupported JSON result")
   const tarball = path.join(temp, packed.filename)
   writeFileSync(
     path.join(temp, "package.json"),
