@@ -166,8 +166,9 @@ The wizard defaults to showing only subagent-capable parent agents when adding o
 
 | Pattern | Example | Why use it |
 | --- | --- | --- |
-| Cheap general work | `general-light` | Let the main model delegate routine edits or analysis to a cheaper model. |
-| Cheap code search | `explore-light` | Keep broad codebase reading off your strongest model. |
+| Basic retrieval work | `explore-basic` | Delegate file finding, symbol lookup, extraction, and bounded data gathering to Luna/nano-class models. |
+| Balanced general work | `general-light` | Delegate routine edits or analysis to Terra/mini-class models that still provide moderate judgment. |
+| Balanced code search | `explore-light` | Keep broader codebase reading off the strongest model without dropping to the basic retrieval tier. |
 | Specialist model | `explore-gemini`, `general-glm` | Route specific task types to models that are strong or inexpensive for that shape of work. |
 | Clear task-list wording | `description_append` | Teach the main model when to pick each variant without adding extra tools or prompts. |
 | Shared model aliases | `models.light` | Change the underlying model once and reuse it across multiple variants. |
@@ -262,7 +263,7 @@ Variant names default to `${parent}-${variantKey}`. In the example above, `gener
 
 Description and prompt fields support template variables such as `{parent}`, `{alias}`, `{variant_key}`, `{model}`, `{model_label}`, and `{routed_agent}`.
 
-Variant descriptions are generated with selection guidance by default. The wizard can infer light/heavy/verification/parallel/strict-review style guidance from the variant key, alias, model preset, resolved model name, model label, and provider model variant. You can also pick a built-in guidance preset during variant creation or press `ctrl+p` while editing the `Description` field to insert preset text. Press `i` on a preset to preview the full text it adds.
+Variant descriptions are generated with selection guidance by default. The wizard can infer basic/light/heavy/verification/parallel/strict-review style guidance from the variant key, alias, model preset, resolved model name, model label, and provider model variant. Capability inference maps GPT nano and GPT-5.6 Luna to `basic`, GPT mini and GPT-5.6 Terra to `light`, and GPT-5.5, GPT-5.6 Sol, and the bare `gpt-5.6` alias to `heavy`. Literal canonical tier words (`basic`, `light`, or `heavy`) are explicit overrides. Otherwise, recognized model capability wins over semantic names: a Sol-backed `data-entry` alias remains heavy, while `data-entry` can still infer basic when the model tier is unknown. You can also pick a built-in guidance preset during variant creation or press `ctrl+p` while editing the `Description` field to insert preset text. Press `i` on a preset to preview the full text it adds.
 
 ## Supported Fields
 

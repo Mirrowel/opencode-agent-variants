@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs"
 import { __testAssembleAgents, __testInternals } from "../dist/index.js"
-import { emptyConfig } from "../dist/config.js"
+import { emptyConfig, inferredSelectionPreset, SELECTION_PRESETS } from "../dist/config.js"
 
 function assert(condition, message) {
   if (!condition) throw new Error(message)
@@ -132,10 +132,52 @@ function testRuntimeDependencyMetadata() {
   assert(pkg.dependencies?.["solid-js"] === "1.9.12", "solid-js must stay pinned to the @opentui/solid peer version")
 }
 
+function testSelectionTierInference() {
+  const config = emptyConfig()
+  config.models.balanced = {
+    model: "openai/gpt-5.6-terra",
+    label: "GPT-5.6 Terra",
+  }
+
+  const cases = [
+    { label: "GPT-5.6 Sol", key: "tier", model: "openai/gpt-5.6-sol", expected: "heavy" },
+    { label: "bare GPT-5.6 alias", key: "tier", model: "openai/gpt-5.6", expected: "heavy" },
+    { label: "GPT-5.5", key: "tier", model: "openai/gpt-5.5", expected: "heavy" },
+    { label: "GPT-5.5 low reasoning", key: "tier", model: "openai/gpt-5.5", variant: "low", expected: "heavy" },
+    { label: "GPT-5.6 Terra", key: "tier", model: "openai/gpt-5.6-terra", expected: "light" },
+    { label: "GPT-5.6 Terra max reasoning", key: "tier", model: "openai/gpt-5.6-terra", variant: "max", expected: "light" },
+    { label: "GPT-5.5 mini high reasoning", key: "tier", model: "openai/gpt-5.5-mini", variant: "high", expected: "light" },
+    { label: "GPT-5.6 Luna", key: "tier", model: "openai/gpt-5.6-luna", expected: "basic" },
+    { label: "GPT-5.6 Luna max reasoning", key: "tier", model: "openai/gpt-5.6-luna", variant: "max", expected: "basic" },
+    { label: "GPT nano", key: "tier", model: "openai/gpt-5-nano", expected: "basic" },
+    { label: "Terra model shortcut", key: "tier", model: "balanced", expected: "light" },
+    { label: "explicit heavy alias overrides Luna", key: "heavy", model: "openai/gpt-5.6-luna", expected: "heavy" },
+    { label: "explicit basic alias overrides Sol", key: "basic", model: "openai/gpt-5.6-sol", expected: "basic" },
+    { label: "explicit light alias overrides Sol", key: "light", model: "openai/gpt-5.6-sol", expected: "light" },
+    { label: "Sol overrides data-entry alias", key: "data-entry", model: "openai/gpt-5.6-sol", expected: "heavy" },
+    { label: "explicit heavy alias overrides Terra", key: "heavy", model: "openai/gpt-5.6-terra", expected: "heavy" },
+    { label: "unknown model uses nano alias fallback", key: "nano", model: "vendor/generic-model", expected: "basic" },
+    { label: "unknown model uses heavy alias fallback", key: "heavy", model: "vendor/generic-model", expected: "heavy" },
+    { label: "functional intent overrides model tier", key: "verification", model: "openai/gpt-5.6-luna", expected: "verification" },
+  ]
+
+  for (const test of cases) {
+    const actual = inferredSelectionPreset("explore", test.key, { model: test.model, variant: test.variant }, config)?.key
+    assert(actual === test.expected, `${test.label} should infer ${test.expected}, got ${actual ?? "none"}`)
+  }
+
+  const providerToken = inferredSelectionPreset("explore", "tier", { model: "sol/generic-model" }, config)
+  assert(providerToken === undefined, "provider names must not be interpreted as model capability tiers")
+  const semanticTaskName = inferredSelectionPreset("explore", "data-entry", { model: "vendor/generic-model" }, config)
+  assert(semanticTaskName?.key === "basic", "semantic task names should provide a fallback when model capability is unknown")
+  assert(SELECTION_PRESETS[0]?.key === "basic", "basic should be the first capability preset below light")
+}
+
 testPartialProviderOverrideWithVariants()
 testMissingCustomProviderModelIsDeferred()
 testMalformedModelShapeStillSkips()
 testMarkerlessDefaultAndLegacyScrub()
 testRuntimeDependencyMetadata()
+testSelectionTierInference()
 
 console.log("regression tests passed")

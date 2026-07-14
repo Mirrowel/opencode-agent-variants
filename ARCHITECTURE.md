@@ -107,7 +107,7 @@
 **SelectionPreset:**
 - Purpose: Built-in task-list guidance presets that make variants easier for the main model to choose correctly
 - Location: `src/config.ts` (`SELECTION_PRESETS`, `inferredSelectionPreset()`, `selectionPresetText()`, `generatedVariantBase()`)
-- Pattern: 8 presets (light, heavy, verification, parallel, strict-review, conservative, creative, synthesis) auto-inferred from variant key/name/model/model-variant; the wizard can materialize preset text into the Description field or leave it auto-inferred
+- Pattern: 9 presets (basic, light, heavy, verification, parallel, strict-review, conservative, creative, synthesis) auto-inferred from variant key/name/model/model-variant; model-tier inference distinguishes entry-level/high-volume models (for example GPT nano and GPT-5.6 Luna), balanced models (GPT mini and GPT-5.6 Terra), and flagship models (GPT-5.5 and GPT-5.6 Sol); literal canonical tier words (`basic`, `light`, `heavy`) are explicit overrides, otherwise recognized model capability wins and semantic task names such as `data-entry` are fallback evidence only when the model tier is unknown; specialized purpose presets remain purpose-driven; the wizard can materialize preset text into the Description field or leave it auto-inferred
 
 **ModelCatalog:**
 - Purpose: Snapshot of OpenCode's merged provider/model/variant inventory used for existence validation

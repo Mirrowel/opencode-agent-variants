@@ -189,10 +189,16 @@ export type SelectionPreset = {
 
 export const SELECTION_PRESETS: SelectionPreset[] = [
   {
+    key: "basic",
+    title: "Basic / high-volume",
+    summary: "File finding, lookup, extraction, and routine data work",
+    text: "Use {alias} for basic exploration and data-gathering tasks such as finding files, locating symbols, listing matches, extracting facts, or other bounded high-volume work. Prefer {parent} or a stronger variant for complex reasoning, implementation, or high-stakes conclusions. If the user explicitly asks for {alias}, call this exact subagent instead of {parent}.",
+  },
+  {
     key: "light",
-    title: "Light / low-cost",
-    summary: "Cheaper, faster, routine, or lower-stakes pass",
-    text: "Use {alias} for routine, low-cost, or fast-turnaround work. If the user explicitly asks for {alias}, call this exact subagent instead of {parent}.",
+    title: "Light / balanced",
+    summary: "Balanced routine work that still needs moderate judgment",
+    text: "Use {alias} for balanced routine work that benefits from moderate judgment while keeping cost and turnaround below the strongest tier. If the user explicitly asks for {alias}, call this exact subagent instead of {parent}.",
   },
   {
     key: "heavy",
@@ -558,9 +564,18 @@ function hasAnyPhrase(input: string, phrases: string[]) {
   return phrases.some((phrase) => normalized.includes(normalizePresetText(phrase)))
 }
 
+function modelSelectionSource(model: string | undefined, config: SidecarConfig) {
+  const resolved = resolveModel(model, config)
+  const rawModelID = splitModelRef(model)?.modelID
+  const resolvedModelID = splitModelRef(resolved)?.modelID
+  const shortcut = model && config.models[model] ? model : undefined
+  const label = model ? config.models[model]?.label : undefined
+  return [shortcut, rawModelID, resolvedModelID, label].filter(Boolean).join(" ")
+}
+
 export function inferredSelectionPreset(parent: string, key: string, variant: Pick<VariantConfig, "name" | "model" | "variant">, config: SidecarConfig) {
   const explicitSource = [key, variant.name].filter(Boolean).join(" ")
-  const modelSource = [variant.model, resolveModel(variant.model, config), modelLabel(variant.model, config)].filter(Boolean).join(" ")
+  const modelSource = modelSelectionSource(variant.model, config)
   const modelVariant = variant.variant ?? ""
 
   if (hasAnyToken(explicitSource, ["verify", "verification", "review", "check", "audit", "critic", "second", "judge"]) || hasAnyPhrase(explicitSource, ["second opinion"])) return presetByKey("verification")
@@ -570,18 +585,29 @@ export function inferredSelectionPreset(parent: string, key: string, variant: Pi
   if (hasAnyToken(explicitSource, ["creative", "alternative", "alternatives", "brainstorm", "broad", "design"])) return presetByKey("creative")
   if (hasAnyToken(explicitSource, ["synthesis", "synthesize", "summary", "summarize", "reconcile", "combine"])) return presetByKey("synthesis")
 
-  const explicitLight = hasAnyToken(explicitSource, ["light", "lite", "fast", "flash", "haiku", "small", "mini", "nano", "micro", "cheap", "budget", "economy", "low"])
-  const explicitHeavy = hasAnyToken(explicitSource, ["heavy", "deep", "strong", "strongest", "pro", "max", "opus", "reason", "reasoning", "thinking"])
-  if (explicitHeavy) return presetByKey("heavy")
-  if (explicitLight) return presetByKey("light")
+  // Canonical tier names are explicit user intent and override capability inference.
+  if (hasAnyToken(explicitSource, ["heavy"])) return presetByKey("heavy")
+  if (hasAnyToken(explicitSource, ["basic"])) return presetByKey("basic")
+  if (hasAnyToken(explicitSource, ["light"])) return presetByKey("light")
 
-  const modelLooksLight = hasAnyToken(modelSource, ["light", "lite", "fast", "flash", "haiku", "small", "mini", "nano", "micro", "cheap", "budget", "economy", "low"])
+  const modelLooksBasic = hasAnyToken(modelSource, ["luna", "nano", "micro", "tiny"])
+  if (modelLooksBasic) return presetByKey("basic")
+
+  const modelLooksLight = hasAnyToken(modelSource, ["terra", "light", "lite", "fast", "flash", "haiku", "small", "mini", "cheap", "budget", "economy", "low"])
   if (modelLooksLight) return presetByKey("light")
 
-  if (hasAnyToken(modelVariant, ["low", "fast", "lite", "light", "economy", "small", "mini", "nano"])) return presetByKey("light")
+  if (hasAnyToken(modelSource, ["sol", "heavy", "deep", "strong", "strongest", "pro", "max", "opus", "xhigh"]) || hasAnyPhrase(modelSource, ["gpt 5 6", "gpt 5 5", "gpt 5", "gpt5", "sonnet", "reasoning"])) return presetByKey("heavy")
+
+  if (hasAnyToken(modelVariant, ["nano", "micro", "tiny"])) return presetByKey("basic")
+  if (hasAnyToken(modelVariant, ["low", "fast", "lite", "light", "economy", "small", "mini"])) return presetByKey("light")
   if (hasAnyToken(modelVariant, ["high", "xhigh", "max", "pro", "reasoning", "thinking"])) return presetByKey("heavy")
 
-  if (hasAnyToken(modelSource, ["heavy", "deep", "strong", "strongest", "pro", "max", "opus", "xhigh"]) || hasAnyPhrase(modelSource, ["gpt 5", "gpt 5 5", "gpt5", "sonnet", "reasoning"])) return presetByKey("heavy")
+  const explicitHeavy = hasAnyToken(explicitSource, ["heavy", "deep", "strong", "strongest", "pro", "max", "opus", "reason", "reasoning", "thinking"])
+  const explicitBasic = hasAnyToken(explicitSource, ["entry", "utility", "lookup", "finder", "find", "file", "files", "locate", "extract", "extraction", "retrieval", "data", "clerical", "volume", "luna", "nano", "micro", "tiny"])
+  const explicitLight = hasAnyToken(explicitSource, ["light", "lite", "fast", "flash", "haiku", "small", "mini", "cheap", "budget", "economy", "low", "terra"])
+  if (explicitHeavy) return presetByKey("heavy")
+  if (explicitBasic) return presetByKey("basic")
+  if (explicitLight) return presetByKey("light")
 }
 
 export function selectionPresetText(parent: string, key: string, variant: VariantConfig, config: SidecarConfig, presetKey?: string) {
