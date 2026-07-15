@@ -34,13 +34,13 @@
 - Location: `src/tui.tsx`
 - Contains: Solid JSX components for menus, field editors, backup browser, diagnostics viewer, selection preset picker; dialog orchestration loops
 - Depends on: `src/config.ts`, `@opencode-ai/plugin/tui`, `@opentui/solid`, `solid-js`
-- Used by: OpenCode TUI runtime via the `"tui"` export in `package.json`
+- Used by: OpenCode TUI runtime via the compiled `dist/tui.js` target of the `"tui"` export in `package.json`
 
 **Build Output:**
 - Purpose: Compiled JavaScript and type declarations for distribution
 - Location: `dist/`
-- Contains: `index.js`, `server.js`, `config.js`, `tui.d.ts`, `server.d.ts`, `index.d.ts`, `config.d.ts`
-- Depends on: TypeScript compilation from `src/`
+- Contains: `index.js`, `server.js`, `config.js`, `tui.js`, `tui.d.ts`, `server.d.ts`, `index.d.ts`, `config.d.ts`
+- Depends on: TypeScript compilation from `src/`, followed by a Bun/OpenTUI Solid compilation pass for `src/tui.tsx`; OpenTUI and Solid remain external host-provided runtime imports
 - Used by: npm package consumers
 
 ## Data Flow
@@ -143,6 +143,7 @@
 - Malformed model references (shape errors) are stripped from patches at assembly time and the variant is skipped with an immediate warning toast; provider/model existence errors are reported asynchronously after the merged provider catalog is available, and invalid hot-reloaded variants fail before execution once the catalog is ready
 - Alias conflicts (duplicate names, parent name collision) skip the variant with an error toast
 - Hot-reload validation (`liveRoute()`) throws errors that surface as task call failures
+- All host client interactions (session lookups, toast delivery, provider catalog fetches) run through `safeClientCall()` with an enforced timeout (3s) and swallowed errors so the plugin never blocks the host
 - Debug log writes are wrapped in try/catch to prevent I/O errors from affecting routing
 - Config save uses atomic write (temp file + rename) to prevent corruption
 

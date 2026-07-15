@@ -36,6 +36,19 @@ try {
   )
   run("npm", ["install", "--ignore-scripts", "--no-audit", "--no-fund"], { cwd: temp })
 
+  const installedRoot = path.join(temp, "node_modules", ...pkg.name.split("/"))
+  const installedPackage = JSON.parse(readFileSync(path.join(installedRoot, "package.json"), "utf8"))
+  if (installedPackage.exports?.["./tui"]?.import !== "./dist/tui.js") {
+    throw new Error("packed TUI export does not target the compiled artifact")
+  }
+  const artifact = readFileSync(path.join(installedRoot, "dist", "tui.js"), "utf8")
+  if (artifact.includes("@opentui/solid/jsx-runtime")) {
+    throw new Error("packed TUI uses non-reactive automatic JSX runtime")
+  }
+  if (!artifact.includes("effect") || !artifact.includes("setProp")) {
+    throw new Error("packed TUI is missing Solid reactive property effects")
+  }
+
   const check = [
     'import { ensureRuntimePluginSupport } from "@opentui/solid/runtime-plugin-support/configure"',
     "ensureRuntimePluginSupport()",

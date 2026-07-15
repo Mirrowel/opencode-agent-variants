@@ -34,7 +34,7 @@ agent-variants/
 - Purpose: Compiled JavaScript and type declaration output for npm distribution
 - Contains: `.js` files (compiled from `src/*.ts` and `src/*.tsx`) and `.d.ts` type declarations
 - Key files: `server.js`, `index.js`, `config.js`, `tui.js`, `tui.d.ts`, `server.d.ts`, `index.d.ts`, `config.d.ts`
-- Note: `src/` is also shipped in the published package (listed in `package.json` `"files"` alongside `dist`) so the TUI runtime can load `tui.tsx` directly
+- Note: `src/` is also shipped for source inspection, but the runtime loads `dist/tui.js`; `scripts/build-tui.mjs` compiles the TSX with OpenTUI's Solid transform so reactive dialog properties repaint correctly from npm installs
 
 **`docs/`:**
 - Purpose: User-facing documentation for configuration, releases, and plugin behavior
@@ -42,9 +42,9 @@ agent-variants/
 - Key files: `CONFIG.md`, `WALKTHROUGH.md`, `PLUGIN_DESCRIPTION.md`, `RELEASE.md`, `PLAN.md`, `ALIAS_UNDERSTANDING_TEST.md`
 
 **`scripts/`:**
-- Purpose: Build and release automation scripts
-- Contains: Node.js ESM scripts (`.mjs`) for release management and git hook installation
-- Key files: `release-lib.mjs`, `set-release-intent.mjs`, `check-release-intent.mjs`, `install-git-hooks.mjs`
+- Purpose: Build, release, and verification automation scripts
+- Contains: Node.js ESM scripts (`.mjs`) for release management, git hook installation, package-content verification, and regression testing
+- Key files: `release-lib.mjs`, `set-release-intent.mjs`, `check-release-intent.mjs`, `install-git-hooks.mjs`, `build-tui.mjs`, `solid-tui-build.mjs`, `pack-dry-run.mjs`, `regression-tests.mjs`, `tui-reactivity-smoke.mjs`, `tui-package-smoke.mjs`
 
 **`.github/`:**
 - Purpose: CI/CD automation
@@ -61,8 +61,8 @@ agent-variants/
 **Configuration:** `tsconfig.json`: TypeScript compiler options (ES2022, NodeNext, JSX with Solid); `package.json`: npm package config with `"oc-plugin": ["server", "tui"]` manifest
 **Core Logic:** `src/index.ts`: Hook factory with route assembly, metadata-based session correlation, optional legacy prompt-marker fallback; `src/config.ts`: All schemas, config I/O, model resolution, backup system, diagnostics
 **Config Example:** `agent-variants.example.jsonc`: Annotated example of the sidecar config format
-**Tests:** No test files exist in this project currently
-**CI/CD:** `.github/workflows/ci.yml`: Lint, typecheck, build, pack dry-run; `.github/workflows/release.yml`: Automated npm publish and GitHub release
+**Tests:** `scripts/regression-tests.mjs`: Node-based regression suite (no test runner) exercising partial provider overrides, deferred diagnostics, legacy marker scrubbing, runtime dependency metadata, and selection tier inference against the compiled `dist/`; run via `npm run test:regression`
+**CI/CD:** `.github/workflows/ci.yml`: Typecheck, build, regression tests, pack dry-run, and TUI package smoke (run as a single `npm run ci` step, also gated locally by the pre-commit hook); `.github/workflows/release.yml`: Automated npm publish and GitHub release
 
 ## Naming Conventions
 
@@ -83,5 +83,7 @@ agent-variants/
 **New model preset field:** Add to the `ModelShortcut` Zod schema in `src/config.ts` and to `MODEL_PRESET_FIELDS` in `src/tui.tsx`
 
 **New script:** Add to `scripts/` as `.mjs` — follow existing naming (`kebab-case.mjs`)
+
+**New regression test case:** Add a `function testX()` to `scripts/regression-tests.mjs` that drives `__testAssembleAgents` / `__testInternals` from `dist/`, then call it at the bottom of the file alongside the other `test*()` invocations — assertions throw on failure; the suite is run via `npm run test:regression`
 
 **Shared utilities:** Add to `src/config.ts` for config-related helpers; add to `src/index.ts` for routing-related helpers
