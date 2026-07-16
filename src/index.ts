@@ -11,7 +11,6 @@ import {
   defaultSidecarPath,
   debugLogPath,
   effectiveVariantPatch,
-  fingerprint,
   generatedVariantDescription,
   generatedParentDescription,
   hasPromptPatch,
@@ -49,7 +48,6 @@ type PendingRoute = RuntimeRoute & {
   callID: string
   parentSessionID: string
   targetAgent: string
-  fingerprint: string
   createdAt: number
 }
 type ScrubContext = { routes?: Map<string, RuntimeRoute> }
@@ -58,6 +56,8 @@ type ChangedPart = { part: any; before: string; after: string; cleaned: number }
 
 const BUILTIN_AGENTS = new Set(Object.keys(BUILTIN_AGENT_DESCRIPTIONS))
 const ROUTE_TTL = 10 * 60 * 1000
+const ROUTE_LOOKUP_DELAYS = [0, 50, 200]
+const ROUTE_LOOKUP_TIMEOUT = 500
 const MARKER_PREFIX = "<!-- agent-variants-route"
 const MARKER_SUFFIX = " -->"
 const ROUTE_MARKER_RE = /<!--\s*agent-variants-route([\s\S]*?)-->/g
@@ -248,6 +248,8 @@ function scrubTaskInput(input: unknown, context: ScrubContext = {}, provenAlias?
 }
 
 export const __testInternals = {
+  applyMessageModel,
+  correlateTaskRoute,
   marker,
   scrubParts,
   scrubTaskInput,
@@ -465,12 +467,6 @@ export function __testAssembleAgents(cfg: Record<string, any>, sidecar: SidecarC
   return { virtualRoutes, parentPromptPatches, parentRequestPatches, diagnostics }
 }
 
-function textFromParts(parts: any[]) {
-  const primary = parts.filter((part) => part?.type === "text" && !part.synthetic).map((part) => part.text).join("\n\n")
-  if (primary.trim()) return primary
-  return parts.filter((part) => part?.type === "text").map((part) => part.text).join("\n\n")
-}
-
 function takeMarkerRoute(parts: any[], routes: Map<string, RuntimeRoute>) {
   const result = scrubParts(parts)
   if (!result.token) return result.count > 0 ? { stripped: result.count } : undefined
@@ -498,15 +494,26 @@ function cleanupPending(list: PendingRoute[], routes?: Map<string, RuntimeRoute>
   }
 }
 
-function takePending(list: PendingRoute[], input: { parentSessionID?: string; agent?: string; fingerprint: string }) {
-  const exact = list.findIndex(
-    (item) => item.parentSessionID === input.parentSessionID && item.targetAgent === input.agent && item.fingerprint === input.fingerprint,
-  )
-  if (exact >= 0) return list.splice(exact, 1)[0]
-  const fallbackCandidates = list
-    .map((item, index) => ({ item, index }))
-    .filter(({ item }) => item.parentSessionID === input.parentSessionID && item.targetAgent === input.agent)
-  if (fallbackCandidates.length === 1) return list.splice(fallbackCandidates[0].index, 1)[0]
+function correlateTaskRoute(
+  list: PendingRoute[],
+  routesByCall: Map<string, RuntimeRoute>,
+  routesBySession: Map<string, RuntimeRoute>,
+  knownRoutes: Map<string, RuntimeRoute>,
+  childSessionID: string,
+  parentTaskPart: any,
+) {
+  if (!parentTaskPart) return { route: undefined, proof: undefined }
+  const metadataRoute = takePendingByCallID(list, parentTaskPart?.callID)
+    ?? takePendingByCallID(list, parentTaskPart?.id)
+    ?? routesByCall.get(parentTaskPart?.callID)
+    ?? routesByCall.get(parentTaskPart?.id)
+    ?? routeForAlias(metadataAlias(parentTaskPart.state?.metadata, knownRoutes), knownRoutes)
+  if (metadataRoute) {
+    routesBySession.set(childSessionID, metadataRoute)
+    return { route: metadataRoute, proof: "metadata" as const }
+  }
+  routesBySession.delete(childSessionID)
+  return { route: undefined, proof: "authoritative-miss" as const }
 }
 
 function getData<T>(value: T | { data?: T } | undefined): T | undefined {
@@ -514,8 +521,8 @@ function getData<T>(value: T | { data?: T } | undefined): T | undefined {
   return value as T | undefined
 }
 
-async function getSession(client: any, sessionID: string) {
-  return getData(await safeClientCall(() => client?.session?.get?.({ path: { id: sessionID } }))) as { parentID?: string; agent?: string } | undefined
+async function getSession(client: any, sessionID: string, timeoutMs = CLIENT_CALL_TIMEOUT) {
+  return getData(await safeClientCall(() => client?.session?.get?.({ path: { id: sessionID } }), timeoutMs)) as { parentID?: string; agent?: string } | undefined
 }
 
 async function debugToast(client: any, _enabled: boolean, title: string, message: string) {
@@ -633,12 +640,13 @@ async function getStoredPart(client: any, directory: string, part: any) {
   return message?.parts?.find((item) => item?.id === part.id)
 }
 
-async function getStoredMessages(client: any, directory: string, sessionID: string) {
+async function getStoredMessages(client: any, directory: string, sessionID: string, timeoutMs = CLIENT_CALL_TIMEOUT) {
   const response = await safeClientCall(() =>
     client?.session?.messages?.({
       path: { id: sessionID },
       query: { directory },
     }),
+    timeoutMs,
   )
   return getData(response) as Array<{ info?: unknown; parts?: any[] }> | undefined
 }
@@ -660,15 +668,29 @@ function taskChildSessionID(part: any) {
   return typeof sessionID === "string" ? sessionID : undefined
 }
 
-async function findParentTaskPartForChild(client: any, directory: string, parentSessionID: string | undefined, childSessionID: string) {
+async function findParentTaskPartForChild(client: any, directory: string, parentSessionID: string | undefined, childSessionID: string, timeoutMs = CLIENT_CALL_TIMEOUT) {
   if (!parentSessionID) return
-  const messages = await getStoredMessages(client, directory, parentSessionID)
+  const messages = await getStoredMessages(client, directory, parentSessionID, timeoutMs)
   if (!messages) return
   for (const message of [...messages].reverse()) {
     for (const part of [...(message.parts ?? [])].reverse()) {
       if (part?.type === "tool" && part.tool === "task" && taskChildSessionID(part) === childSessionID) return part
     }
   }
+}
+
+async function findParentTaskContext(client: any, directory: string, childSessionID: string) {
+  let session: { parentID?: string; agent?: string } | undefined
+  for (const wait of ROUTE_LOOKUP_DELAYS) {
+    await delay(wait)
+    if (!session) {
+      session = await getSession(client, childSessionID, ROUTE_LOOKUP_TIMEOUT)
+      if (session && !session.parentID) return { parentTaskPart: undefined }
+    }
+    const parentTaskPart = await findParentTaskPartForChild(client, directory, session?.parentID, childSessionID, ROUTE_LOOKUP_TIMEOUT)
+    if (parentTaskPart) return { parentTaskPart }
+  }
+  return { parentTaskPart: undefined }
 }
 
 function partIsClean(part: any, routes: Map<string, RuntimeRoute>) {
@@ -1079,7 +1101,6 @@ const plugin: Plugin = async (input) => {
       cleanupPending(pending, tokenRoutes)
       const usePromptMarker = promptMarkersEnabled()
       const token = usePromptMarker ? randomUUID() : undefined
-      const originalDescription = args.description
       if (token) tokenRoutes.set(token, route)
       byCall.set(hookInput.callID, route)
       pending.push({
@@ -1088,12 +1109,6 @@ const plugin: Plugin = async (input) => {
         callID: hookInput.callID,
         parentSessionID: hookInput.sessionID,
         targetAgent: route.targetAgent,
-        fingerprint: fingerprint({
-          parentSessionID: hookInput.sessionID,
-          agent: route.targetAgent,
-          prompt: args.prompt,
-          description: originalDescription,
-        }),
         createdAt: Date.now(),
       })
       if (args.description && !args.description.includes(`@${route.alias} variant`)) {
@@ -1155,45 +1170,30 @@ const plugin: Plugin = async (input) => {
       if (markerRoute?.stripped) {
         await debugToast(input.client, sidecar.debug, "Agent variant marker stripped", `stripped ${markerRoute.stripped} route marker(s) without token match; session=${hookInput.sessionID}`)
       }
-      const session = await getSession(input.client, hookInput.sessionID)
-      const parentTaskPart = await findParentTaskPartForChild(input.client, input.directory, session?.parentID, hookInput.sessionID)
-      const metadataRoute = takePendingByCallID(pending, parentTaskPart?.callID) ?? takePendingByCallID(pending, parentTaskPart?.id) ?? byCall.get(parentTaskPart?.callID) ?? byCall.get(parentTaskPart?.id)
-      if (metadataRoute) {
-        const routeToken = (metadataRoute as Partial<PendingRoute>).token
+      const { parentTaskPart } = await findParentTaskContext(input.client, input.directory, hookInput.sessionID)
+      const correlation = correlateTaskRoute(
+        pending,
+        byCall,
+        bySession,
+        virtualRoutes,
+        hookInput.sessionID,
+        parentTaskPart,
+      )
+      if (correlation.route) {
+        const routeToken = (correlation.route as Partial<PendingRoute>).token
         if (routeToken) tokenRoutes.delete(routeToken)
-        bySession.set(hookInput.sessionID, metadataRoute)
-        applyMessageModel(output, metadataRoute)
+        applyMessageModel(output, correlation.route)
         await debugToast(
           input.client,
           sidecar.debug,
           "Agent variant model applied (metadata)",
-          `${routeSummary(metadataRoute)}; session=${hookInput.sessionID}; parent task=${parentTaskPart?.id ?? "unknown"}; call=${parentTaskPart?.callID ?? "unknown"}`,
+          `${routeSummary(correlation.route)}; session=${hookInput.sessionID}; parent task=${parentTaskPart?.id ?? "unknown"}; call=${parentTaskPart?.callID ?? "unknown"}`,
         )
         return
       }
       if (parentTaskPart) {
         debugLog(sidecar.debug, "Agent variant metadata route miss", `session=${hookInput.sessionID}; parent task=${parentTaskPart.id ?? "unknown"}; call=${parentTaskPart.callID ?? "unknown"}`)
       }
-      const fp = fingerprint({
-        parentSessionID: session?.parentID ?? "",
-        agent: output.message.agent,
-        prompt: textFromParts(output.parts as any[]),
-      })
-      const route = takePending(pending, {
-        parentSessionID: session?.parentID,
-        agent: output.message.agent,
-        fingerprint: fp,
-      })
-      if (!route) return
-      if (route.token) tokenRoutes.delete(route.token)
-      bySession.set(hookInput.sessionID, route)
-      applyMessageModel(output, route)
-      await debugToast(
-        input.client,
-        sidecar.debug,
-        "Agent variant model applied (fallback)",
-        `${routeSummary(route)}; session=${hookInput.sessionID}`,
-      )
     },
     "experimental.chat.messages.transform": async (_hookInput, output) => {
       const { cleaned, changed, replayOnly } = changedMessageParts(output.messages as any[], virtualRoutes)

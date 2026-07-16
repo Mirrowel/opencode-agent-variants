@@ -125,6 +125,75 @@ function testMarkerlessDefaultAndLegacyScrub() {
   assert(!String(input.prompt).includes("agent-variants-route"), "route marker must be removed from prompt")
 }
 
+function testParallelBaseTaskCannotClaimVariantRoute() {
+  const route = {
+    alias: "explore-heavy",
+    parent: "explore",
+    targetAgent: "explore",
+    key: "heavy",
+    patch: {},
+    model: "openai/gpt-5.5",
+  }
+  const pendingRoute = {
+    ...route,
+    callID: "heavy-call",
+    parentSessionID: "parent-session",
+    createdAt: Date.now(),
+  }
+  const pending = [pendingRoute]
+  const byCall = new Map([[pendingRoute.callID, route]])
+  const bySession = new Map()
+  const knownRoutes = new Map([[route.alias, route]])
+  const baseOutput = { message: { agent: "explore", model: { providerID: "zai-coding-plan", modelID: "glm-5.2" } } }
+  const heavyOutput = { message: { agent: "explore", model: { providerID: "zai-coding-plan", modelID: "glm-5.2" } } }
+
+  const base = __testInternals.correlateTaskRoute(
+    pending,
+    byCall,
+    bySession,
+    knownRoutes,
+    "base-child",
+    { id: "base-part", callID: "base-call" },
+  )
+  if (base.route) __testInternals.applyMessageModel(baseOutput, base.route)
+
+  const heavy = __testInternals.correlateTaskRoute(
+    pending,
+    byCall,
+    bySession,
+    knownRoutes,
+    "heavy-child",
+    { id: "heavy-part", callID: "heavy-call" },
+  )
+  if (heavy.route) __testInternals.applyMessageModel(heavyOutput, heavy.route)
+
+  const baseModel = `${baseOutput.message.model.providerID}/${baseOutput.message.model.modelID}`
+  const heavyModel = `${heavyOutput.message.model.providerID}/${heavyOutput.message.model.modelID}`
+  assert(
+    baseModel === "zai-coding-plan/glm-5.2",
+    `parallel base task must keep zai-coding-plan/glm-5.2, got ${baseModel}; sibling heavy task resolved to ${heavyModel}`,
+  )
+  assert(heavyModel === route.model, `parallel heavy task should use ${route.model}, got ${heavyModel}`)
+  assert(pending.length === 0, "the exact heavy task should consume its own pending route")
+
+  byCall.clear()
+  bySession.clear()
+  const resumed = __testInternals.correlateTaskRoute(
+    pending,
+    byCall,
+    bySession,
+    knownRoutes,
+    "heavy-child",
+    {
+      id: "heavy-part",
+      callID: "heavy-call",
+      state: { metadata: { agentVariants: { alias: route.alias, routedAgent: route.targetAgent } } },
+    },
+  )
+  assert(resumed.route?.alias === route.alias, "persisted task metadata should reconstruct a variant route after transient call state is gone")
+  assert(bySession.get("heavy-child")?.alias === route.alias, "a direct variant-child continuation should retain request and prompt patches")
+}
+
 function testRuntimeDependencyMetadata() {
   const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"))
   assert(pkg.files.includes("src"), "published package must include runtime TUI source imports")
@@ -180,6 +249,7 @@ testPartialProviderOverrideWithVariants()
 testMissingCustomProviderModelIsDeferred()
 testMalformedModelShapeStillSkips()
 testMarkerlessDefaultAndLegacyScrub()
+testParallelBaseTaskCannotClaimVariantRoute()
 testRuntimeDependencyMetadata()
 testSelectionTierInference()
 

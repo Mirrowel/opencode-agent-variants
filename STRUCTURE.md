@@ -62,7 +62,7 @@ agent-variants/
 **Core Logic:** `src/index.ts`: Hook factory with route assembly, metadata-based session correlation, optional legacy prompt-marker fallback; `src/config.ts`: All schemas, config I/O, model resolution, backup system, diagnostics
 **Config Example:** `agent-variants.example.jsonc`: Annotated example of the sidecar config format
 **Tests:** `scripts/regression-tests.mjs`: Node-based regression suite (no test runner) exercising partial provider overrides, deferred diagnostics, legacy marker scrubbing, runtime dependency metadata, and selection tier inference against the compiled `dist/`; run via `npm run test:regression`
-**CI/CD:** `.github/workflows/ci.yml`: Typecheck, build, regression tests, pack dry-run, and TUI package smoke (run as a single `npm run ci` step, also gated locally by the pre-commit hook); `.github/workflows/release.yml`: Automated npm publish and GitHub release
+**CI/CD:** `.github/workflows/ci.yml`: Typecheck, build, regression tests, TUI reactivity smoke, pack dry-run, and TUI package smoke (run as a single `npm run ci` step, also gated locally by the pre-commit hook); `.github/workflows/release.yml`: Automated npm publish and GitHub release
 
 ## Naming Conventions
 
