@@ -310,7 +310,7 @@ function agentMode(api: TuiPluginApi, agent: string): AgentMode {
   return (api.state.config.agent?.[agent]?.mode as AgentMode | undefined) ?? BUILTIN_AGENT_MODES[agent] ?? "all"
 }
 
-function agentModes(api: TuiPluginApi) {
+export function agentModes(api: TuiPluginApi) {
   return Object.fromEntries(agentsFromState(api).map((agent) => [agent, agentMode(api, agent)]))
 }
 
@@ -636,7 +636,7 @@ function variantEntries(entry: AgentEntry): Array<[string, VariantConfig]> {
   return Object.entries(entry.variants) as Array<[string, VariantConfig]>
 }
 
-function generatedAliasSet(config: SidecarConfig) {
+export function generatedAliasSet(config: SidecarConfig) {
   const aliases = new Set<string>()
   for (const [agent, entry] of agentEntries(config)) {
     for (const [key, variant] of variantEntries(entry)) {
