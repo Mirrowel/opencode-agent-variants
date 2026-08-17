@@ -41,6 +41,9 @@ try {
   if (installedPackage.exports?.["./tui"]?.import !== "./dist/tui.js") {
     throw new Error("packed TUI export does not target the compiled artifact")
   }
+  if (installedPackage.exports?.["./wizard"]?.import !== "./dist/wizard.js") {
+    throw new Error("packed wizard export does not target the compiled artifact")
+  }
   const artifact = readFileSync(path.join(installedRoot, "dist", "tui.js"), "utf8")
   if (artifact.includes("@opentui/solid/jsx-runtime")) {
     throw new Error("packed TUI uses non-reactive automatic JSX runtime")
@@ -48,12 +51,23 @@ try {
   if (!artifact.includes("effect") || !artifact.includes("setProp")) {
     throw new Error("packed TUI is missing Solid reactive property effects")
   }
+  const wizardArtifact = readFileSync(path.join(installedRoot, "dist", "wizard.js"), "utf8")
+  if (wizardArtifact.includes("@opentui/solid/jsx-runtime")) {
+    throw new Error("packed wizard uses non-reactive automatic JSX runtime")
+  }
+  if (!wizardArtifact.includes("effect") || !wizardArtifact.includes("setProp")) {
+    throw new Error("packed wizard is missing Solid reactive property effects")
+  }
 
   const check = [
     'import { ensureRuntimePluginSupport } from "@opentui/solid/runtime-plugin-support/configure"',
     "ensureRuntimePluginSupport()",
     `const mod = await import(${JSON.stringify(`${pkg.name}/tui`)})`,
     'if (mod.default?.id !== "agent-variants" || typeof mod.default?.tui !== "function") throw new Error("invalid TUI plugin export")',
+    `const wizard = await import(${JSON.stringify(`${pkg.name}/wizard`)})`,
+    'if (typeof wizard.mainMenu !== "function" || typeof wizard.newWizardSettings !== "function" || typeof wizard.addVariantFor !== "function" || typeof wizard.editVariantFor !== "function" || typeof wizard.toggleEntryFor !== "function" || typeof wizard.deleteVariantFor !== "function" || typeof wizard.editParentFields !== "function" || typeof wizard.manageModelPresets !== "function" || typeof wizard.pickParentAgent !== "function" || typeof wizard.wizardInfoText !== "function" || typeof wizard.applyWizardUiSettings !== "function" || typeof wizard.variantCount !== "function") throw new Error("wizard library is missing embedded-host exports")',
+    `const config = await import(${JSON.stringify(`${pkg.name}/config`)})`,
+    'if (typeof config.loadSidecar !== "function" || typeof config.diagnoseConfig !== "function" || typeof config.saveSidecar !== "function") throw new Error("config export is missing expected functions")',
     'console.log("packed TUI import passed")',
   ].join("; ")
   run("bun", ["--conditions=browser", "-e", check], { cwd: temp })
