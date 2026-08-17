@@ -137,7 +137,7 @@ const BUILTIN_AGENT_MODES: Record<string, AgentMode> = {
   explore: "subagent",
   scout: "subagent",
 }
-const THEME_COLORS = ["primary", "secondary", "accent", "success", "warning", "error", "info"] as const
+export const THEME_COLORS = ["primary", "secondary", "accent", "success", "warning", "error", "info"] as const
 const PRESET_COLORS = [
   ["slate", "#64748B"],
   ["red", "#EF4444"],
@@ -306,7 +306,7 @@ function agentsFromState(api: TuiPluginApi): string[] {
   return [...merged].sort()
 }
 
-function agentMode(api: TuiPluginApi, agent: string): AgentMode {
+export function agentMode(api: TuiPluginApi, agent: string): AgentMode {
   return (api.state.config.agent?.[agent]?.mode as AgentMode | undefined) ?? BUILTIN_AGENT_MODES[agent] ?? "all"
 }
 
