@@ -1468,6 +1468,13 @@ function HeightSliderDialog(props: { api: TuiPluginApi; current: number; onDone:
   )
 }
 
+/** Restart phrases that mark a line or dialog title as requiring a restart. */
+const RESTART_REQUIRED_TEXT_RE = /restart[^\n]{0,40}required|required[^\n]{0,40}restart|requires? restart|restart opencode to|you restart/i
+
+function isRestartRequiredText(text: string): boolean {
+  return RESTART_REQUIRED_TEXT_RE.test(text)
+}
+
 function InfoDialog(props: { api: TuiPluginApi; title: string; message: string; onDone: () => void }) {
   const theme = () => props.api.theme.current
   useWizardDialogSize(props.api)
@@ -1516,7 +1523,7 @@ function InfoDialog(props: { api: TuiPluginApi; title: string; message: string; 
   return (
     <box flexDirection="column" width="100%" paddingLeft={2} paddingRight={2} paddingTop={1} paddingBottom={1}>
       <box flexDirection="row" justifyContent="space-between" width="100%" marginBottom={1}>
-        <text fg={theme().accent}><b>{props.title}</b></text>
+        <text fg={isRestartRequiredText(props.title) ? theme().error : theme().accent}><b>{props.title}</b></text>
         <text fg={theme().textMuted} onMouseUp={props.onDone}>esc</text>
       </box>
       <scrollbox maxHeight={bodyHeight()} ref={(element: ScrollBoxRenderable) => (scroll = element)}>
@@ -1524,11 +1531,13 @@ function InfoDialog(props: { api: TuiPluginApi; title: string; message: string; 
         <For each={lines()}>
           {(line) => {
             const heading = line.length > 0 && !line.startsWith(" ") && (line.endsWith(":") || /^[A-Z][A-Za-z ]+$/.test(line))
-            const warning = /restart|required|red/i.test(line)
+            const restartRequired = isRestartRequiredText(line)
+            const warning = restartRequired || /restart|required|red/i.test(line)
+            const bold = restartRequired || heading
             const positive = /hot reload|yes|saved|enabled/i.test(line)
             return line.length === 0
               ? <text> </text>
-              : <text fg={warning ? theme().error : positive ? theme().success : heading ? theme().accent : theme().textMuted} wrapMode="word">{heading ? <b>{line}</b> : line}</text>
+              : <text fg={warning ? theme().error : positive ? theme().success : heading ? theme().accent : theme().textMuted} wrapMode="word">{bold ? <b>{line}</b> : line}</text>
           }}
         </For>
       </box>
