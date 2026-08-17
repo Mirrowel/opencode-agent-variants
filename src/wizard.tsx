@@ -60,11 +60,11 @@ import {
 
 type AgentEntry = SidecarConfig["agents"][string]
 type ModelEntry = SidecarConfig["models"][string]
-type FieldListChoice =
+export type FieldListChoice =
   | { action: "select"; value: string }
   | { action: "toggle"; value: string }
   | { action: "inspect"; value: string }
-type FieldListOption = {
+export type FieldListOption = {
   title: string
   value: string
   description: string
@@ -75,7 +75,7 @@ type FieldListOption = {
   previewColor?: DisplayColor
   kind?: "field" | "action"
 }
-type DisplayColor = string | TuiPluginApi["theme"]["current"]["text"]
+export type DisplayColor = string | TuiPluginApi["theme"]["current"]["text"]
 type WizardSelectOption<Value = unknown> = TuiDialogSelectOption<Value> & {
   color?: DisplayColor
   danger?: boolean
@@ -159,7 +159,7 @@ const PRESET_COLORS = [
   ["rose", "#F43F5E"],
 ] as const
 
-interface FieldDef {
+export interface FieldDef {
   key: PatchField
   label: string
   type: "string" | "number" | "json"
@@ -594,7 +594,7 @@ function resolveUiColor(api: TuiPluginApi, color: unknown): DisplayColor | undef
   return undefined
 }
 
-function parentColor(api: TuiPluginApi, config: SidecarConfig, agent: string): DisplayColor | undefined {
+export function parentColor(api: TuiPluginApi, config: SidecarConfig, agent: string): DisplayColor | undefined {
   return resolveUiColor(api, (config.agents[agent] as AgentEntry | undefined)?.parent.color)
     ?? resolveUiColor(api, api.state.config.agent?.[agent]?.color)
     ?? fallbackAgentColor(api, agent)
@@ -941,7 +941,7 @@ function MenuDialog<Value>(props: {
   )
 }
 
-function showFieldList(api: TuiPluginApi, props: { title: string; options: FieldListOption[]; current?: string; titleColor?: DisplayColor }): Promise<FieldListChoice | undefined> {
+export function showFieldList(api: TuiPluginApi, props: { title: string; options: FieldListOption[]; current?: string; titleColor?: DisplayColor }): Promise<FieldListChoice | undefined> {
   return new Promise((resolve) => {
     let settled = false
     const done = (value: FieldListChoice | undefined, clear = true) => {
@@ -1804,15 +1804,21 @@ export async function editParentFields(
   config: SidecarConfig,
   agent: string,
   settings: WizardSettings,
+  /**
+   * Restricts the editor to these field keys (embedded hosts hide fields the
+   * surrounding app owns). Standalone passes nothing and gets every field.
+   */
+  fieldFilter?: ReadonlySet<string>,
 ): Promise<SidecarConfig> {
   const next = structuredClone(config)
   if (!next.agents[agent]) next.agents[agent] = { parent: {}, variants: {} }
-  let selectedField: string | undefined = EDITABLE_FIELDS[0]?.key
+  const fields = fieldFilter ? EDITABLE_FIELDS.filter((field) => fieldFilter.has(field.key)) : EDITABLE_FIELDS
+  let selectedField: string | undefined = fields[0]?.key
 
   while (true) {
     const parent = (next.agents[agent] as AgentEntry).parent
     const fieldOpts: FieldListOption[] = [
-      ...EDITABLE_FIELDS.map((field) => fieldListOption(api, next, { field, parent, mode: "parent", parentName: agent })),
+      ...fields.map((field) => fieldListOption(api, next, { field, parent, mode: "parent", parentName: agent })),
       { title: "< Back", value: "__back__", description: "Return to main menu", kind: "action" },
     ]
 
@@ -2549,7 +2555,7 @@ async function pickSelectionPreset(api: TuiPluginApi, config: SidecarConfig, age
   return picked
 }
 
-async function promptForField(
+export async function promptForField(
   api: TuiPluginApi,
   field: string,
   current: string | undefined,
