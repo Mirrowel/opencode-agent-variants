@@ -2298,7 +2298,7 @@ async function runDiagnostics(api: TuiPluginApi, config: SidecarConfig): Promise
   await showInfo(api, { title: "Diagnostics", message: lines.join("\n") })
 }
 
-async function viewDebugLog(api: TuiPluginApi): Promise<void> {
+export async function viewDebugLog(api: TuiPluginApi): Promise<void> {
   const file = debugLogPath(defaultConfigDir())
   if (!existsSync(file)) {
     await showInfo(api, { title: "Debug log", message: `No debug log found at ${file}` })
@@ -2311,7 +2311,7 @@ async function viewDebugLog(api: TuiPluginApi): Promise<void> {
   })
 }
 
-async function clearDebugLog(api: TuiPluginApi): Promise<void> {
+export async function clearDebugLog(api: TuiPluginApi): Promise<void> {
   const file = debugLogPath(defaultConfigDir())
   const confirmed = await showConfirm(api.ui, { title: "Clear debug log?", message: `Empty ${file}?` })
   if (!confirmed) return
@@ -2319,7 +2319,7 @@ async function clearDebugLog(api: TuiPluginApi): Promise<void> {
   api.ui.toast({ variant: "success", title: "Debug log cleared", message: file })
 }
 
-async function configBackupsMenu(api: TuiPluginApi, config: SidecarConfig): Promise<SidecarConfig> {
+export async function configBackupsMenu(api: TuiPluginApi, config: SidecarConfig): Promise<SidecarConfig> {
   const journal = loadBackupJournal()
   const action = await showMenu(api, {
     title: "Config backups",
