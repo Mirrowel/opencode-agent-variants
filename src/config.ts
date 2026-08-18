@@ -246,6 +246,54 @@ export function overlayProfilePatch(base: AgentPatch, profile: ProfilePatch | un
   }
   return next
 }
+
+// ---------------------------------------------------------------------------
+// Profile lens helpers (editing context). The lens decides which layer the
+// editors write to: the global default (the sidecar's agents tree) or a named
+// profile overlay (hot fields only). Reads merge profile-on-top-of-global for
+// display; writes create the profile containers on demand and prune them when
+// empty so sidecars stay clean.
+// ---------------------------------------------------------------------------
+
+export function profileVariantPatch(config: SidecarConfig, profile: string, agent: string, key: string): ProfilePatch | undefined {
+  return config.profiles[profile]?.agents[agent]?.variants[key]
+}
+
+export function profileParentPatch(config: SidecarConfig, profile: string, agent: string): ProfilePatch | undefined {
+  return config.profiles[profile]?.agents[agent]?.parent
+}
+
+/** Which layer a field value comes from in the current lens (display hint). */
+export function profileFieldSource(config: SidecarConfig, profile: string, agent: string, field: string, variantKey?: string): "profile" | "global" {
+  const patch = variantKey === undefined ? profileParentPatch(config, profile, agent) : profileVariantPatch(config, profile, agent, variantKey)
+  return patch !== undefined && (patch as Record<string, unknown>)[field] !== undefined ? "profile" : "global"
+}
+
+/**
+ * Sets (or clears, when value is undefined/"") a profile parent/variant field.
+ * Mirrors the global editor's semantics: changing the model drops a pinned
+ * variant override; clearing a field removes the override so the value falls
+ * back to the global default. Empty containers are pruned.
+ */
+export function setProfileFieldIn(
+  config: SidecarConfig,
+  profile: string,
+  agent: string,
+  target: { kind: "parent" } | { kind: "variant"; key: string },
+  field: string,
+  value: unknown,
+): SidecarConfig {
+  const next = structuredClone(config)
+  next.profiles[profile] ??= { agents: {} }
+  const entry = (next.profiles[profile]!.agents[agent] ??= { parent: {}, variants: {} })
+  const record = (target.kind === "parent" ? (entry.parent ??= {}) : (entry.variants[target.key] ??= {})) as Record<string, unknown>
+  if (field === "model" && record["model"] !== value) delete record["variant"]
+  if (value === undefined || value === "") delete record[field]
+  else record[field] = value
+  if (target.kind === "variant" && Object.keys(record).length === 0) delete entry.variants[target.key]
+  if (Object.keys(entry.parent).length === 0 && Object.keys(entry.variants).length === 0) delete next.profiles[profile]!.agents[agent]
+  return next
+}
 export type SidecarConfig = z.infer<typeof SidecarConfig>
 export type BackupOperation = z.infer<typeof BackupOperation>
 export type PatchBackupEntry = z.infer<typeof PatchBackupEntry>

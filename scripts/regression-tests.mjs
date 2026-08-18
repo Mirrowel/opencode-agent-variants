@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs"
 import { __testAssembleAgents, __testInternals } from "../dist/index.js"
-import { emptyConfig, inferredSelectionPreset, SELECTION_PRESETS, SidecarConfig, profileMatchesModel, resolveActiveProfile, overlayProfilePatch } from "../dist/config.js"
+import { emptyConfig, inferredSelectionPreset, SELECTION_PRESETS, SidecarConfig, profileMatchesModel, resolveActiveProfile, overlayProfilePatch, profileVariantPatch, profileParentPatch, profileFieldSource, setProfileFieldIn } from "../dist/config.js"
 import { currentPaletteCategory, declarePaletteCategory, reconcilePaletteCategories, __resetPaletteRegistry } from "../dist/palette-category.js"
 
 function assert(condition, message) {
@@ -337,6 +337,47 @@ function testProfiles() {
   const parsed = SidecarConfig.parse({})
   assert(parsed.profiles && typeof parsed.profiles === "object", "profiles defaults to a record")
   assert(parsed.routing.activeProfile === undefined, "activeProfile unset by default")
+
+  // Lens helpers: overlay reads, source hints, write routing, container pruning.
+  const lensConfig = emptyConfig()
+  lensConfig.agents.general = {
+    parent: { temperature: 0.2, model: "zai/glm-5.3" },
+    variants: { quick: { model: "zai/glm-5.2", temperature: 0.1 } },
+  }
+  lensConfig.profiles = { solo: { agents: { general: { parent: { temperature: 0.8 }, variants: { quick: { top_p: 0.5 } } } } } }
+  assert(profileVariantPatch(lensConfig, "solo", "general", "quick")?.top_p === 0.5, "profileVariantPatch reads a variant override")
+  assert(profileVariantPatch(lensConfig, "solo", "general", "missing") === undefined, "profileVariantPatch undefined for unpatched variant")
+  assert(profileParentPatch(lensConfig, "solo", "general")?.temperature === 0.8, "profileParentPatch reads a parent override")
+  assert(profileFieldSource(lensConfig, "solo", "general", "temperature") === "profile", "parent field source is profile when overridden")
+  assert(profileFieldSource(lensConfig, "solo", "general", "model") === "global", "parent field source is global when not overridden")
+  assert(profileFieldSource(lensConfig, "solo", "general", "top_p", "quick") === "profile", "variant field source is profile when overridden")
+  assert(profileFieldSource(lensConfig, "solo", "general", "model", "quick") === "global", "variant field source is global when not overridden")
+
+  const lensWritten = setProfileFieldIn(lensConfig, "solo", "general", { kind: "variant", key: "quick" }, "temperature", 0.7)
+  assert(lensWritten.profiles.solo.agents.general.variants.quick.temperature === 0.7, "lens write lands in the profile variant patch")
+  assert(lensConfig.profiles.solo.agents.general.variants.quick.temperature === undefined, "lens write does not mutate the source config")
+  assert(lensWritten.agents.general.variants.quick.temperature === 0.1, "lens write leaves the global default untouched")
+
+  const lensCleared = setProfileFieldIn(lensWritten, "solo", "general", { kind: "variant", key: "quick" }, "top_p", "")
+  assert(lensCleared.profiles.solo.agents.general.variants.quick.top_p === undefined, "empty value clears the profile override")
+
+  const lensPruned = setProfileFieldIn(lensCleared, "solo", "general", { kind: "variant", key: "quick" }, "temperature", "")
+  assert(lensPruned.profiles.solo.agents.general.variants.quick === undefined, "empty variant patch is pruned")
+  assert(lensPruned.profiles.solo.agents.general.parent.temperature === 0.8, "sibling patches survive pruning")
+
+  const lensCreated = setProfileFieldIn(emptyConfig(), "fresh", "build", { kind: "parent" }, "model", "zai/glm-5.3")
+  assert(lensCreated.profiles.fresh.agents.build.parent.model === "zai/glm-5.3", "lens write creates the profile/agent/parent chain on demand")
+
+  const lensVariantDrop = setProfileFieldIn(lensCreated, "fresh", "build", { kind: "parent" }, "model", "zai/glm-5.2")
+  assert(lensVariantDrop.profiles.fresh.agents.build.parent.model === "zai/glm-5.2", "model rewrite updates the profile patch")
+
+  // Model change drops a pinned variant override (mirrors global semantics).
+  const withVariant = setProfileFieldIn(lensCreated, "fresh", "build", { kind: "parent" }, "variant", "high")
+  assert(withVariant.profiles.fresh.agents.build.parent.variant === "high", "variant override set")
+  const modelChanged = setProfileFieldIn(withVariant, "fresh", "build", { kind: "parent" }, "model", "zai/glm-5.2")
+  assert(modelChanged.profiles.fresh.agents.build.parent.variant === undefined, "changing the model drops the pinned variant override")
+  const sameModel = setProfileFieldIn(withVariant, "fresh", "build", { kind: "parent" }, "model", "zai/glm-5.3")
+  assert(sameModel.profiles.fresh.agents.build.parent.variant === "high", "rewriting the same model keeps the variant override")
 }
 
 testProfiles()

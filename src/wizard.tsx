@@ -57,6 +57,10 @@ import {
   type Profile,
   PROFILE_FIELDS,
   type PatchField,
+  profileFieldSource,
+  profileParentPatch,
+  profileVariantPatch,
+  setProfileFieldIn,
 } from "./config.js"
 
 // Types for sidecar entries.
@@ -77,6 +81,8 @@ export type FieldListOption = {
   channelEnabled?: boolean
   previewColor?: DisplayColor
   kind?: "field" | "action"
+  /** Rendered gray and inert: not editable in the current lens (profile overlays are hot-fields only). */
+  muted?: boolean
 }
 export type DisplayColor = string | TuiPluginApi["theme"]["current"]["text"]
 type WizardSelectOption<Value = unknown> = TuiDialogSelectOption<Value> & {
@@ -988,7 +994,7 @@ function FieldListDialog(props: {
     const option = current()
     if (!option) return
     if (action !== "select" && option.kind === "action") return
-    if (action === "toggle" && !option.channel) return
+    if (action === "toggle" && (!option.channel || option.muted)) return
     props.onDone({ action, value: option.value })
   }
   const commandPrefix = `agent-variants.field-list.${Math.random().toString(36).slice(2)}`
@@ -1044,8 +1050,8 @@ function FieldListDialog(props: {
         <For each={props.options}>
           {(option, index) => {
             const active = createMemo(() => selected() === index())
-            const fg = createMemo(() => active() ? theme().background : option.restart ? theme().error : theme().text)
-            const valueFg = createMemo(() => active() ? theme().background : option.description.startsWith("inherited:") ? theme().success : option.description === "not set" ? theme().textMuted : theme().textMuted)
+            const fg = createMemo(() => (active() ? theme().background : option.muted ? theme().textMuted : option.restart ? theme().error : theme().text))
+            const valueFg = createMemo(() => (active() ? theme().background : option.description.startsWith("inherited:") ? theme().success : option.description === "not set" || option.muted ? theme().textMuted : theme().textMuted))
             return (
               <box
                 flexDirection="row"
@@ -1059,7 +1065,7 @@ function FieldListDialog(props: {
               >
                 <text width={24} flexShrink={0} fg={fg()} wrapMode="none"><b>{option.title}</b></text>
                 <text flexGrow={1} fg={valueFg()} wrapMode="none" overflow="hidden">{option.description}</text>
-                <Show when={option.channel}>
+                <Show when={option.channel && !option.muted}>
                   <box width={3} flexShrink={0} justifyContent="center">
                     <text fg={option.channelEnabled ? theme().success : theme().error}>■</text>
                   </box>
@@ -1812,40 +1818,64 @@ export async function editParentFields(
    * surrounding app owns). Standalone passes nothing and gets every field.
    */
   fieldFilter?: ReadonlySet<string>,
+  /** Profile lens: hot-field edits write a profile override instead of the global default. */
+  lens?: string,
 ): Promise<SidecarConfig> {
-  const next = structuredClone(config)
-  if (!next.agents[agent]) next.agents[agent] = { parent: {}, variants: {} }
+  let current = structuredClone(config)
+  if (!current.agents[agent]) current.agents[agent] = { parent: {}, variants: {} }
   const fields = fieldFilter ? EDITABLE_FIELDS.filter((field) => fieldFilter.has(field.key)) : EDITABLE_FIELDS
   let selectedField: string | undefined = fields[0]?.key
+  const isHot = (fieldKey: string) => (PROFILE_FIELDS as readonly string[]).includes(fieldKey)
 
   while (true) {
-    const parent = (next.agents[agent] as AgentEntry).parent
+    const parent = (current.agents[agent] as AgentEntry).parent
+    const profilePatch = lens ? profileParentPatch(current, lens, agent) : undefined
+    const view = profilePatch ? ({ ...parent, ...profilePatch } as AgentEntry["parent"]) : parent
     const fieldOpts: FieldListOption[] = [
-      ...fields.map((field) => fieldListOption(api, next, { field, parent, mode: "parent", parentName: agent })),
+      ...fields.map((field) => {
+        const row = fieldListOption(api, current, { field, parent: view, mode: "parent", parentName: agent })
+        if (lens) {
+          row.muted = !isHot(field.key)
+          if (row.muted) row.description = `${row.description} - global default only`
+          else if (profileFieldSource(current, lens, agent, field.key) === "profile") row.description = `${row.description} - from profile`
+        }
+        return row
+      }),
       { title: "< Back", value: "__back__", description: "Return to main menu", kind: "action" },
     ]
 
-    const pickedField = await showFieldList(api, { title: `Edit parent fields - ${agent}`, options: fieldOpts, current: selectedField, titleColor: parentColor(api, next, agent) })
+    const pickedField = await showFieldList(api, { title: lensTitle(`Edit parent fields - ${agent}`, lens), options: fieldOpts, current: selectedField, titleColor: parentColor(api, current, agent) })
     const field = pickedField?.value
-    if (!field || field === "__back__") return next
+    if (!field || field === "__back__") return current
     selectedField = field
 
     const picked = fieldDef(field)
     if (!picked) continue
     if (pickedField.action === "inspect") {
-      await showInfo(api, { title: picked.label, message: inspectParentField(api, next, agent, parent, picked.key) })
+      await showInfo(api, { title: picked.label, message: inspectParentField(api, current, agent, view, picked.key) })
       continue
     }
     if (pickedField.action === "toggle") {
+      if (await warnStructuralInProfile(api, lens)) continue
       parent.propagate = { ...(parent.propagate ?? {}), [picked.key]: !propagationEnabled(parent, picked.key) }
       markFieldChange(settings, picked.key, `${agent}: ${picked.label} propagation requires restart.`)
       if (!isHotReloadField(picked.key)) await warnRestartField(api, picked.label, "Propagation for this field affects cached task-list/UI metadata.")
       continue
     }
-    const value = await promptForField(api, field, formatInputValue(parent[picked.key]), { config: next, model: parent.model })
+    if (lens && !isHot(picked.key)) {
+      await warnStructuralInProfile(api, lens)
+      continue
+    }
+    const value = await promptForField(api, field, formatInputValue(view[picked.key]), { config: current, model: view.model })
     if (value === undefined) continue
-    const previous = parent[picked.key]
-    if (!fieldValueChanged(previous, value)) continue
+    const previous = view[picked.key]
+    if (!fieldValueChanged(previous as string | undefined, value)) continue
+    if (lens) {
+      // Profile write: empty input clears the override (falls back to the
+      // global default); the model-change rule drops a pinned variant.
+      current = setProfileFieldIn(current, lens, agent, { kind: "parent" }, picked.key, value)
+      continue
+    }
     setField(parent as Record<string, unknown>, picked.key, value)
     if (picked.key === "model" && previous !== value) delete parent.variant
     markFieldChange(settings, picked.key, `${agent}: ${picked.label} requires restart.`)
@@ -1950,7 +1980,7 @@ async function editVariantFields(
   return variant as VariantConfig
 }
 
-async function editVariant(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings): Promise<SidecarConfig> {
+async function editVariant(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings, lens?: string): Promise<SidecarConfig> {
   const agentsWithVariants = agentEntries(config).filter(([, e]) => Object.keys(e.variants).length > 0)
   if (agentsWithVariants.length === 0) {
     await showAlert(api.ui, { title: "No variants", message: "Add a variant first." })
@@ -1963,7 +1993,7 @@ async function editVariant(api: TuiPluginApi, config: SidecarConfig, settings: W
     description: `${Object.keys(e.variants).length} variant(s)`,
     color: parentColor(api, config, a),
   }))
-  const agent = await showMenu(api, { title: "Edit variant - pick agent", options: agentOpts })
+  const agent = await showMenu(api, { title: lensTitle("Edit variant - pick agent", lens), options: agentOpts })
   if (!agent) return config
 
   const entries = variantEntries(config.agents[agent] as AgentEntry)
@@ -1973,73 +2003,10 @@ async function editVariant(api: TuiPluginApi, config: SidecarConfig, settings: W
     description: modelDescription(v.model, config),
     color: variantColor(api, config, agent, k, v),
   }))
-  const key = await showMenu(api, { title: `Edit variant of "${agent}"`, options: varOpts })
+  const key = await showMenu(api, { title: lensTitle(`Edit variant of "${agent}"`, lens), options: varOpts })
   if (!key) return config
 
-  const next = structuredClone(config)
-  let selectedField: string | undefined = EDITABLE_FIELDS[0]?.key
-  while (true) {
-    const nextEntry = next.agents[agent] as AgentEntry
-    const parent = nextEntry.parent
-    const target = nextEntry.variants[key] as VariantConfig & Record<string, unknown>
-    const fieldOpts: FieldListOption[] = [
-      ...EDITABLE_FIELDS.map((field) => fieldListOption(api, next, { field, parent, variant: target, mode: "variant", parentName: agent, variantKey: key, alias: variantName(agent, key, target) })),
-      {
-        title: "Display name",
-        value: "name",
-        description: target.name ? String(target.name) : `default: ${agent}-${key}`,
-        restart: true,
-      },
-      { title: "< Back", value: "__back__", description: "Return to variant picker", kind: "action" },
-    ]
-
-    const pickedField = await showFieldList(api, { title: `Edit field - ${variantName(agent, key, target)}`, options: fieldOpts, current: selectedField, titleColor: variantColor(api, next, agent, key, target) })
-    const field = pickedField?.value
-    if (!field || field === "__back__") return next
-    selectedField = field
-
-    if (field === "name") {
-      if (pickedField.action === "inspect") {
-        await showInfo(api, { title: "Display name", message: inspectVariantName(agent, key, target) })
-        continue
-      }
-      const val = await showPrompt(api.ui, { title: "Display name", value: target.name as string | undefined, placeholder: `${agent}-${key}` })
-      if (val === undefined) continue
-      const previous = target.name
-      if (!fieldValueChanged(previous, val)) continue
-      if (val === "") delete target.name
-      if (val !== "") target.name = val
-      markRestart(settings, `${agent}.${key}: display name requires restart.`)
-      await warnRestartField(api, "Display name", "Generated agent names are cached by OpenCode's task list.")
-      continue
-    }
-
-    if (!EDITABLE_FIELD_KEYS.has(field as PatchField)) continue
-    const picked = fieldDef(field)
-    if (!picked) continue
-    if (pickedField.action === "inspect") {
-      await showInfo(api, { title: picked.label, message: inspectVariantField(api, next, agent, key, nextEntry.parent, target, picked.key) })
-      continue
-    }
-    if (pickedField.action === "toggle") {
-      target.inherit = { ...(target.inherit ?? {}), [picked.key]: !inheritanceEnabled(target, picked.key) }
-      markFieldChange(settings, picked.key, `${variantName(agent, key, target)}: ${picked.label} inheritance requires restart.`)
-      if (!isHotReloadField(picked.key)) await warnRestartField(api, picked.label, "Inheritance for this field affects cached task-list/UI metadata.")
-      continue
-    }
-    const val = await promptForField(api, field, formatInputValue(target[picked.key]), {
-      config: next,
-      model: effectiveVariantPatch(nextEntry.parent, target).model,
-      descriptionVariant: { agent, key, variant: target },
-    })
-    if (val === undefined) continue
-    const previous = target[picked.key]
-    if (!fieldValueChanged(previous, val)) continue
-    setField(target, picked.key, val)
-    if (picked.key === "model" && previous !== val) delete target.variant
-    markFieldChange(settings, picked.key, `${variantName(agent, key, target)}: ${picked.label} requires restart.`)
-    if (!isHotReloadField(picked.key)) await warnRestartField(api, picked.label, "This field is stored in OpenCode's cached agent/task-list metadata.")
-  }
+  return editVariantFor(api, config, settings, agent, key, lens)
 }
 
 async function toggleDisable(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings): Promise<SidecarConfig> {
@@ -2780,20 +2747,51 @@ async function pickProfileActivation(api: TuiPluginApi, config: SidecarConfig): 
   return next
 }
 
-/** Match-rule editor for one profile. */
+/** Match-rule editor for one profile: activation mode (auto vs manual only) + rule details. */
 async function profileMatchEditor(api: TuiPluginApi, config: SidecarConfig, name: string): Promise<SidecarConfig> {
   const next = structuredClone(config)
   const profile = next.profiles[name]!
   while (true) {
     const match = profile.match
     const options: WizardSelectOption<string>[] = [
-      { title: "Model", value: "model", description: match?.model ?? "(no rule - manual activation only)" },
-      { title: "Variant filter", value: "variant", description: match?.variant === undefined ? "(any variant)" : Array.isArray(match.variant) ? match.variant.join(", ") : match.variant },
-      { title: "Remove rule (manual activation only)", value: "__remove__", description: "", danger: !match },
-      { title: "< Back", value: "__back__", description: "" },
+      {
+        title: "Activation mode",
+        value: "mode",
+        description: match ? "automatic (model + variant match)" : "manual only",
+        help: "Automatic profiles activate when the primary session's model + variant matches the rule below (several matching: last one wins). Manual-only profiles never activate on their own - they apply only through a runtime pin (Profiles > Activation).",
+      },
     ]
-    const picked = await showMenu(api, { title: `Profile "${name}" - activation rule`, options })
+    if (match) {
+      options.push(
+        { title: "Model", value: "model", description: match.model },
+        { title: "Variant filter", value: "variant", description: match.variant === undefined ? "(any variant)" : Array.isArray(match.variant) ? match.variant.join(", ") : match.variant },
+        { title: "Switch to manual only", value: "__remove__", description: "removes the match rule", danger: true },
+      )
+    }
+    options.push({ title: "< Back", value: "__back__", description: "" })
+    const picked = await showMenu(api, { title: `Profile "${name}" - activation`, options })
     if (!picked || picked === "__back__") return next
+    if (picked === "mode") {
+      const mode = await showMenu(api, {
+        title: `Profile "${name}" - activation mode`,
+        options: [
+          { title: "Automatic on model + variant match", value: "auto", description: match ? "current" : "", help: "The profile activates whenever the primary session's model + variant matches the rule. When several profiles match, the last one wins." },
+          { title: "Manual only", value: "manual", description: match ? "" : "current", help: "The profile never activates automatically. Apply it with a runtime pin (Profiles > Activation) or switch the editing context to it." },
+          { title: "< Cancel", value: "__cancel__", description: "" },
+        ],
+      })
+      if (!mode || mode === "__cancel__") continue
+      if (mode === "manual") {
+        delete profile.match
+        continue
+      }
+      if (!profile.match?.model) {
+        const value = await promptForField(api, "model", undefined, { config: next, model: undefined, includeModelPresets: false })
+        if (value === undefined || value === "") continue
+        profile.match = { model: String(value) }
+      }
+      continue
+    }
     if (picked === "__remove__") {
       delete profile.match
       continue
@@ -2868,6 +2866,99 @@ async function profileAgentEditor(api: TuiPluginApi, config: SidecarConfig, name
       }
       continue
     }
+  }
+}
+
+/** Dialog title suffix so the active lens is always visible while editing. */
+export function lensTitle(base: string, lens: string | undefined): string {
+  return lens ? `${base} [profile: ${lens}]` : base
+}
+
+/**
+ * Structural changes (add/delete/disable variant, display name, description,
+ * color) are global-default only. Returns true when a lens was set and the
+ * caller should abort the structural action.
+ */
+export async function warnStructuralInProfile(api: TuiPluginApi, lens: string | undefined): Promise<boolean> {
+  if (!lens) return false
+  await showAlert(api.ui, {
+    title: `Not editable in profile "${lens}"`,
+    message: `Structural changes (add/delete/disable variant, display name, description, color) live in the global default.\n\nSwitch the profile context back to Global default to change them.`,
+  })
+  return true
+}
+
+/**
+ * Profile context switcher pop-up: select the editing lens, add, rename, or
+ * delete a profile. Selecting a row closes the pop-up and every subsequent
+ * editor renders/writes in that profile. The full editor (match rules,
+ * per-agent patches) lives in the Profiles menu - this pop-up is for switching.
+ * Returns undefined when cancelled; the lens resets to the global default on
+ * every wizard open by design.
+ */
+export async function profileSwitcher(
+  api: TuiPluginApi,
+  config: SidecarConfig,
+  lens: string | undefined,
+): Promise<{ config: SidecarConfig; lens: string | undefined } | undefined> {
+  let current = config
+  let currentLens = lens
+  while (true) {
+    const manual = current.routing.activeProfile
+    const options: WizardSelectOption<string>[] = [
+      {
+        title: currentLens === undefined ? "* Global default" : "Global default",
+        value: "__global__",
+        description: "base layer - every field editable",
+        help: "The sidecar's agents tree. Structural and hot fields are both editable here. This is what sessions use when no profile is active.",
+      },
+      ...Object.entries(current.profiles).map(([name, profile]): WizardSelectOption<string> => ({
+        title: currentLens === name ? `* ${name}` : name,
+        value: `select:${name}`,
+        description: `${profileMatchSummary(profile)} - ${Object.keys(profile.agents).length} agent(s)${manual === name ? " - runtime pinned" : ""}`,
+        help: `Enter switches the editing context to profile "${name}". Edits write hot-field overrides on top of the global default; structural rows gray out. Selecting does not change what live sessions use - that is the runtime pin (Profiles > Activation).`,
+      })),
+      { title: "+ Add profile...", value: "__add__", description: "create and switch to it", danger: true, help: "Creates a new profile and immediately switches the editing context to it." },
+      { title: "Rename...", value: "__rename__", description: "change a profile's name" },
+      { title: "Delete...", value: "__delete__", description: "remove a profile", danger: true },
+      { title: "< Back", value: "__back__", description: "" },
+    ]
+    const picked = await showMenu(api, { title: "Profile context", options })
+    if (!picked || picked === "__back__") return undefined
+    if (picked === "__global__") return { config: current, lens: undefined }
+    if (picked.startsWith("select:")) return { config: current, lens: picked.slice("select:".length) }
+    if (picked === "__add__") {
+      const name = await showPrompt(api.ui, { title: "New profile name", placeholder: "e.g. sol-heavy, cheap-mode" })
+      if (name === undefined || name.trim() === "" || current.profiles[name.trim()]) continue
+      current = structuredClone(current)
+      current.profiles[name.trim()] = { agents: {} }
+      return { config: current, lens: name.trim() }
+    }
+    const names = Object.keys(current.profiles)
+    if (names.length === 0) {
+      await showAlert(api.ui, { title: "No profiles", message: "Create a profile first (+ Add profile...)." })
+      continue
+    }
+    const target = await showMenu(api, {
+      title: picked === "__rename__" ? "Rename which profile?" : "Delete which profile?",
+      options: [...names.map((name) => ({ title: name, value: name, description: profileMatchSummary(current.profiles[name]!) })), { title: "< Cancel", value: "__cancel__", description: "" }],
+    })
+    if (!target || target === "__cancel__") continue
+    if (picked === "__rename__") {
+      const newName = await showPrompt(api.ui, { title: `Rename "${target}"`, value: target, placeholder: target })
+      if (newName === undefined || newName.trim() === "" || newName.trim() === target || current.profiles[newName.trim()]) continue
+      current = structuredClone(current)
+      current.profiles = Object.fromEntries(Object.entries(current.profiles).map(([key, value]) => [key === target ? newName.trim() : key, value]))
+      if (current.routing.activeProfile === target) current.routing.activeProfile = newName.trim()
+      if (currentLens === target) currentLens = newName.trim()
+      continue
+    }
+    const confirmed = await showConfirm(api.ui, { title: `Delete profile "${target}"?`, message: "The profile and all its overrides are removed from the sidecar. This cannot be undone (backups still apply)." })
+    if (!confirmed) continue
+    current = structuredClone(current)
+    delete current.profiles[target]
+    if (current.routing.activeProfile === target) delete current.routing.activeProfile
+    if (currentLens === target) currentLens = undefined
   }
 }
 
@@ -2979,11 +3070,17 @@ async function profileEditorFlow(api: TuiPluginApi, config: SidecarConfig, setti
   }
 }
 
-export async function mainMenu(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings, host?: WizardHost): Promise<SidecarConfig> {
+export async function mainMenu(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings, host?: WizardHost, lens?: string): Promise<SidecarConfig> {
   const agentCount = Object.keys(config.agents).length
   const vCount = variantCount(config)
 
   const opts: WizardSelectOption<string>[] = [
+    {
+      title: `Profile context: ${lens ?? "Global default"}`,
+      value: "__lens__",
+      description: lens ? "hot fields only - structural rows grayed out" : "every field editable",
+      help: "Switch which layer the editors write to: the global default (full rights) or a named profile overlay (hot-reload fields only). Selecting a profile here changes editing only - live sessions follow the runtime activation (Profiles > Activation).",
+    },
     { title: "Add variant", value: "add", description: "Create a new agent variant", danger: true, help: "Creates a new variant under a parent subagent. New task-list aliases require restart before they appear." },
     { title: "Model presets", value: "models", description: `${Object.keys(config.models).length} shortcut(s)`, help: "Create reusable model shortcuts like light or heavy. Presets appear in Model pickers and can include model, model variant, temperature, top_p, and options." },
     { title: "Profiles", value: "profiles", description: `${Object.keys(config.profiles).length} profile(s)${config.routing.activeProfile ? `, pinned: ${config.routing.activeProfile}` : ""}`, help: "Conditional overrides applied on top of the global default, activated manually or by matching the primary session model. Profiles may only edit hot-reload fields (model, variant, temperature, top_p, prompt patches, options); structural changes (description, color, add/delete/disable) stay in the global default." },
@@ -2999,40 +3096,48 @@ export async function mainMenu(api: TuiPluginApi, config: SidecarConfig, setting
   ]
 
   const action = await showMenu(api, {
-    title: "Agent Variants",
+    title: lensTitle("Agent Variants", lens),
     options: opts,
   })
 
   switch (action) {
+    case "__lens__": {
+      const switched = await profileSwitcher(api, config, lens)
+      if (switched) return mainMenu(api, switched.config, settings, host, switched.lens)
+      return mainMenu(api, config, settings, host, lens)
+    }
     case "add":
-      return mainMenu(api, await addVariant(api, config, settings), settings)
+      if (await warnStructuralInProfile(api, lens)) return mainMenu(api, config, settings, host, lens)
+      return mainMenu(api, await addVariant(api, config, settings), settings, host, lens)
     case "models":
-      return mainMenu(api, await manageModelPresets(api, config), settings)
+      return mainMenu(api, await manageModelPresets(api, config), settings, host, lens)
     case "profiles":
-      return mainMenu(api, await manageProfiles(api, config, settings), settings)
+      return mainMenu(api, await manageProfiles(api, config, settings), settings, host, lens)
     case "edit-parent":
-      return editParentFlow(api, config, settings)
+      return editParentFlow(api, config, settings, lens)
     case "edit-variant":
-      return mainMenu(api, await editVariant(api, config, settings), settings)
+      return mainMenu(api, await editVariant(api, config, settings, lens), settings, host, lens)
     case "toggle":
-      return mainMenu(api, await toggleDisable(api, config, settings), settings)
+      if (await warnStructuralInProfile(api, lens)) return mainMenu(api, config, settings, host, lens)
+      return mainMenu(api, await toggleDisable(api, config, settings), settings, host, lens)
     case "info":
       await showWizardInfo(api)
-      return mainMenu(api, config, settings)
+      return mainMenu(api, config, settings, host, lens)
     case "diagnostics":
       await runDiagnostics(api, config)
-      return mainMenu(api, config, settings)
+      return mainMenu(api, config, settings, host, lens)
     case "advanced":
-      return mainMenu(api, await debugAdvancedMenu(api, config, settings), settings)
+      return mainMenu(api, await debugAdvancedMenu(api, config, settings), settings, host, lens)
     case "delete":
-      return mainMenu(api, await deleteVariant(api, config, settings), settings)
+      if (await warnStructuralInProfile(api, lens)) return mainMenu(api, config, settings, host, lens)
+      return mainMenu(api, await deleteVariant(api, config, settings), settings, host, lens)
     case "preview":
       await previewConfig(api, config)
-      return mainMenu(api, config, settings)
+      return mainMenu(api, config, settings, host, lens)
     case "save":
       if (host?.onSave) {
-        const action = await host.onSave(config, settings)
-        if (action === "continue") return mainMenu(api, config, settings, host)
+        const saveAction = await host.onSave(config, settings)
+        if (saveAction === "continue") return mainMenu(api, config, settings, host, lens)
         return config
       }
       await saveConfig(api, config, settings)
@@ -3042,7 +3147,7 @@ export async function mainMenu(api: TuiPluginApi, config: SidecarConfig, setting
   }
 }
 
-async function editParentFlow(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings): Promise<SidecarConfig> {
+async function editParentFlow(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings, lens?: string): Promise<SidecarConfig> {
   const agents = selectableParentAgents(api, config, settings)
   const opts: WizardSelectOption<string>[] = agents.map((a) => {
     const entry = config.agents[a] as AgentEntry | undefined
@@ -3060,11 +3165,11 @@ async function editParentFlow(api: TuiPluginApi, config: SidecarConfig, settings
     description: "Return to main menu",
   })
 
-  const agent = await showMenu(api, { title: "Edit parent fields - pick agent", options: opts })
-  if (!agent || agent === "__back__") return mainMenu(api, config, settings)
+  const agent = await showMenu(api, { title: lensTitle("Edit parent fields - pick agent", lens), options: opts })
+  if (!agent || agent === "__back__") return mainMenu(api, config, settings, undefined, lens)
 
-  const updated = await editParentFields(api, config, agent, settings)
-  return mainMenu(api, updated, settings)
+  const updated = await editParentFields(api, config, agent, settings, undefined, lens)
+  return mainMenu(api, updated, settings, undefined, lens)
 }
 
 async function debugAdvancedMenu(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings): Promise<SidecarConfig> {
@@ -3214,6 +3319,8 @@ export async function editVariantFor(
   settings: WizardSettings,
   agent: string,
   key: string,
+  /** Profile lens: hot-field edits write a profile override instead of the global default. */
+  lens?: string,
 ): Promise<SidecarConfig> {
   const entry = config.agents[agent] as AgentEntry | undefined
   const variant = entry?.variants[key] as (VariantConfig & Record<string, unknown>) | undefined
@@ -3222,26 +3329,40 @@ export async function editVariantFor(
     return config
   }
 
-  const next = structuredClone(config)
+  let current = structuredClone(config)
   let selectedField: string | undefined = EDITABLE_FIELDS[0]?.key
   while (true) {
-    const nextEntry = next.agents[agent] as AgentEntry
+    const nextEntry = current.agents[agent] as AgentEntry
     const parent = nextEntry.parent
     const target = nextEntry.variants[key] as VariantConfig & Record<string, unknown>
+    const profilePatch = lens ? profileVariantPatch(current, lens, agent, key) : undefined
+    // Lens view: profile hot-field overrides on top of the global default, so
+    // rows and prompts show the effective values with the right source.
+    const view = profilePatch ? ({ ...target, ...profilePatch } as VariantConfig & Record<string, unknown>) : target
+    const isHot = (fieldKey: string) => (PROFILE_FIELDS as readonly string[]).includes(fieldKey)
     const fieldOpts: FieldListOption[] = [
-      ...EDITABLE_FIELDS.map((field) => fieldListOption(api, next, { field, parent, variant: target, mode: "variant", parentName: agent, variantKey: key, alias: variantName(agent, key, target) })),
+      ...EDITABLE_FIELDS.map((field) => {
+        const row = fieldListOption(api, current, { field, parent, variant: view, mode: "variant", parentName: agent, variantKey: key, alias: variantName(agent, key, target) })
+        if (lens) {
+          row.muted = !isHot(field.key)
+          if (row.muted) row.description = `${row.description} - global default only`
+          else if (profileFieldSource(current, lens, agent, field.key, key) === "profile") row.description = `${row.description} - from profile`
+        }
+        return row
+      }),
       {
         title: "Display name",
         value: "name",
         description: target.name ? String(target.name) : `default: ${agent}-${key}`,
         restart: true,
+        muted: lens !== undefined,
       },
       { title: "< Back", value: "__back__", description: "Return", kind: "action" },
     ]
 
-    const pickedField = await showFieldList(api, { title: `Edit field - ${variantName(agent, key, target)}`, options: fieldOpts, current: selectedField, titleColor: variantColor(api, next, agent, key, target) })
+    const pickedField = await showFieldList(api, { title: lensTitle(`Edit field - ${variantName(agent, key, target)}`, lens), options: fieldOpts, current: selectedField, titleColor: variantColor(api, current, agent, key, target) })
     const field = pickedField?.value
-    if (!field || field === "__back__") return next
+    if (!field || field === "__back__") return current
     selectedField = field
 
     if (field === "name") {
@@ -3249,6 +3370,7 @@ export async function editVariantFor(
         await showInfo(api, { title: "Display name", message: inspectVariantName(agent, key, target) })
         continue
       }
+      if (await warnStructuralInProfile(api, lens)) continue
       const val = await showPrompt(api.ui, { title: "Display name", value: target.name as string | undefined, placeholder: `${agent}-${key}` })
       if (val === undefined) continue
       const previous = target.name
@@ -3264,23 +3386,34 @@ export async function editVariantFor(
     const picked = fieldDef(field)
     if (!picked) continue
     if (pickedField.action === "inspect") {
-      await showInfo(api, { title: picked.label, message: inspectVariantField(api, next, agent, key, nextEntry.parent, target, picked.key) })
+      await showInfo(api, { title: picked.label, message: inspectVariantField(api, current, agent, key, nextEntry.parent, view, picked.key) })
       continue
     }
     if (pickedField.action === "toggle") {
+      if (await warnStructuralInProfile(api, lens)) continue
       target.inherit = { ...(target.inherit ?? {}), [picked.key]: !inheritanceEnabled(target, picked.key) }
       markFieldChange(settings, picked.key, `${variantName(agent, key, target)}: ${picked.label} inheritance requires restart.`)
       if (!isHotReloadField(picked.key)) await warnRestartField(api, picked.label, "Inheritance for this field affects cached task-list/UI metadata.")
       continue
     }
-    const val = await promptForField(api, field, formatInputValue(target[picked.key]), {
-      config: next,
-      model: effectiveVariantPatch(nextEntry.parent, target).model,
-      descriptionVariant: { agent, key, variant: target },
+    if (lens && !isHot(picked.key)) {
+      await warnStructuralInProfile(api, lens)
+      continue
+    }
+    const val = await promptForField(api, field, formatInputValue(view[picked.key]), {
+      config: current,
+      model: effectiveVariantPatch(nextEntry.parent, view).model,
+      descriptionVariant: { agent, key, variant: view },
     })
     if (val === undefined) continue
-    const previous = target[picked.key]
-    if (!fieldValueChanged(previous, val)) continue
+    const previous = view[picked.key]
+    if (!fieldValueChanged(previous as string | undefined, val)) continue
+    if (lens) {
+      // Profile write: empty input clears the override (falls back to the
+      // global default); the model-change rule drops a pinned variant.
+      current = setProfileFieldIn(current, lens, agent, { kind: "variant", key }, picked.key, val)
+      continue
+    }
     setField(target, picked.key, val)
     if (picked.key === "model" && previous !== val) delete target.variant
     markFieldChange(settings, picked.key, `${variantName(agent, key, target)}: ${picked.label} requires restart.`)
