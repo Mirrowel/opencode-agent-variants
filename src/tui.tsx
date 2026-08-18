@@ -12,6 +12,7 @@
 import type { TuiPlugin } from "@opencode-ai/plugin/tui"
 import { defaultSidecarPath, loadSidecar } from "./config.js"
 import { applyWizardUiSettings, mainMenu, newWizardSettings } from "./wizard.js"
+import { currentPaletteCategory, declarePaletteCategory, schedulePaletteReconcile } from "./palette-category.js"
 
 function registerConfigureCommand(api: import("@opencode-ai/plugin/tui").TuiPluginApi, run: () => Promise<void>) {
   const command = {
@@ -19,10 +20,12 @@ function registerConfigureCommand(api: import("@opencode-ai/plugin/tui").TuiPlug
     name: "agent-variants.configure",
     title: "Agent Variants: Configure",
     desc: "Manage agent model variants",
-    category: "Plugins",
+    category: "",
     slashName: "agent-variants",
     run,
   }
+  command.category = declarePaletteCategory("Agent Variants", command)
+  schedulePaletteReconcile()
   const apiWithKeymap = api as import("@opencode-ai/plugin/tui").TuiPluginApi & {
     keymap?: {
       registerLayer?: (layer: { commands: Array<typeof command>; bindings: unknown[] }) => () => void
@@ -36,7 +39,7 @@ function registerConfigureCommand(api: import("@opencode-ai/plugin/tui").TuiPlug
       title: "Agent Variants: Configure",
       value: "agent-variants.configure",
       description: "Manage agent model variants",
-      category: "Plugins",
+      category: currentPaletteCategory(),
       slash: {
         name: "agent-variants",
       },

@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs"
 import { __testAssembleAgents, __testInternals } from "../dist/index.js"
 import { emptyConfig, inferredSelectionPreset, SELECTION_PRESETS } from "../dist/config.js"
+import { currentPaletteCategory, declarePaletteCategory, reconcilePaletteCategories, __resetPaletteRegistry } from "../dist/palette-category.js"
 
 function assert(condition, message) {
   if (!condition) throw new Error(message)
@@ -13,6 +14,43 @@ function hardDiagnostics(assembled) {
 function assertGenerated(assembled, cfg, alias) {
   assert(cfg.agent[alias], `${alias} should be generated`)
   assert(assembled.virtualRoutes.has(alias), `${alias} should have a runtime route`)
+}
+
+function testPaletteCategory() {
+  __resetPaletteRegistry()
+
+  // Single plugin declared: own name, applied to its command immediately.
+  const avCommand = { category: "" }
+  const first = declarePaletteCategory("Agent Variants", avCommand)
+  assert(first === "Agent Variants", "lone declaration returns its own name")
+  assert(avCommand.category === "Agent Variants", "lone declaration stamps its command")
+
+  // Second plugin declares later: both commands mutate to the identical join.
+  const studioCommand = { category: "" }
+  const second = declarePaletteCategory("Config Studio", studioCommand)
+  assert(second === "Agent Variants & Config Studio", "second declaration returns the join")
+  assert(avCommand.category === "Agent Variants & Config Studio", "earlier command mutated to the join")
+  assert(studioCommand.category === "Agent Variants & Config Studio", "new command stamped with the join")
+  assert(currentPaletteCategory() === "Agent Variants & Config Studio", "live getter matches")
+
+  // Third plugin: deterministic alphabetical three-way join everywhere.
+  const soukCommand = { category: "" }
+  declarePaletteCategory("Souk", soukCommand)
+  const expected = "Agent Variants, Config Studio & Souk"
+  assert(soukCommand.category === expected, "three-way join stamped")
+  assert(avCommand.category === expected && studioCommand.category === expected, "all earlier commands mutated to the three-way join")
+
+  // Duplicate declaration of a known label: no duplicate in the join.
+  declarePaletteCategory("Agent Variants")
+  assert(currentPaletteCategory() === expected, "duplicate label does not duplicate in the join")
+
+  // Reconcile is idempotent and repairs stale categories.
+  avCommand.category = "stale"
+  reconcilePaletteCategories()
+  assert(avCommand.category === expected, "reconcile repairs stale categories")
+
+  __resetPaletteRegistry()
+  assert(currentPaletteCategory() === "", "reset clears the registry")
 }
 
 function testPartialProviderOverrideWithVariants() {
@@ -245,6 +283,7 @@ function testSelectionTierInference() {
   assert(SELECTION_PRESETS[0]?.key === "basic", "basic should be the first capability preset below light")
 }
 
+testPaletteCategory()
 testPartialProviderOverrideWithVariants()
 testMissingCustomProviderModelIsDeferred()
 testMalformedModelShapeStillSkips()
