@@ -53,6 +53,9 @@ import {
   type FullBackupEntry,
   type SidecarConfig,
   type VariantConfig,
+  type ProfilePatch,
+  type Profile,
+  PROFILE_FIELDS,
   type PatchField,
 } from "./config.js"
 
@@ -2684,6 +2687,298 @@ function formatInputValue(value: unknown): string | undefined {
 
 // Main menu loop.
 
+// ---------------------------------------------------------------------------
+// Profiles: conditional hot-field overlays activated manually or by matching
+// the primary session model. Profiles sit above the global default layer and
+// may only override hot-reload fields.
+// ---------------------------------------------------------------------------
+
+const PROFILE_FIELD_DEFS: FieldDef[] = EDITABLE_FIELDS.filter((field) => (PROFILE_FIELDS as readonly string[]).includes(field.key))
+
+function profilePatchIsEmpty(patch: ProfilePatch | undefined): boolean {
+  if (!patch) return true
+  return Object.values(patch).every((value) => value === undefined)
+}
+
+function setProfileField(patch: ProfilePatch, key: string, value: unknown): ProfilePatch {
+  const next = { ...patch }
+  if (value === "" || value === undefined) {
+    delete (next as Record<string, unknown>)[key]
+  } else {
+    ;(next as Record<string, unknown>)[key] = value
+  }
+  return next
+}
+
+function profileFieldDescription(patch: ProfilePatch | undefined, key: string): string {
+  const value = (patch as Record<string, unknown> | undefined)?.[key]
+  if (value === undefined) return "(inherits global default)"
+  if (typeof value === "string") return truncate(value, 46)
+  return truncate(JSON.stringify(value), 46)
+}
+
+/** Hot-fields-only field list editor for a profile patch object. */
+async function profilePatchEditor(api: TuiPluginApi, title: string, patch: ProfilePatch, context?: { model: unknown }): Promise<ProfilePatch | undefined> {
+  let current = patch
+  while (true) {
+    const options: FieldListOption[] = PROFILE_FIELD_DEFS.map((field) => ({
+      title: field.label,
+      value: field.key,
+      description: profileFieldDescription(current, field.key),
+      kind: "field" as const,
+    }))
+    options.push({ title: "Clear all profile fields", value: "__clear__", description: "remove every override in this patch", kind: "action" })
+    options.push({ title: "< Back", value: "__back__", description: "", kind: "action" })
+    const picked = await showFieldList(api, { title, options })
+    if (!picked || picked.value === "__back__") return current
+    if (picked.value === "__clear__") {
+      current = {}
+      continue
+    }
+    if (picked.action === "inspect") {
+      await showWizardInfo(api)
+      continue
+    }
+    const field = PROFILE_FIELD_DEFS.find((item) => item.key === picked.value)
+    if (!field) continue
+    const value = await promptForField(api, field.key, (current as Record<string, unknown>)[field.key] as string | undefined, {
+      config: loadSidecar(defaultSidecarPath()),
+      model: context?.model,
+      includeModelPresets: field.key === "model",
+    })
+    if (value === undefined) continue
+    current = setProfileField(current, field.key, value)
+  }
+}
+
+function profileMatchSummary(profile: Profile): string {
+  if (!profile.match) return "manual activation only"
+  const variant = profile.match.variant
+  const variantText = variant === undefined ? "any variant" : Array.isArray(variant) ? variant.join("/") : variant
+  return `auto on ${profile.match.model} (${variantText})`
+}
+
+/** Pick the active-profile mode: auto matching or a manual pin. */
+async function pickProfileActivation(api: TuiPluginApi, config: SidecarConfig): Promise<SidecarConfig> {
+  const options: WizardSelectOption<string>[] = [
+    { title: "Automatic (match primary model)", value: "__auto__", description: config.routing.activeProfile ? "" : "current", help: "Profiles with a match rule activate based on the primary session's selected model; last matching profile wins." },
+  ]
+  for (const name of Object.keys(config.profiles)) {
+    options.push({
+      title: `Pin: ${name}`,
+      value: name,
+      description: config.routing.activeProfile === name ? "current" : profileMatchSummary(config.profiles[name]!),
+      help: `Manually pins profile "${name}". A manual pin wins over automatic matching and applies everywhere immediately (hot).`,
+    })
+  }
+  options.push({ title: "< Back", value: "__back__", description: "" })
+  const picked = await showMenu(api, { title: "Profile activation", options })
+  if (!picked || picked === "__back__") return config
+  const next = structuredClone(config)
+  if (picked === "__auto__") delete next.routing.activeProfile
+  else next.routing.activeProfile = picked
+  return next
+}
+
+/** Match-rule editor for one profile. */
+async function profileMatchEditor(api: TuiPluginApi, config: SidecarConfig, name: string): Promise<SidecarConfig> {
+  const next = structuredClone(config)
+  const profile = next.profiles[name]!
+  while (true) {
+    const match = profile.match
+    const options: WizardSelectOption<string>[] = [
+      { title: "Model", value: "model", description: match?.model ?? "(no rule - manual activation only)" },
+      { title: "Variant filter", value: "variant", description: match?.variant === undefined ? "(any variant)" : Array.isArray(match.variant) ? match.variant.join(", ") : match.variant },
+      { title: "Remove rule (manual activation only)", value: "__remove__", description: "", danger: !match },
+      { title: "< Back", value: "__back__", description: "" },
+    ]
+    const picked = await showMenu(api, { title: `Profile "${name}" - activation rule`, options })
+    if (!picked || picked === "__back__") return next
+    if (picked === "__remove__") {
+      delete profile.match
+      continue
+    }
+    if (picked === "model") {
+      const value = await promptForField(api, "model", profile.match?.model, { config: next, model: undefined, includeModelPresets: false })
+      if (value === undefined) continue
+      profile.match = { ...(profile.match ?? { model: "" }), model: String(value) }
+      continue
+    }
+    if (picked === "variant") {
+      if (!profile.match?.model) {
+        await showAlert(api.ui, { title: "Set a model first", message: "The variant filter matches against the rule's model." })
+        continue
+      }
+      const value = await promptForField(api, "variant", profile.match?.variant as string | undefined, { config: next, model: profile.match.model })
+      if (value === undefined) continue
+      const base = { ...(profile.match ?? { model: "" }) }
+      if (value === "") delete base.variant
+      else base.variant = String(value)
+      profile.match = base
+      continue
+    }
+  }
+}
+
+/** Per-agent profile editor: parent hot fields + per-variant hot fields. */
+async function profileAgentEditor(api: TuiPluginApi, config: SidecarConfig, name: string, agent: string): Promise<SidecarConfig> {
+  const next = structuredClone(config)
+  next.profiles[name]!.agents[agent] ??= { parent: {}, variants: {} }
+  const entry = next.profiles[name]!.agents[agent]!
+  while (true) {
+    const options: WizardSelectOption<string>[] = [
+      { title: "Parent fields", value: "parent", description: profilePatchIsEmpty(entry.parent) ? "(no overrides)" : `${Object.values(entry.parent).filter((v) => v !== undefined).length} override(s)`, help: "Hot fields applied to base calls of this agent (task calls without a variant) and inherited by variants as usual." },
+      { title: "Variant overrides", value: "variants", description: `${Object.keys(entry.variants).length} patched`, help: "Hot-field overrides for specific variants of this agent. The profile value replaces the global default for that field." },
+      { title: "Remove agent from profile", value: "__remove__", description: "", danger: true },
+      { title: "< Back", value: "__back__", description: "" },
+    ]
+    const picked = await showMenu(api, { title: `Profile "${name}" - ${agent}`, options })
+    if (!picked || picked === "__back__") {
+      if (profilePatchIsEmpty(entry.parent) && Object.keys(entry.variants).length === 0) delete next.profiles[name]!.agents[agent]
+      return next
+    }
+    if (picked === "__remove__") {
+      delete next.profiles[name]!.agents[agent]
+      return next
+    }
+    if (picked === "parent") {
+      const patch = await profilePatchEditor(api, `Profile "${name}" - ${agent} - parent`, entry.parent ?? {})
+      if (patch) entry.parent = patch
+      continue
+    }
+    if (picked === "variants") {
+      const globalVariants = Object.entries(config.agents[agent]?.variants ?? {})
+      if (globalVariants.length === 0) {
+        await showAlert(api.ui, { title: "No variants", message: `Agent "${agent}" has no variants in the global default config. Add them first (structural changes are global-default only).` })
+        continue
+      }
+      const variantOptions: WizardSelectOption<string>[] = globalVariants.map(([key, variant]) => ({
+        title: variantName(agent, key, variant),
+        value: key,
+        description: entry.variants[key] ? `${Object.values(entry.variants[key]!).filter((v) => v !== undefined).length} override(s)` : "(not patched in this profile)",
+      }))
+      variantOptions.push({ title: "< Back", value: "__back__", description: "" })
+      const variantPick = await showMenu(api, { title: `Profile "${name}" - ${agent} - variants`, options: variantOptions })
+      if (!variantPick || variantPick === "__back__") continue
+      entry.variants[variantPick] ??= {}
+      const patch = await profilePatchEditor(api, `Profile "${name}" - ${agent} - variant ${variantPick}`, entry.variants[variantPick]!)
+      if (patch) {
+        if (profilePatchIsEmpty(patch)) delete entry.variants[variantPick]
+        else entry.variants[variantPick] = patch
+      }
+      continue
+    }
+  }
+}
+
+/** Profiles list + management menu. */
+export async function manageProfiles(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings): Promise<SidecarConfig> {
+  let current = config
+  while (true) {
+    const manual = current.routing.activeProfile
+    const options: WizardSelectOption<string>[] = [
+      {
+        title: "Activation",
+        value: "__activation__",
+        description: manual ? `manual pin: ${manual}` : "automatic (primary-model match)",
+        help: "Automatic mode activates the last profile whose match rule fits the primary session's model. A manual pin wins over matching and applies everywhere immediately.",
+      },
+    ]
+    for (const [name, profile] of Object.entries(current.profiles)) {
+      const agentCount = Object.keys(profile.agents).length
+      options.push({
+        title: manual === name ? `* ${name}` : name,
+        value: `profile:${name}`,
+        description: `${profileMatchSummary(profile)} - ${agentCount} agent(s)`,
+        help: `Profile "${name}". Fields set here override the global default while the profile is active. Only hot-reload fields are editable; structural changes (add/delete/disable variant, description, color) are global-default only.`,
+      })
+    }
+    options.push({ title: "+ Add profile", value: "__add__", description: "new named overlay", danger: true })
+    options.push({ title: "< Back", value: "__back__", description: "" })
+    const picked = await showMenu(api, { title: "Profiles", options })
+    if (!picked || picked === "__back__") return current
+    if (picked === "__activation__") {
+      current = await pickProfileActivation(api, current)
+      continue
+    }
+    if (picked === "__add__") {
+      const name = await showPrompt(api.ui, { title: "New profile name", placeholder: "e.g. sol-heavy, cheap-mode" })
+      if (name === undefined || name.trim() === "" || current.profiles[name.trim()]) continue
+      current = structuredClone(current)
+      current.profiles[name.trim()] = { agents: {} }
+      current = await profileEditorFlow(api, current, settings, name.trim())
+      continue
+    }
+    if (picked.startsWith("profile:")) {
+      current = await profileEditorFlow(api, current, settings, picked.slice("profile:".length))
+      continue
+    }
+  }
+}
+
+async function profileEditorFlow(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings, name: string): Promise<SidecarConfig> {
+  let current = config
+  while (true) {
+    const profile = current.profiles[name]
+    if (!profile) return current
+    const options: WizardSelectOption<string>[] = [
+      { title: "Activation rule", value: "match", description: profileMatchSummary(profile), help: "Auto-activation by primary model. Ordered evaluation: when several profiles match, the last one wins." },
+      ...Object.entries(profile.agents).map(([agent, entry]): WizardSelectOption<string> => ({
+        title: agent,
+        value: `agent:${agent}`,
+        description: `${Object.values(entry.parent ?? {}).filter((v) => v !== undefined).length} parent field(s), ${Object.keys(entry.variants).length} variant override(s)`,
+        help: `Profile overrides for agent "${agent}".`,
+      })),
+      { title: "+ Add agent", value: "__add_agent__", description: "patch another agent in this profile", danger: true },
+      { title: "Rename profile", value: "__rename__", description: "" },
+      { title: "Delete profile", value: "__delete__", description: "", danger: true },
+      { title: "< Back", value: "__back__", description: "" },
+    ]
+    const picked = await showMenu(api, { title: `Profile "${name}"`, options })
+    if (!picked || picked === "__back__") return current
+    if (picked === "match") {
+      current = await profileMatchEditor(api, current, name)
+      continue
+    }
+    if (picked === "__add_agent__") {
+      const agentOptions: WizardSelectOption<string>[] = Object.keys(current.agents)
+        .filter((agent) => !profile.agents[agent])
+        .map((agent) => ({ title: agent, value: agent, description: `${Object.keys(current.agents[agent]!.variants).length} variant(s)` }))
+      agentOptions.push({ title: "< Cancel", value: "__cancel__", description: "" })
+      if (agentOptions.length === 1) {
+        await showAlert(api.ui, { title: "No more agents", message: "Every configured parent agent already has a patch in this profile." })
+        continue
+      }
+      const agentPick = await showMenu(api, { title: "Add agent to profile", options: agentOptions })
+      if (!agentPick || agentPick === "__cancel__") continue
+      current = await profileAgentEditor(api, current, name, agentPick)
+      continue
+    }
+    if (picked.startsWith("agent:")) {
+      current = await profileAgentEditor(api, current, name, picked.slice("agent:".length))
+      continue
+    }
+    if (picked === "__rename__") {
+      const newName = await showPrompt(api.ui, { title: "Rename profile", placeholder: name, value: name })
+      if (newName === undefined || newName.trim() === "" || newName.trim() === name || current.profiles[newName.trim()]) continue
+      current = structuredClone(current)
+      const entries = Object.entries(current.profiles).map(([key, value]) => [key === name ? newName.trim() : key, value] as const)
+      current.profiles = Object.fromEntries(entries)
+      if (current.routing.activeProfile === name) current.routing.activeProfile = newName.trim()
+      name = newName.trim()
+      continue
+    }
+    if (picked === "__delete__") {
+      const confirmed = await showConfirm(api.ui, { title: `Delete profile "${name}"?`, message: "The profile and all its overrides are removed from the sidecar. This cannot be undone (backups still apply)." })
+      if (!confirmed) continue
+      current = structuredClone(current)
+      delete current.profiles[name]
+      if (current.routing.activeProfile === name) delete current.routing.activeProfile
+      return current
+    }
+  }
+}
+
 export async function mainMenu(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings, host?: WizardHost): Promise<SidecarConfig> {
   const agentCount = Object.keys(config.agents).length
   const vCount = variantCount(config)
@@ -2691,6 +2986,7 @@ export async function mainMenu(api: TuiPluginApi, config: SidecarConfig, setting
   const opts: WizardSelectOption<string>[] = [
     { title: "Add variant", value: "add", description: "Create a new agent variant", danger: true, help: "Creates a new variant under a parent subagent. New task-list aliases require restart before they appear." },
     { title: "Model presets", value: "models", description: `${Object.keys(config.models).length} shortcut(s)`, help: "Create reusable model shortcuts like light or heavy. Presets appear in Model pickers and can include model, model variant, temperature, top_p, and options." },
+    { title: "Profiles", value: "profiles", description: `${Object.keys(config.profiles).length} profile(s)${config.routing.activeProfile ? `, pinned: ${config.routing.activeProfile}` : ""}`, help: "Conditional overrides applied on top of the global default, activated manually or by matching the primary session model. Profiles may only edit hot-reload fields (model, variant, temperature, top_p, prompt patches, options); structural changes (description, color, add/delete/disable) stay in the global default." },
     { title: "Edit parent fields", value: "edit-parent", description: "Override fields on an agent parent", help: "Parent fields can be propagated per field to variants. Red fields change cached task-list/UI metadata and require restart." },
     { title: "Edit variant", value: "edit-variant", description: "Change fields on an existing variant", help: "Variant fields override inherited parent values. Red fields require restart before OpenCode's task list/UI reflects them." },
     { title: "Toggle disable", value: "toggle", description: "Enable or disable agents/variants", danger: true, help: "Disable keeps config without deleting it. Task-list visibility updates after restart, and stale calls are blocked at runtime." },
@@ -2712,6 +3008,8 @@ export async function mainMenu(api: TuiPluginApi, config: SidecarConfig, setting
       return mainMenu(api, await addVariant(api, config, settings), settings)
     case "models":
       return mainMenu(api, await manageModelPresets(api, config), settings)
+    case "profiles":
+      return mainMenu(api, await manageProfiles(api, config, settings), settings)
     case "edit-parent":
       return editParentFlow(api, config, settings)
     case "edit-variant":

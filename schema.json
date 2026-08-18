@@ -1,0 +1,401 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "debug": {
+      "default": false,
+      "type": "boolean"
+    },
+    "routing": {
+      "default": {
+        "prompt_markers": false
+      },
+      "type": "object",
+      "properties": {
+        "prompt_markers": {
+          "default": false,
+          "type": "boolean"
+        },
+        "activeProfile": {
+          "type": "string"
+        }
+      }
+    },
+    "ui": {
+      "default": {
+        "width": "large",
+        "height": "normal"
+      },
+      "type": "object",
+      "properties": {
+        "width": {
+          "default": "large",
+          "type": "string",
+          "enum": [
+            "medium",
+            "large",
+            "xlarge"
+          ]
+        },
+        "height": {
+          "default": "normal",
+          "type": "string",
+          "enum": [
+            "compact",
+            "normal",
+            "tall",
+            "max"
+          ]
+        },
+        "height_percent": {
+          "type": "integer",
+          "minimum": 25,
+          "maximum": 100
+        }
+      }
+    },
+    "models": {
+      "default": {},
+      "type": "object",
+      "propertyNames": {
+        "type": "string"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "model": {
+            "type": "string",
+            "minLength": 1
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1
+          },
+          "variant": {
+            "type": "string"
+          },
+          "temperature": {
+            "type": "number"
+          },
+          "top_p": {
+            "type": "number"
+          },
+          "options": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {}
+          }
+        },
+        "required": [
+          "model"
+        ]
+      }
+    },
+    "profiles": {
+      "default": {},
+      "type": "object",
+      "propertyNames": {
+        "type": "string"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "match": {
+            "type": "object",
+            "properties": {
+              "model": {
+                "type": "string",
+                "minLength": 1
+              },
+              "variant": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "minItems": 1,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "minLength": 1
+                    }
+                  }
+                ]
+              }
+            },
+            "required": [
+              "model"
+            ]
+          },
+          "agents": {
+            "default": {},
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "parent": {
+                  "default": {},
+                  "type": "object",
+                  "properties": {
+                    "model": {
+                      "type": "string"
+                    },
+                    "variant": {
+                      "type": "string"
+                    },
+                    "temperature": {
+                      "type": "number"
+                    },
+                    "top_p": {
+                      "type": "number"
+                    },
+                    "prompt": {
+                      "type": "string"
+                    },
+                    "prompt_prepend": {
+                      "type": "string"
+                    },
+                    "prompt_append": {
+                      "type": "string"
+                    },
+                    "options": {
+                      "type": "object",
+                      "propertyNames": {
+                        "type": "string"
+                      },
+                      "additionalProperties": {}
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "variants": {
+                  "default": {},
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {
+                    "type": "object",
+                    "properties": {
+                      "model": {
+                        "type": "string"
+                      },
+                      "variant": {
+                        "type": "string"
+                      },
+                      "temperature": {
+                        "type": "number"
+                      },
+                      "top_p": {
+                        "type": "number"
+                      },
+                      "prompt": {
+                        "type": "string"
+                      },
+                      "prompt_prepend": {
+                        "type": "string"
+                      },
+                      "prompt_append": {
+                        "type": "string"
+                      },
+                      "options": {
+                        "type": "object",
+                        "propertyNames": {
+                          "type": "string"
+                        },
+                        "additionalProperties": {}
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "agents": {
+      "default": {},
+      "type": "object",
+      "propertyNames": {
+        "type": "string"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "disable": {
+            "type": "boolean"
+          },
+          "parent": {
+            "default": {},
+            "type": "object",
+            "properties": {
+              "model": {
+                "type": "string"
+              },
+              "variant": {
+                "type": "string"
+              },
+              "temperature": {
+                "type": "number"
+              },
+              "top_p": {
+                "type": "number"
+              },
+              "prompt": {
+                "type": "string"
+              },
+              "prompt_prepend": {
+                "type": "string"
+              },
+              "prompt_append": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              },
+              "description_prepend": {
+                "type": "string"
+              },
+              "description_append": {
+                "type": "string"
+              },
+              "options": {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "additionalProperties": {}
+              },
+              "color": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^#[0-9a-fA-F]{6}$"
+                  },
+                  {
+                    "type": "string",
+                    "enum": [
+                      "primary",
+                      "secondary",
+                      "accent",
+                      "success",
+                      "warning",
+                      "error",
+                      "info"
+                    ]
+                  }
+                ]
+              },
+              "disable": {
+                "type": "boolean"
+              },
+              "propagate": {
+                "type": "object",
+                "propertyNames": {
+                  "type": "string"
+                },
+                "additionalProperties": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "variants": {
+            "default": {},
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "model": {
+                  "type": "string"
+                },
+                "variant": {
+                  "type": "string"
+                },
+                "temperature": {
+                  "type": "number"
+                },
+                "top_p": {
+                  "type": "number"
+                },
+                "prompt": {
+                  "type": "string"
+                },
+                "prompt_prepend": {
+                  "type": "string"
+                },
+                "prompt_append": {
+                  "type": "string"
+                },
+                "description": {
+                  "type": "string"
+                },
+                "description_prepend": {
+                  "type": "string"
+                },
+                "description_append": {
+                  "type": "string"
+                },
+                "options": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {}
+                },
+                "color": {
+                  "anyOf": [
+                    {
+                      "type": "string",
+                      "pattern": "^#[0-9a-fA-F]{6}$"
+                    },
+                    {
+                      "type": "string",
+                      "enum": [
+                        "primary",
+                        "secondary",
+                        "accent",
+                        "success",
+                        "warning",
+                        "error",
+                        "info"
+                      ]
+                    }
+                  ]
+                },
+                "disable": {
+                  "type": "boolean"
+                },
+                "inherit": {
+                  "type": "object",
+                  "propertyNames": {
+                    "type": "string"
+                  },
+                  "additionalProperties": {
+                    "type": "boolean"
+                  }
+                },
+                "name": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "title": "OpenCode Agent Variants sidecar config",
+  "description": "Configuration for @mirrowel/opencode-agent-variants (agent-variants.jsonc)."
+}

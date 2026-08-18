@@ -96,13 +96,51 @@ const UiSettings = z.object({
 
 const RoutingSettings = z.object({
   prompt_markers: z.boolean().default(false),
+  /** Manually pinned profile name; wins over automatic model matching. */
+  activeProfile: z.string().optional(),
 }).default({ prompt_markers: false })
+
+/**
+ * Profile patches may only override hot-reload fields: a profile activates
+ * mid-session (manual switch or primary-model match), so structural changes
+ * (description/color/disable/add/delete) are global-default-only.
+ */
+const ProfilePatch = z
+  .object({
+    model: z.string().optional(),
+    variant: z.string().optional(),
+    temperature: z.number().finite().optional(),
+    top_p: z.number().finite().optional(),
+    prompt: z.string().optional(),
+    prompt_prepend: z.string().optional(),
+    prompt_append: z.string().optional(),
+    options: z.record(z.string(), z.unknown()).optional(),
+  })
+  .strict()
+
+const ProfileMatch = z.object({
+  /** Primary model in provider/model form. */
+  model: z.string().min(1),
+  /** Variant filter: string, non-empty array, or omitted for wildcard. */
+  variant: z.union([z.string(), z.array(z.string().min(1)).min(1)]).optional(),
+})
+
+const ProfileAgentEntry = z.object({
+  parent: ProfilePatch.default({}),
+  variants: z.record(z.string(), ProfilePatch).default({}),
+})
+
+const Profile = z.object({
+  match: ProfileMatch.optional(),
+  agents: z.record(z.string(), ProfileAgentEntry).default({}),
+})
 
 export const SidecarConfig = z.object({
   debug: z.boolean().default(false),
   routing: RoutingSettings,
   ui: UiSettings,
   models: z.record(z.string(), ModelShortcut).default({}),
+  profiles: z.record(z.string(), Profile).default({}),
   agents: z.record(
     z.string(),
     z.object({
@@ -152,6 +190,62 @@ export type ParentPatch = z.infer<typeof ParentPatch>
 export type VariantConfig = z.infer<typeof Variant>
 export type ModelShortcut = z.infer<typeof ModelShortcut>
 export type UiSettings = z.infer<typeof UiSettings>
+export type ProfilePatch = z.infer<typeof ProfilePatch>
+export type ProfileMatch = z.infer<typeof ProfileMatch>
+export type ProfileAgentEntry = z.infer<typeof ProfileAgentEntry>
+export type Profile = z.infer<typeof Profile>
+export type ActiveProfile = { name: string; source: "manual" | "auto" }
+
+/** Fields a profile may override (enforced by the ProfilePatch schema too). */
+export const PROFILE_FIELDS = HOT_RELOAD_FIELDS
+
+export function profileMatchesModel(match: ProfileMatch | undefined, providerID: string, modelID: string, variant?: string): boolean {
+  if (!match) return false
+  const slash = match.model.indexOf("/")
+  if (slash <= 0) return false
+  const provider = match.model.slice(0, slash)
+  const model = match.model.slice(slash + 1)
+  if (provider !== providerID || model !== modelID) return false
+  if (match.variant === undefined) return true
+  const effective = variant && variant !== "default" ? variant : "default"
+  if (typeof match.variant === "string") return match.variant === effective
+  return match.variant.includes(effective)
+}
+
+/**
+ * Resolves the active profile for a primary model. Ordered evaluation with
+ * last-match-wins (documented semantics); a manual activeProfile pin wins
+ * over automatic matching. Returns undefined when nothing applies.
+ */
+export function resolveActiveProfile(config: SidecarConfig, primary?: { providerID: string; modelID: string; variant?: string }): ActiveProfile | undefined {
+  const manual = config.routing.activeProfile
+  if (manual !== undefined) {
+    if (config.profiles[manual]) return { name: manual, source: "manual" }
+    return undefined
+  }
+  if (!primary) return undefined
+  let hit: ActiveProfile | undefined
+  for (const [name, profile] of Object.entries(config.profiles)) {
+    if (profileMatchesModel(profile.match, primary.providerID, primary.modelID, primary.variant)) hit = { name, source: "auto" }
+  }
+  return hit
+}
+
+/**
+ * Overlays a profile patch on top of a base patch: profile fields replace the
+ * global-default value; unset profile fields fall through to the default.
+ */
+export function overlayProfilePatch(base: AgentPatch, profile: ProfilePatch | undefined): AgentPatch {
+  if (!profile) return base
+  const next: AgentPatch = { ...base }
+  for (const field of PROFILE_FIELDS) {
+    const value = (profile as Record<string, unknown>)[field]
+    if (value !== undefined) {
+      ;(next as Record<string, unknown>)[field] = value
+    }
+  }
+  return next
+}
 export type SidecarConfig = z.infer<typeof SidecarConfig>
 export type BackupOperation = z.infer<typeof BackupOperation>
 export type PatchBackupEntry = z.infer<typeof PatchBackupEntry>
@@ -306,7 +400,7 @@ export function backupJournalPath(configDir = defaultConfigDir()) {
 }
 
 export function emptyConfig(): SidecarConfig {
-  return { debug: false, routing: { prompt_markers: false }, ui: { width: "large", height: "normal" }, models: {}, agents: {} }
+  return { debug: false, routing: { prompt_markers: false }, ui: { width: "large", height: "normal" }, models: {}, profiles: {}, agents: {} }
 }
 
 export function loadSidecar(filePath = defaultSidecarPath()) {
@@ -746,6 +840,40 @@ export function diagnoseConfig(config: SidecarConfig, input: { agents: string[];
   for (const [key, preset] of Object.entries(config.models)) {
     for (const issue of validatePatchModel(`Model preset "${key}"`, preset, config, catalog)) {
       diagnostics.push({ level: "warning", message: issue })
+    }
+  }
+
+  // Profile diagnostics.
+  const manualProfile = config.routing.activeProfile
+  if (manualProfile !== undefined && !config.profiles[manualProfile]) {
+    diagnostics.push({ level: "error", message: `routing.activeProfile "${manualProfile}" does not match any profile; automatic model matching is suppressed until the pin is cleared.` })
+  }
+  const seenMatches = new Map<string, string>()
+  for (const [name, profile] of Object.entries(config.profiles)) {
+    if (profile.match) {
+      const key = `${profile.match.model}|${typeof profile.match.variant === "string" ? profile.match.variant : Array.isArray(profile.match.variant) ? [...profile.match.variant].sort().join(",") : "*"}`
+      const previous = seenMatches.get(key)
+      if (previous) {
+        diagnostics.push({ level: "info", message: `Profiles "${previous}" and "${name}" match the same primary model/variant; the later profile ("${name}") wins (ordered, last-match-wins).` })
+      } else {
+        seenMatches.set(key, name)
+      }
+      const shapeIssue = validateModelShape(profile.match.model, config)
+      if (shapeIssue) diagnostics.push({ level: "warning", message: `Profile "${name}" match model is invalid: ${shapeIssue}` })
+    }
+    for (const [agent, agentEntry] of Object.entries(profile.agents)) {
+      if (!knownAgents.has(agent)) diagnostics.push({ level: "warning", agent, message: `Profile "${name}" patches agent "${agent}" which is not a known built-in or configured agent.` })
+      for (const issue of validatePatchModel(`Profile "${name}" parent "${agent}"`, applyModelPresetPatch(overlayProfilePatch({}, agentEntry.parent), config), config, catalog)) {
+        diagnostics.push({ level: "warning", agent, message: issue })
+      }
+      for (const [key, variantPatch] of Object.entries(agentEntry.variants)) {
+        for (const issue of validatePatchModel(`Profile "${name}" variant "${agent}/${key}"`, applyModelPresetPatch(overlayProfilePatch({}, variantPatch), config), config, catalog)) {
+          diagnostics.push({ level: "warning", agent, variant: key, message: issue })
+        }
+        if (!config.agents[agent]?.variants[key]) {
+          diagnostics.push({ level: "warning", agent, variant: key, message: `Profile "${name}" overrides variant "${key}" of agent "${agent}", but that variant does not exist in the global default config.` })
+        }
+      }
     }
   }
 

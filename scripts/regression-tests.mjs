@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs"
 import { __testAssembleAgents, __testInternals } from "../dist/index.js"
-import { emptyConfig, inferredSelectionPreset, SELECTION_PRESETS } from "../dist/config.js"
+import { emptyConfig, inferredSelectionPreset, SELECTION_PRESETS, SidecarConfig, profileMatchesModel, resolveActiveProfile, overlayProfilePatch } from "../dist/config.js"
 import { currentPaletteCategory, declarePaletteCategory, reconcilePaletteCategories, __resetPaletteRegistry } from "../dist/palette-category.js"
 
 function assert(condition, message) {
@@ -283,6 +283,63 @@ function testSelectionTierInference() {
   assert(SELECTION_PRESETS[0]?.key === "basic", "basic should be the first capability preset below light")
 }
 
+function testProfiles() {
+  // profileMatchesModel: wildcard, exact variant, array variant, default normalization.
+  assert(!profileMatchesModel(undefined, "any", "model"), "rule-less profile never auto-matches (manual only)")
+  assert(profileMatchesModel({ model: "zai/glm-5.3" }, "zai", "glm-5.3"), "model-only rule matches any variant")
+  assert(!profileMatchesModel({ model: "zai/glm-5.3" }, "zai", "glm-5.2"), "different model does not match")
+  assert(profileMatchesModel({ model: "zai/glm-5.3", variant: "high" }, "zai", "glm-5.3", "high"), "string variant matches")
+  assert(!profileMatchesModel({ model: "zai/glm-5.3", variant: "high" }, "zai", "glm-5.3", "low"), "other variant does not match")
+  assert(profileMatchesModel({ model: "zai/glm-5.3", variant: "default" }, "zai", "glm-5.3", "default"), "rule variant default matches default session")
+  assert(!profileMatchesModel({ model: "zai/glm-5.3", variant: "high" }, "zai", "glm-5.3", undefined), "rule variant high does not match default session")
+  assert(profileMatchesModel({ model: "zai/glm-5.3", variant: ["high", "max"] }, "zai", "glm-5.3", "max"), "array variant matches member")
+  assert(!profileMatchesModel({ model: "zai/glm-5.3", variant: ["high"] }, "zai", "glm-5.3", undefined), "undefined variant normalizes to default")
+  assert(!profileMatchesModel({ model: "glmbad" }, "zai", "glm-5.3"), "malformed rule model never matches")
+
+  // resolveActiveProfile: manual pin wins; ordered last-match-wins; dead pin disables matching.
+  const config = emptyConfig()
+  config.profiles = {
+    light: { match: { model: "zai/glm-5.3" }, agents: {} },
+    heavy: { match: { model: "zai/glm-5.3", variant: "high" }, agents: {} },
+    manualOnly: { agents: {} },
+  }
+  const primary = { providerID: "zai", modelID: "glm-5.3", variant: "high" }
+  assert(resolveActiveProfile(config, primary)?.name === "heavy", "last matching profile wins")
+  assert(resolveActiveProfile(config, { providerID: "zai", modelID: "glm-5.3" })?.name === "light", "wildcard profile matches default variant")
+  assert(resolveActiveProfile(config) === undefined, "no primary and no pin resolves nothing")
+  config.routing.activeProfile = "manualOnly"
+  assert(resolveActiveProfile(config, primary)?.source === "manual", "manual pin wins over matching")
+  config.routing.activeProfile = "gone"
+  assert(resolveActiveProfile(config, primary) === undefined, "dead manual pin suppresses matching")
+
+  // overlayProfilePatch: replaces set fields, falls through unset, hot fields only.
+  const base = { model: "zai/glm-5.3", temperature: 0.4, description: "keep" }
+  const overlaid = overlayProfilePatch(base, { temperature: 0.9, prompt: "go" })
+  assert(overlaid.temperature === 0.9, "profile field replaces default")
+  assert(overlaid.model === "zai/glm-5.3", "unset profile fields fall through")
+  assert(overlaid.description === "keep", "non-hot default fields survive")
+  assert(overlaid.prompt === "go", "profile can add hot fields")
+  const structural = overlayProfilePatch(base, { description: "hack" })
+  assert(structural.description === "keep", "structural fields cannot be overlaid even if forced")
+
+  // Schema: profile patches reject structural fields (strict object).
+  const strict = SidecarConfig.safeParse({
+    debug: false,
+    routing: { prompt_markers: false },
+    ui: { width: "large", height: "normal" },
+    models: {},
+    profiles: { bad: { agents: { general: { parent: { description: "nope" }, variants: {} } } } },
+    agents: {},
+  })
+  assert(!strict.success, "ProfilePatch strict schema rejects structural fields")
+
+  // Defaults round-trip: empty config carries an empty profiles record.
+  const parsed = SidecarConfig.parse({})
+  assert(parsed.profiles && typeof parsed.profiles === "object", "profiles defaults to a record")
+  assert(parsed.routing.activeProfile === undefined, "activeProfile unset by default")
+}
+
+testProfiles()
 testPaletteCategory()
 testPartialProviderOverrideWithVariants()
 testMissingCustomProviderModelIsDeferred()

@@ -17,6 +17,8 @@ import {
   hasRequestPatch,
   loadSidecar,
   modelCatalogFromProviders,
+  overlayProfilePatch,
+  resolveActiveProfile,
   resolveModel,
   splitModelRef,
   templateContext,
@@ -42,6 +44,8 @@ type RuntimeRoute = {
   model?: string
   variant?: string
   base?: AgentPatch
+  /** Name of the profile whose overlay shaped this route, if any. */
+  profile?: string
 }
 type PendingRoute = RuntimeRoute & {
   token?: string
@@ -521,8 +525,36 @@ function getData<T>(value: T | { data?: T } | undefined): T | undefined {
   return value as T | undefined
 }
 
+type SessionModel = { providerID: string; modelID: string; variant?: string }
+
 async function getSession(client: any, sessionID: string, timeoutMs = CLIENT_CALL_TIMEOUT) {
-  return getData(await safeClientCall(() => client?.session?.get?.({ path: { id: sessionID } }), timeoutMs)) as { parentID?: string; agent?: string } | undefined
+  return getData(await safeClientCall(() => client?.session?.get?.({ path: { id: sessionID } }), timeoutMs)) as
+    | ({ parentID?: string; agent?: string; model?: { providerID?: string; id?: string; variant?: string } })
+    | undefined
+}
+
+/** Short-TTL cache of a session's current model (primary-model profile matching). */
+const sessionModelCache = new Map<string, { model: SessionModel | undefined; at: number }>()
+const SESSION_MODEL_TTL_MS = 10_000
+
+function cachedSessionModel(sessionID: string, model: SessionModel | undefined) {
+  sessionModelCache.set(sessionID, { model, at: Date.now() })
+  if (sessionModelCache.size > 64) {
+    const oldest = sessionModelCache.keys().next().value
+    if (oldest !== undefined) sessionModelCache.delete(oldest)
+  }
+}
+
+async function sessionModel(client: any, sessionID: string): Promise<SessionModel | undefined> {
+  const hit = sessionModelCache.get(sessionID)
+  if (hit && Date.now() - hit.at < SESSION_MODEL_TTL_MS) return hit.model
+  const session = await getSession(client, sessionID)
+  const raw = session?.model
+  const model = raw && typeof raw.providerID === "string" && typeof raw.id === "string"
+    ? { providerID: raw.providerID, modelID: raw.id, ...(raw.variant && raw.variant !== "default" ? { variant: raw.variant } : {}) }
+    : undefined
+  cachedSessionModel(sessionID, model)
+  return model
 }
 
 async function debugToast(client: any, _enabled: boolean, title: string, message: string) {
@@ -680,17 +712,58 @@ async function findParentTaskPartForChild(client: any, directory: string, parent
 }
 
 async function findParentTaskContext(client: any, directory: string, childSessionID: string) {
-  let session: { parentID?: string; agent?: string } | undefined
+  let session: { parentID?: string; agent?: string; model?: { providerID?: string; id?: string; variant?: string } } | undefined
   for (const wait of ROUTE_LOOKUP_DELAYS) {
     await delay(wait)
     if (!session) {
       session = await getSession(client, childSessionID, ROUTE_LOOKUP_TIMEOUT)
-      if (session && !session.parentID) return { parentTaskPart: undefined }
+      if (session && !session.parentID) return { parentTaskPart: undefined, parentSessionID: undefined }
     }
     const parentTaskPart = await findParentTaskPartForChild(client, directory, session?.parentID, childSessionID, ROUTE_LOOKUP_TIMEOUT)
-    if (parentTaskPart) return { parentTaskPart }
+    if (parentTaskPart) return { parentTaskPart, parentSessionID: session?.parentID }
   }
-  return { parentTaskPart: undefined }
+  return { parentTaskPart: undefined, parentSessionID: undefined }
+}
+
+/**
+ * Profile base-parent application: when a profile is active and patches this
+ * parent agent, and the child is provably a base task call (parent task part
+ * exists, its metadata carries no variant alias, and no route correlation
+ * matched), apply the profile's parent patch model to the child message.
+ * Variant children are excluded by the same correlation proof that gates
+ * route application (fail-closed, #751).
+ */
+async function applyProfileBaseParent(
+  client: any,
+  agent: string | undefined,
+  parentTaskPart: any,
+  parentSessionID: string | undefined,
+  output: { message: { model?: { providerID: string; modelID: string; variant?: string } } },
+): Promise<string | undefined> {
+  if (!agent || !parentTaskPart) return undefined
+  const metadata = parentTaskPart?.state?.metadata as Record<string, unknown> | undefined
+  const variantMeta = metadata?.agentVariants as Record<string, unknown> | undefined
+  if (variantMeta && typeof variantMeta.alias === "string") return undefined
+  const config = loadSidecar(defaultSidecarPath())
+  if (Object.keys(config.profiles).length === 0) return undefined
+  const primary = parentSessionID ? await sessionModel(client, parentSessionID) : undefined
+  const active = resolveActiveProfile(config, primary)
+  if (!active) return undefined
+  const entry = config.profiles[active.name]?.agents[agent]
+  if (!entry || Object.keys(entry.parent ?? {}).length === 0) return undefined
+  const patch = applyModelPresetPatch(overlayProfilePatch({}, entry.parent), config)
+  const model = resolveModel(patch.model, config)
+  if (!model) return undefined
+  const shapeIssue = validateModelShape(patch.model, config)
+  if (shapeIssue) return undefined
+  const split = splitModelRef(model)
+  if (!split) return undefined
+  output.message.model = {
+    providerID: split.providerID,
+    modelID: split.modelID,
+    ...(patch.variant ? { variant: patch.variant } : {}),
+  }
+  return `${active.name} (${active.source})`
 }
 
 function partIsClean(part: any, routes: Map<string, RuntimeRoute>) {
@@ -971,7 +1044,7 @@ function catalogDiagnostics(config: SidecarConfig, catalog: ModelCatalog) {
   return diagnostics
 }
 
-function liveRoute(staticRoute: RuntimeRoute, catalog: ModelCatalog | undefined) {
+function liveRoute(staticRoute: RuntimeRoute, catalog: ModelCatalog | undefined, primary?: SessionModel) {
   const config = loadSidecar(defaultSidecarPath())
   const entry = config.agents[staticRoute.parent]
   const variant = entry?.variants[staticRoute.key]
@@ -981,7 +1054,12 @@ function liveRoute(staticRoute: RuntimeRoute, catalog: ModelCatalog | undefined)
   if (variantName(staticRoute.parent, staticRoute.key, variant) !== staticRoute.alias) {
     throw new Error(`Variant "${staticRoute.alias}" was renamed. Restart OpenCode to update the task list.`)
   }
-  const patch = applyModelPresetPatch(effectiveVariantPatch(entry.parent, variant), config)
+  const active = resolveActiveProfile(config, primary)
+  const profileEntry = active ? config.profiles[active.name]?.agents[staticRoute.parent] : undefined
+  const profileVariant = profileEntry?.variants[staticRoute.key]
+  const parentPatch = applyModelPresetPatch(overlayProfilePatch(entry.parent, profileEntry?.parent), config)
+  const variantPatch = applyModelPresetPatch(overlayProfilePatch(variant, profileVariant), config)
+  const patch = effectiveVariantPatch(parentPatch, variantPatch)
   const shapeIssues = validatePatchModelShape(`Variant "${staticRoute.alias}"`, patch, config)
   if (shapeIssues.length > 0) throw new Error(`Variant "${staticRoute.alias}" is invalid after hot reload: ${shapeIssues.join(" ")}`)
   if (catalog) {
@@ -993,6 +1071,7 @@ function liveRoute(staticRoute: RuntimeRoute, catalog: ModelCatalog | undefined)
     patch,
     model: resolveModel(patch.model, config),
     variant: patch.variant,
+    ...(active ? { profile: active.name } : {}),
   }
 }
 
@@ -1096,7 +1175,8 @@ const plugin: Plugin = async (input) => {
       if (!args?.subagent_type || !args.prompt) return
       const staticRoute = virtualRoutes.get(args.subagent_type)
       if (!staticRoute) return
-      const route = liveRoute(staticRoute, catalog)
+      const primary = await sessionModel(input.client, hookInput.sessionID)
+      const route = liveRoute(staticRoute, catalog, primary)
       if (!catalog) debugLog(debugEnabled(), "Agent variant validation deferred", `${route.alias}: merged provider catalog is not ready; OpenCode provider validation will be used if needed`)
       cleanupPending(pending, tokenRoutes)
       const usePromptMarker = promptMarkersEnabled()
@@ -1170,7 +1250,7 @@ const plugin: Plugin = async (input) => {
       if (markerRoute?.stripped) {
         await debugToast(input.client, sidecar.debug, "Agent variant marker stripped", `stripped ${markerRoute.stripped} route marker(s) without token match; session=${hookInput.sessionID}`)
       }
-      const { parentTaskPart } = await findParentTaskContext(input.client, input.directory, hookInput.sessionID)
+      const { parentTaskPart, parentSessionID } = await findParentTaskContext(input.client, input.directory, hookInput.sessionID)
       const correlation = correlateTaskRoute(
         pending,
         byCall,
@@ -1193,6 +1273,15 @@ const plugin: Plugin = async (input) => {
       }
       if (parentTaskPart) {
         debugLog(sidecar.debug, "Agent variant metadata route miss", `session=${hookInput.sessionID}; parent task=${parentTaskPart.id ?? "unknown"}; call=${parentTaskPart.callID ?? "unknown"}`)
+      }
+      const appliedProfile = await applyProfileBaseParent(input.client, hookInput.agent, parentTaskPart, parentSessionID, output)
+      if (appliedProfile) {
+        await debugToast(
+          input.client,
+          sidecar.debug,
+          "Agent variant profile base-parent applied",
+          `profile=${appliedProfile}; agent=${hookInput.agent}; session=${hookInput.sessionID}`,
+        )
       }
     },
     "experimental.chat.messages.transform": async (_hookInput, output) => {

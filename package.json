@@ -40,6 +40,7 @@
   "files": [
     "dist",
     "src",
+    "schema.json",
     "tsconfig.json",
     "docs/CONFIG.md",
     "agent-variants.example.jsonc",
@@ -64,7 +65,7 @@
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
-    "build": "npm run clean && tsc --outDir dist --declaration && npm run build:tui",
+    "build": "npm run clean && tsc --outDir dist --declaration && npm run build:tui && node scripts/generate-schema.mjs",
     "build:tui": "bun scripts/build-tui.mjs",
     "ci": "npm run release:intent:check && npm run ci:package",
     "ci:package": "npm run typecheck && npm run build && npm run test:regression && npm run test:tui-reactivity && npm run pack:dry-run && npm run test:tui-package",
