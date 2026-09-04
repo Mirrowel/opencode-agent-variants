@@ -337,10 +337,16 @@ export const SELECTION_PRESETS: SelectionPreset[] = [
     text: "Use {alias} for basic exploration and data-gathering tasks such as finding files, locating symbols, listing matches, extracting facts, or other bounded high-volume work. Prefer {parent} or a stronger variant for complex reasoning, implementation, or high-stakes conclusions. If the user explicitly asks for {alias}, call this exact subagent instead of {parent}.",
   },
   {
+    key: "flash",
+    title: "Flash / fast-capable",
+    summary: "Fast work that still needs sound judgment - lighter than light, not dumb",
+    text: "Use {alias} for fast routine work that still needs sound judgment - quick exploration, straightforward questions, and high-volume lookups where a basic tier would be too shallow but the strongest models are overkill. It trades some depth for speed without going dumb. Prefer {parent} or a stronger variant for deep or high-stakes work. If the user explicitly asks for {alias}, call this exact subagent instead of {parent}.",
+  },
+  {
     key: "light",
     title: "Light / balanced",
-    summary: "Balanced routine work that still needs moderate judgment",
-    text: "Use {alias} for balanced routine work that benefits from moderate judgment while keeping cost and turnaround below the strongest tier. If the user explicitly asks for {alias}, call this exact subagent instead of {parent}.",
+    summary: "Balanced work needing real judgment - weaker sibling of the main model",
+    text: "Use {alias} for balanced work that needs real judgment and care - standard implementation, multi-step tasks, and decisions where correctness matters more than speed, at lower cost and turnaround than the strongest tier. If the user explicitly asks for {alias}, call this exact subagent instead of {parent}.",
   },
   {
     key: "heavy",
@@ -731,24 +737,35 @@ export function inferredSelectionPreset(parent: string, key: string, variant: Pi
   if (hasAnyToken(explicitSource, ["heavy"])) return presetByKey("heavy")
   if (hasAnyToken(explicitSource, ["basic"])) return presetByKey("basic")
   if (hasAnyToken(explicitSource, ["light"])) return presetByKey("light")
+  if (hasAnyToken(explicitSource, ["flash"])) return presetByKey("flash")
 
-  const modelLooksBasic = hasAnyToken(modelSource, ["luna", "nano", "micro", "tiny"])
+  // Model capability inference. Tier philosophy:
+  // - light  = weaker sibling of the MAIN model family (mini, terra, sonnet, "-light" names)
+  // - flash  = distinct fast/secondary model, speed-optimized but not dumb (flash-class + speed words)
+  // - basic  = genuinely small/low-capability lines (nano, luna, haiku, lite)
+  // - heavy  = flagship lines (sol, opus, fable, max/reasoning)
+  const modelLooksBasic = hasAnyToken(modelSource, ["luna", "nano", "micro", "tiny", "haiku", "lite"])
   if (modelLooksBasic) return presetByKey("basic")
 
-  const modelLooksLight = hasAnyToken(modelSource, ["terra", "light", "lite", "fast", "flash", "haiku", "small", "mini", "cheap", "budget", "economy", "low"])
+  const modelLooksFlash = hasAnyToken(modelSource, ["flash", "fast", "quick", "small", "cheap", "budget", "economy", "low"])
+  if (modelLooksFlash) return presetByKey("flash")
+
+  const modelLooksLight = hasAnyToken(modelSource, ["terra", "mini", "sonnet", "light"])
   if (modelLooksLight) return presetByKey("light")
 
-  if (hasAnyToken(modelSource, ["sol", "heavy", "deep", "strong", "strongest", "pro", "max", "opus", "xhigh"]) || hasAnyPhrase(modelSource, ["gpt 5 6", "gpt 5 5", "gpt 5", "gpt5", "sonnet", "reasoning"])) return presetByKey("heavy")
+  if (hasAnyToken(modelSource, ["sol", "heavy", "deep", "strong", "strongest", "pro", "max", "opus", "fable", "xhigh"]) || hasAnyPhrase(modelSource, ["gpt 5 6", "gpt 5 5", "gpt 5", "gpt5", "reasoning"])) return presetByKey("heavy")
 
   if (hasAnyToken(modelVariant, ["nano", "micro", "tiny"])) return presetByKey("basic")
-  if (hasAnyToken(modelVariant, ["low", "fast", "lite", "light", "economy", "small", "mini"])) return presetByKey("light")
+  if (hasAnyToken(modelVariant, ["low", "fast", "lite", "light", "economy", "small", "mini"])) return presetByKey("flash")
   if (hasAnyToken(modelVariant, ["high", "xhigh", "max", "pro", "reasoning", "thinking"])) return presetByKey("heavy")
 
-  const explicitHeavy = hasAnyToken(explicitSource, ["heavy", "deep", "strong", "strongest", "pro", "max", "opus", "reason", "reasoning", "thinking"])
-  const explicitBasic = hasAnyToken(explicitSource, ["entry", "utility", "lookup", "finder", "find", "file", "files", "locate", "extract", "extraction", "retrieval", "data", "clerical", "volume", "luna", "nano", "micro", "tiny"])
-  const explicitLight = hasAnyToken(explicitSource, ["light", "lite", "fast", "flash", "haiku", "small", "mini", "cheap", "budget", "economy", "low", "terra"])
+  const explicitHeavy = hasAnyToken(explicitSource, ["heavy", "deep", "strong", "strongest", "pro", "max", "opus", "fable", "reason", "reasoning", "thinking"])
+  const explicitBasic = hasAnyToken(explicitSource, ["entry", "utility", "lookup", "finder", "find", "file", "files", "locate", "extract", "extraction", "retrieval", "data", "clerical", "volume", "luna", "nano", "micro", "tiny", "haiku", "lite"])
+  const explicitFlash = hasAnyToken(explicitSource, ["fast", "flash", "quick", "small", "cheap", "budget", "economy"])
+  const explicitLight = hasAnyToken(explicitSource, ["light", "mini", "terra", "sonnet"])
   if (explicitHeavy) return presetByKey("heavy")
   if (explicitBasic) return presetByKey("basic")
+  if (explicitFlash) return presetByKey("flash")
   if (explicitLight) return presetByKey("light")
 }
 

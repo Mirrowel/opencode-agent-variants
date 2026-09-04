@@ -269,6 +269,21 @@ function testSelectionTierInference() {
     { label: "unknown model uses nano alias fallback", key: "nano", model: "vendor/generic-model", expected: "basic" },
     { label: "unknown model uses heavy alias fallback", key: "heavy", model: "vendor/generic-model", expected: "heavy" },
     { label: "functional intent overrides model tier", key: "verification", model: "openai/gpt-5.6-luna", expected: "verification" },
+    // flash tier: distinct fast/secondary model lines.
+    { label: "GLM flash", key: "tier", model: "zai-coding-plan/glm-5.3-flash", expected: "flash" },
+    { label: "generic flash model", key: "tier", model: "vendor/model-flash", expected: "flash" },
+    { label: "generic fast model", key: "tier", model: "vendor/model-fast", expected: "flash" },
+    { label: "low reasoning variant on generic model", key: "tier", model: "vendor/generic-model", variant: "low", expected: "flash" },
+    { label: "explicit flash alias overrides Sol", key: "flash", model: "openai/gpt-5.6-sol", expected: "flash" },
+    // light tier: weaker siblings of the main family.
+    { label: "sonnet stays light", key: "tier", model: "vendor/claude-sonnet", expected: "light" },
+    { label: "light-named model stays light", key: "tier", model: "vendor/model-light", expected: "light" },
+    // basic tier: genuinely small lines.
+    { label: "haiku drops to basic", key: "tier", model: "vendor/claude-haiku", expected: "basic" },
+    { label: "lite drops to basic", key: "tier", model: "vendor/model-lite", expected: "basic" },
+    // heavy tier additions.
+    { label: "opus stays heavy", key: "tier", model: "vendor/claude-opus", expected: "heavy" },
+    { label: "fable is heavy", key: "tier", model: "vendor/model-fable", expected: "heavy" },
   ]
 
   for (const test of cases) {
@@ -280,7 +295,16 @@ function testSelectionTierInference() {
   assert(providerToken === undefined, "provider names must not be interpreted as model capability tiers")
   const semanticTaskName = inferredSelectionPreset("explore", "data-entry", { model: "vendor/generic-model" }, config)
   assert(semanticTaskName?.key === "basic", "semantic task names should provide a fallback when model capability is unknown")
-  assert(SELECTION_PRESETS[0]?.key === "basic", "basic should be the first capability preset below light")
+  // Capability ladder order: basic -> flash -> light -> heavy.
+  const tierKeys = SELECTION_PRESETS.slice(0, 4).map((preset) => preset.key)
+  assert(tierKeys.join(",") === "basic,flash,light,heavy", `capability presets should read basic,flash,light,heavy - got ${tierKeys.join(",")}`)
+  // The user's real explore variants infer exactly as configured.
+  const exploreHeavy = inferredSelectionPreset("explore", "heavy", { model: "zai-coding-plan/glm-5.3", variant: "max" }, config)
+  assert(exploreHeavy?.key === "heavy", "explore heavy stays heavy")
+  const exploreLight = inferredSelectionPreset("explore", "light", { model: "zai-coding-plan/glm-5.3-flash", variant: "high" }, config)
+  assert(exploreLight?.key === "light", "explicit light alias still wins over flash model inference")
+  const renamedExploreFlash = inferredSelectionPreset("explore", "flash", { model: "zai-coding-plan/glm-5.3-flash", variant: "high" }, config)
+  assert(renamedExploreFlash?.key === "flash", "renamed flash alias infers flash")
 }
 
 function testProfiles() {
