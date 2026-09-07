@@ -413,5 +413,161 @@ testMarkerlessDefaultAndLegacyScrub()
 testParallelBaseTaskCannotClaimVariantRoute()
 testRuntimeDependencyMetadata()
 testSelectionTierInference()
+await testLiveRepairNeverRevertsRunningParts()
+await testHistoryRepairSkipsRunningParts()
+
+async function testLiveRepairNeverRevertsRunningParts() {
+  const { repairLiveTaskPart, persistCleanedParts, LIVE_REPAIR_DELAYS } = __testInternals
+  const route = { alias: "explore-light", targetAgent: "explore", parent: "explore", model: "opencode/muse" }
+  const routes = new Map([["explore-light", route]])
+
+  const makePart = () => ({
+    id: "prt_race1",
+    messageID: "msg_race1",
+    sessionID: "ses_race1",
+    type: "tool",
+    tool: "task",
+    callID: "call_race1",
+    state: {
+      status: "running",
+      input: { subagent_type: "explore", prompt: "x", selected_alias: "explore-light" },
+      metadata: { sessionId: "ses_child1" },
+      time: { start: 1 },
+    },
+  })
+
+  // Fake client: reads return the CURRENT store clone; PATCHes apply
+  // last-write-wins (like the real DB + event bridge). `completeAfterMs`
+  // simulates OpenCode's processor completing the part AFTER the tool hook.
+  const makeClient = ({ completeAfterMs }) => {
+    const store = { part: makePart() }
+    const patches = []
+    const client = {
+      __patches: patches,
+      session: {
+        messages: async () => ({ data: [{ parts: [structuredClone(store.part)] }] }),
+        message: async () => ({ data: { parts: [structuredClone(store.part)] } }),
+      },
+      _client: {
+        patch: async (request) => {
+          patches.push(structuredClone(request.body))
+          store.part = structuredClone(request.body)
+          return { data: {}, response: { ok: true, status: 200 } }
+        },
+      },
+    }
+    if (completeAfterMs !== undefined) {
+      setTimeout(() => {
+        // Mirrors the processor's completed write: it carries the after-hook's
+        // mutated metadata (agentVariants) alongside status/output.
+        store.part = {
+          ...store.part,
+          state: {
+            ...store.part.state,
+            status: "completed",
+            output: "LIGHT-OK <task/>",
+            metadata: {
+              ...store.part.state.metadata,
+              agentVariants: { alias: "explore-light", routedAgent: "explore" },
+            },
+          },
+        }
+      }, completeAfterMs)
+    }
+    return client
+  }
+
+  // 1. The production race: the repair's first reads see `running`, the
+  //    processor completes the part mid-ladder. The repair must NEVER write a
+  //    running snapshot over the completed one.
+  {
+    const client = makeClient({ completeAfterMs: 120 })
+    const repaired = repairLiveTaskPart({
+      client,
+      directory: "dir",
+      sessionID: "ses_race1",
+      callID: "call_race1",
+      route,
+      routes,
+      debug: false,
+    })
+    const finished = await Promise.race([
+      repaired.then(() => true),
+      new Promise((resolve) => setTimeout(() => resolve(false), 15000)),
+    ])
+    if (!finished) throw new Error("live repair did not settle within the ladder")
+    const statuses = client.__patches.map((body) => body.state?.status)
+    if (client.__patches.length === 0) throw new Error("live repair should repair once the part completes")
+    if (!statuses.every((status) => status === "completed")) throw new Error(`live repair wrote non-completed snapshots: ${statuses.join(",")}`)
+    const final = client.__patches.at(-1)
+    if (final.state.metadata?.agentVariants?.alias !== "explore-light") throw new Error("live repair must stamp agentVariants metadata")
+    if (final.state.input?.selected_alias !== undefined) throw new Error("live repair must scrub plugin arg keys")
+  }
+
+  // 2. A part that never completes is left untouched.
+  {
+    const original = [...LIVE_REPAIR_DELAYS]
+    LIVE_REPAIR_DELAYS.length = 0
+    LIVE_REPAIR_DELAYS.push(0, 5, 10)
+    try {
+      const client = makeClient({ completeAfterMs: undefined })
+      return repairLiveTaskPart({ client, directory: "dir", sessionID: "ses_race1", callID: "call_race1", route, routes, debug: false }).then(() => {
+        try {
+          if (client.__patches.length !== 0) throw new Error("live repair must not touch a part that never completed")
+        } finally {
+          LIVE_REPAIR_DELAYS.length = 0
+          for (const value of original) LIVE_REPAIR_DELAYS.push(value)
+        }
+      })
+    } catch (error) {
+      LIVE_REPAIR_DELAYS.length = 0
+      for (const value of original) LIVE_REPAIR_DELAYS.push(value)
+      throw error
+    }
+  }
+}
+
+async function testHistoryRepairSkipsRunningParts() {
+  const { persistCleanedParts } = __testInternals
+  const route = { alias: "explore-light", targetAgent: "explore", parent: "explore", model: "opencode/muse" }
+  const routes = new Map([["explore-light", route]])
+  const snapshot = {
+    id: "prt_hist1",
+    messageID: "msg_hist1",
+    sessionID: "ses_hist1",
+    type: "tool",
+    tool: "task",
+    callID: "call_hist1",
+    state: {
+      status: "completed",
+      input: { subagent_type: "explore", prompt: "x" },
+      output: "done",
+      metadata: { sessionId: "ses_child2" },
+      time: { start: 1, end: 2 },
+    },
+  }
+  // Fresh stored state is RUNNING (processor has not persisted completion
+  // yet) - the history repair must skip instead of writing anything.
+  const client = {
+    session: {
+      messages: async () => ({ data: [{ parts: [{ ...snapshot, state: { ...snapshot.state, status: "running", output: undefined } }] }] }),
+      message: async () => ({ data: { parts: [{ ...snapshot, state: { ...snapshot.state, status: "running", output: undefined } }] } }),
+    },
+    _client: {
+      patch: async () => {
+        throw new Error("history repair must not PATCH a running stored part")
+      },
+    },
+  }
+  const result = await persistCleanedParts(
+    client,
+    "dir",
+    [{ part: structuredClone(snapshot), before: "a", after: "b", cleaned: 1 }],
+    routes,
+    false,
+    "history",
+  )
+  if (result.repaired !== 0) throw new Error(`history repair should skip running parts, repaired=${result.repaired}`)
+}
 
 console.log("regression tests passed")

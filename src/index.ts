@@ -69,7 +69,7 @@ const ROUTE_ATTR_RE = /\s+(?:agent_variant|routed_agent|parent_agent|effective_m
 const ROUTE_STANDALONE_RE = /\n?\s*<agent_variant\b[^>]*\/?>\s*\n?/g
 const ROUTE_ARG_FRAGMENT_RE = /\s*(?:selected_alias|agent_variant|routed_agent|parent_agent|effective_model|model_variant)=(?:"[^"]*"|\\"[^\\]*\\")/g
 const PLUGIN_ARG_KEYS = ["selected_alias", "agent_variant", "routed_agent", "parent_agent", "effective_model", "model_variant"] as const
-const LIVE_REPAIR_DELAYS = [0, 50, 250, 1000]
+const LIVE_REPAIR_DELAYS = [0, 100, 400, 1500, 3000, 4000]
 const TOAST_TIMEOUT = 1500
 const CATALOG_FETCH_TIMEOUT = 3000
 const CLIENT_CALL_TIMEOUT = 3000
@@ -258,6 +258,9 @@ export const __testInternals = {
   scrubParts,
   scrubTaskInput,
   scrubTaskOutput,
+  repairLiveTaskPart,
+  persistCleanedParts,
+  LIVE_REPAIR_DELAYS,
 }
 
 function routeModel(route: RuntimeRoute) {
@@ -831,16 +834,37 @@ async function persistCleanedParts(client: any, directory: string, parts: Change
       failures: parts.map((entry) => ({ id: entry.part.id, message: "OpenCode SDK raw client is unavailable" })),
     }
   }
+  let repaired = 0
   for (const entry of parts) {
     const part = entry.part
     debugLog(debugEnabledFlag, `Agent variant ${label} repair diff`, `${part.id}: cleaned=${entry.cleaned}; ${diffSnippet(entry.before, entry.after)}`)
     try {
+      // Re-read the CURRENT stored part before writing. The hook snapshot can
+      // be stale relative to OpenCode's own writes (the processor completes
+      // the part right after tool.execute.after returns); PATCHing a stale
+      // whole-part snapshot can land after that final write and revert the
+      // part to running forever. Only completed task parts are repaired -
+      // `completed` is terminal in OpenCode's processor, so the fresh read
+      // has no further writer to race against.
+      const fresh = await getStoredPart(client, directory, part)
+      if (!fresh) {
+        failures.push({ id: part.id, message: "stored part disappeared before repair" })
+        continue
+      }
+      const freshStatus = (fresh as { state?: { status?: string } }).state?.status
+      if (freshStatus !== "completed") {
+        debugLog(debugEnabledFlag, `Agent variant ${label} repair skipped`, `${part.id}: stored status=${freshStatus ?? "unknown"}; only completed task parts are repaired`)
+        continue
+      }
+      const freshCopy = structuredClone(fresh)
+      const freshScrub = scrubParts([freshCopy], { routes })
+      if (freshScrub.count === 0) continue
       const result = await safeClientCall(() =>
         rawClient.patch({
           url: "/session/{sessionID}/message/{messageID}/part/{partID}",
           path: { sessionID: part.sessionID, messageID: part.messageID, partID: part.id },
           query: { directory },
-          body: part,
+          body: freshCopy,
           headers: { "content-type": "application/json" },
         }),
       )
@@ -859,11 +883,12 @@ async function persistCleanedParts(client: any, directory: string, parts: Change
       const verification = partIsClean(stored, routes)
       debugLog(debugEnabledFlag, `Agent variant ${label} repair verify`, `${part.id}: clean=${verification.clean}; stored=${debugPartSnapshot(stored)}; verificationAfter=${debugPartSnapshot(verification.after)}`)
       if (!verification.clean) failures.push({ id: part.id, message: `persistent repair did not stick; ${verification.cleaned} artifact(s) still detected after read-back` })
+      else repaired += 1
     } catch (error) {
       failures.push({ id: part.id, message: error instanceof Error ? error.message : String(error) })
     }
   }
-  return { repaired: parts.length - failures.length, failures }
+  return { repaired, failures }
 }
 
 async function delay(ms: number) {
@@ -915,6 +940,17 @@ async function repairLiveTaskPart(input: { client: any; directory: string; sessi
       debugLog(input.debug, "Agent variant live repair pending", `${input.callID}: stored task part not found after ${wait}ms`)
       continue
     }
+    // NEVER write a snapshot of a non-completed part. OpenCode completes the
+    // part shortly after the after-hook returns; a read-modify-write with a
+    // pre-completion snapshot can land after that final write and silently
+    // revert the part to running forever (parallel variant task calls lost
+    // their results this way). `completed` is terminal in OpenCode's
+    // processor, so once we see it there is no further writer to race.
+    const storedStatus = (stored as { state?: { status?: string } }).state?.status
+    if (storedStatus !== "completed") {
+      debugLog(input.debug, "Agent variant live repair waiting", `${stored.id}: status=${storedStatus ?? "unknown"} after ${wait}ms; waiting for the task part to complete before repairing`)
+      continue
+    }
     const cleaned = cleanTaskPartForRoute(stored, input.route, input.routes)
     if (cleaned.before === cleaned.after) {
       debugLog(input.debug, "Agent variant live repair skipped", `${stored.id}: already clean`)
@@ -927,6 +963,7 @@ async function repairLiveTaskPart(input: { client: any; directory: string; sessi
     }
     debugLog(input.debug, "Agent variant live repair failed", `${stored.id}: ${repair.failures.map((failure) => `${failure.id}: ${failure.message}`).join("; ")}`)
   }
+  debugLog(input.debug, "Agent variant live repair gave up", `${input.callID}: part never reached a completed state; leaving stored data untouched`)
 }
 
 async function warningToast(client: any, diagnostic: Diagnostic) {
@@ -1213,7 +1250,10 @@ const plugin: Plugin = async (input) => {
         args.subagent_type = route.alias
       }
       const cleanedArgs = scrubTaskInput(hookInput.args, { routes: virtualRoutes }, route.alias)
-      output.title = `${output.title} (@${route.alias} variant)`
+      const variantSuffix = ` (@${route.alias} variant)`
+      if (typeof output.title === "string" && !output.title.endsWith(variantSuffix)) {
+        output.title = `${output.title}${variantSuffix}`
+      }
       output.metadata = {
         ...output.metadata,
         agentVariants: {
