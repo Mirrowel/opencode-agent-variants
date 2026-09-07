@@ -2,6 +2,11 @@ import { readFileSync } from "node:fs"
 import { __testAssembleAgents, __testInternals } from "../dist/index.js"
 import { emptyConfig, inferredSelectionPreset, SELECTION_PRESETS, SidecarConfig, profileMatchesModel, resolveActiveProfile, overlayProfilePatch, profileVariantPatch, profileParentPatch, profileFieldSource, setProfileFieldIn } from "../dist/config.js"
 import { currentPaletteCategory, declarePaletteCategory, reconcilePaletteCategories, __resetPaletteRegistry } from "../dist/palette-category.js"
+import { isAgentVariantsSpec, isConfigStudioSpec, ensureTuiRegistration } from "../dist/selfwire.js"
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { pathToFileURL } from "node:url"
 
 function assert(condition, message) {
   if (!condition) throw new Error(message)
@@ -569,5 +574,99 @@ async function testHistoryRepairSkipsRunningParts() {
   )
   if (result.repaired !== 0) throw new Error(`history repair should skip running parts, repaired=${result.repaired}`)
 }
+
+function testSelfwire() {
+  // Identity matching: npm specs AND local checkout folders.
+  assert(isAgentVariantsSpec("@mirrowel/opencode-agent-variants"), "npm spec matches")
+  assert(isAgentVariantsSpec("@mirrowel/opencode-agent-variants@dev"), "tagged npm spec matches")
+  assert(isAgentVariantsSpec("file:///C:/Projects/OC%20Plugins/agent-variants"), "local checkout folder matches")
+  assert(isAgentVariantsSpec("file:///C:/cache/@mirrowel/opencode-agent-variants@dev"), "cache folder matches")
+  assert(!isAgentVariantsSpec("@mirrowel/opencode-config-studio"), "studio spec does not match")
+  assert(!isAgentVariantsSpec("file:///C:/Projects/OC%20Plugins/opencode-config-studio"), "studio folder does not match")
+  assert(isConfigStudioSpec("file:///C:/Projects/OC%20Plugins/opencode-config-studio"), "studio folder detected")
+  assert(isConfigStudioSpec("@mirrowel/opencode-config-studio@latest"), "studio npm detected")
+
+  // No registration -> no-op.
+  {
+    const dir = mkdtempSync(join(tmpdir(), "av-selfwire-"))
+    const globalDir = join(dir, "global")
+    mkdirSync(globalDir, { recursive: true })
+    try {
+      writeFileSync(join(globalDir, "opencode.json"), JSON.stringify({ plugin: ["@cortexkit/other"] }), "utf8")
+      const result = ensureTuiRegistration({ env: { OPENCODE_CONFIG_DIR: globalDir } })
+      if (result.status !== "not-registered") throw new Error(`expected not-registered, got ${result.status}`)
+      if (existsSync(join(globalDir, "tui.json"))) throw new Error("tui.json must not be created")
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  // Studio present anywhere -> stands down even with AV registered.
+  {
+    const dir = mkdtempSync(join(tmpdir(), "av-selfwire-"))
+    const globalDir = join(dir, "global")
+    mkdirSync(globalDir, { recursive: true })
+    try {
+      writeFileSync(
+        join(globalDir, "opencode.json"),
+        JSON.stringify({ plugin: ["@mirrowel/opencode-agent-variants", "file:///C:/somewhere/opencode-config-studio"] }),
+        "utf8",
+      )
+      const result = ensureTuiRegistration({ env: { OPENCODE_CONFIG_DIR: globalDir } })
+      if (result.status !== "skipped-studio") throw new Error(`expected skipped-studio, got ${result.status}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  // Mirrors the registration level; local wins over npm; already-wired is a
+  // no-op; stale/mismatched mirrors auto-correct.
+  {
+    const dir = mkdtempSync(join(tmpdir(), "av-selfwire-"))
+    const globalDir = join(dir, "global")
+    const project = join(dir, "project", "src")
+    const localRepo = join(dir, "agent-variants")
+    mkdirSync(globalDir, { recursive: true })
+    mkdirSync(project, { recursive: true })
+    mkdirSync(localRepo, { recursive: true })
+    const localSpec = pathToFileURL(localRepo).href
+    try {
+      writeFileSync(join(globalDir, "opencode.json"), JSON.stringify({ plugin: ["@cortexkit/other", "@mirrowel/opencode-agent-variants@latest", localSpec] }), "utf8")
+      writeFileSync(join(globalDir, "tui.json"), JSON.stringify({ plugin: ["@cortexkit/magic"] }), "utf8")
+
+      const first = ensureTuiRegistration({ env: { OPENCODE_CONFIG_DIR: globalDir } })
+      if (first.status !== "wired" || first.spec !== localSpec) throw new Error(`local must win: ${JSON.stringify(first)}`)
+      const tui = JSON.parse(readFileSync(join(globalDir, "tui.json"), "utf8"))
+      if (!tui.plugin.includes(localSpec) || !tui.plugin.includes("@cortexkit/magic")) throw new Error(`wire keeps foreign entries: ${JSON.stringify(tui.plugin)}`)
+
+      const second = ensureTuiRegistration({ env: { OPENCODE_CONFIG_DIR: globalDir } })
+      if (second.status !== "already-wired") throw new Error(`idempotent: ${second.status}`)
+
+      // Mismatch correction: tui carries npm while server prefers local.
+      writeFileSync(join(globalDir, "tui.json"), JSON.stringify({ plugin: ["@cortexkit/magic", "@mirrowel/opencode-agent-variants@dev", "@mirrowel/opencode-agent-variants@latest"] }), "utf8")
+      const third = ensureTuiRegistration({ env: { OPENCODE_CONFIG_DIR: globalDir } })
+      if (third.status !== "corrected") throw new Error(`expected corrected, got ${third.status}`)
+      const fixed = JSON.parse(readFileSync(join(globalDir, "tui.json"), "utf8"))
+      const own = fixed.plugin.filter((entry) => isAgentVariantsSpec(entry))
+      if (own.length !== 1 || own[0] !== localSpec) throw new Error(`dedup + local alignment failed: ${JSON.stringify(fixed.plugin)}`)
+
+      // Project-level registration mirrors to the project tui.json.
+      writeFileSync(join(project, "opencode.json"), JSON.stringify({ plugin: [localSpec] }), "utf8")
+      rmSync(join(globalDir, "opencode.json"))
+      const fourth = ensureTuiRegistration({ env: { OPENCODE_CONFIG_DIR: globalDir }, directory: project, worktree: join(dir, "project") })
+      if (fourth.status !== "corrected" && fourth.status !== "wired") throw new Error(`project mirror failed: ${JSON.stringify(fourth)}`)
+      const projectTui = JSON.parse(readFileSync(join(project, "tui.json"), "utf8"))
+      if (!projectTui.plugin.includes(localSpec)) throw new Error(`project tui must carry the spec: ${JSON.stringify(projectTui)}`)
+      const globalTui = JSON.parse(readFileSync(join(globalDir, "tui.json"), "utf8"))
+      if (globalTui.plugin.some((entry) => isAgentVariantsSpec(entry))) throw new Error(`stale global mirror must be pruned: ${JSON.stringify(globalTui)}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+}
+
+testSelfwire()
+await testLiveRepairNeverRevertsRunningParts()
+await testHistoryRepairSkipsRunningParts()
 
 console.log("regression tests passed")

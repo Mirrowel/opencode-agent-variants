@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto"
 import { appendFileSync } from "node:fs"
 import type { Plugin } from "@opencode-ai/plugin"
+import { ensureTuiRegistration } from "./selfwire.js"
 import {
   applyPromptPatch,
   applyModelPresetPatch,
@@ -1114,6 +1115,16 @@ function liveRoute(staticRoute: RuntimeRoute, catalog: ModelCatalog | undefined,
 
 const plugin: Plugin = async (input) => {
   const sidecar = loadSidecar(defaultSidecarPath())
+  // v1-only: mirror the standalone server registration into tui.json at the
+  // same config level. Stands down entirely when Config Studio is registered
+  // anywhere (it embeds agent-variants and provides the wizard UI). v2 hosts
+  // never reach this - their setup auto-discovers ./tui.
+  const wire = ensureTuiRegistration({ directory: input.directory, worktree: input.worktree })
+  if (wire.status === "wired" || wire.status === "corrected") {
+    debugLog(sidecar.debug, "Agent variant self-wire", `${wire.status}: ${wire.spec} -> ${"target" in wire ? wire.target : ""}`)
+  } else if (wire.status === "failed") {
+    debugLog(sidecar.debug, "Agent variant self-wire failed", wire.error)
+  }
   let virtualRoutes = new Map<string, RuntimeRoute>()
   let parentPromptPatches = new Map<string, AgentPatch>()
   let parentRequestPatches = new Map<string, AgentPatch>()
