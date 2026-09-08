@@ -622,6 +622,17 @@ function debugLog(_enabled: boolean, title: string, message: string) {
   }
 }
 
+/** Anomaly-class logging that persists even with debug mode off: any warning
+ * that reaches the user as a toast (or should have) also lands in the debug
+ * log so post-hoc forensics never depend on the debug switch. */
+function alwaysLog(title: string, message: string) {
+  try {
+    appendFileSync(debugLogPath(defaultConfigDir()), `${new Date().toISOString()} [always] ${title}: ${message}\n`)
+  } catch {
+    // Logging should never affect routing.
+  }
+}
+
 function serial(value: unknown) {
   return JSON.stringify(value)
 }
@@ -1185,6 +1196,12 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
     for (const diagnostic of diagnostics) {
       if (diagnostic.level === "info") continue
       const key = diagnosticKey(diagnostic)
+      // Every user-visible warning/error diagnostic is captured to the debug
+      // log unconditionally - the debug flag gates chatter, not evidence.
+      alwaysLog(
+        "diagnostic queued",
+        `${diagnostic.level}: ${diagnostic.message}${diagnostic.agent ? `; agent=${diagnostic.agent}` : ""}${diagnostic.alias ? `; alias=${diagnostic.alias}` : ""}`,
+      )
       if (!diagnosticQueue.has(key)) diagnosticQueue.set(key, { diagnostic, attempts: 0 })
     }
     if (diagnosticQueue.size > 0) scheduleDiagnosticFlush()
@@ -1271,19 +1288,21 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
       const usePromptMarker = promptMarkersEnabled()
       const token = usePromptMarker ? randomUUID() : undefined
       if (token) tokenRoutes.set(token, route)
+      // One canonical route object per call: byCall, the pending queue, and
+      // session bindings all share this instance so per-call bookkeeping
+      // (appliedCount) is always read from the object the after-hook holds.
+      // Spreading a copy here previously split the counters in two.
+      const callRoute = route as RuntimeRoute & Pick<PendingRoute, "token" | "callID" | "parentSessionID" | "createdAt">
+      callRoute.token = token
+      callRoute.callID = hookInput.callID
+      callRoute.parentSessionID = hookInput.sessionID
+      callRoute.createdAt = Date.now()
       byCall.set(hookInput.callID, route)
       // Continuation: the child session id is known up front, so the session
       // route is registered immediately - chat.message then correlates with
       // zero parent-history fetches (deterministic regardless of size).
       if (continuation) bindSessionRoute(bySession, continuation, route)
-      pending.push({
-        ...route,
-        token,
-        callID: hookInput.callID,
-        parentSessionID: hookInput.sessionID,
-        targetAgent: route.targetAgent,
-        createdAt: Date.now(),
-      })
+      pending.push(callRoute as PendingRoute)
       if (args.description && !args.description.includes(`@${route.alias} variant`)) {
         args.description = `${args.description} (@${route.alias} variant)`
       }
@@ -1301,6 +1320,27 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
       const route = byCall.get(hookInput.callID)
       if (!route) return
       byCall.delete(hookInput.callID)
+      if (!route.appliedCount) {
+        // The variant was requested and the after-hook annotated the part, but
+        // the model override never landed on any child message (correlation
+        // miss) - the child silently ran the default model. Surface it instead
+        // of letting the annotation claim otherwise. Checked BEFORE the
+        // unbind so the bound child list is still intact for the trace.
+        const boundBefore = (route.boundSessions ?? []).join(", ")
+        const neverApplied = `Variant ${route.alias} was requested but its model override was never applied - the subagent ran the default model (correlation miss; call=${hookInput.callID}). If this repeats, please report it.`
+        alwaysLog(
+          "Agent variant route never applied",
+          `${routeSummary(route)}; call=${hookInput.callID}; bound=[${boundBefore}]; child messages ran the session-default model`,
+        )
+        queueDiagnostics([
+          {
+            level: "warning",
+            message: neverApplied,
+            agent: route.parent,
+            alias: route.alias,
+          },
+        ])
+      }
       // The call is over: release the session bindings it established. Later
       // manual or automated messages to this subagent session must run the
       // session's own model, not a stale variant route.
@@ -1322,21 +1362,6 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
         },
       }
       output.output = cleanTaskOutput(output.output)
-      if (!route.appliedCount) {
-        // The variant was requested and the after-hook annotated the part, but
-        // the model override never landed on any child message (correlation
-        // miss) - the child silently ran the default model. Surface it instead
-        // of letting the annotation claim otherwise.
-        debugLog(sidecar.debug, "Agent variant route never applied", `${routeSummary(route)}; call=${hookInput.callID}; child messages ran the session-default model`)
-        queueDiagnostics([
-          {
-            level: "warning",
-            message: `Variant ${route.alias} was requested but its model override was never applied - the subagent ran the default model (correlation miss). If this repeats, please report it.`,
-            agent: route.parent,
-            alias: route.alias,
-          },
-        ])
-      }
       void repairLiveTaskPart({
         client: input.client,
         directory: input.directory,

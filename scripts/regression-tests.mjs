@@ -673,6 +673,8 @@ await testHistoryRepairSkipsRunningParts()
 async function testCorrelationV2() {
   const { createHooks } = __testInternals
   const messagesCalls = []
+  const toasts = []
+  let newPartStatus = "running"
   // liveRoute hot-reloads the sidecar from the real config dir; point HOME at
   // a temp profile so validation sees exactly this test's variant.
   const tmpHome = mkdtempSync(path.join(tmpdir(), "av-live-"))
@@ -684,9 +686,9 @@ async function testCorrelationV2() {
   const realHome = process.env.HOME
   process.env.USERPROFILE = tmpHome
   process.env.HOME = tmpHome
-  const childPartFor = (child, callID, status) => ({
+  const childPartFor = (child, callID) => ({
     id: `prt_${child}`, type: "tool", tool: "task", callID,
-    state: { status, input: { subagent_type: "explore" }, metadata: { sessionId: child } },
+    state: { status: child === "ses_child_new" ? newPartStatus : "completed", input: { subagent_type: "explore" }, metadata: { sessionId: child } },
   })
   const sessions = new Map([
     ["ses_parent", { id: "ses_parent", model: { providerID: "closedrouter", modelID: "glm-5.3" } }],
@@ -694,11 +696,17 @@ async function testCorrelationV2() {
     ["ses_child_new", { id: "ses_child_new", parentID: "ses_parent" }],
   ])
   const fakeClient = {
+    tui: {
+      showToast: async (payload) => {
+        toasts.push(JSON.stringify(payload))
+        return true
+      },
+    },
     session: {
       get: async ({ path }) => ({ data: sessions.get(path.id) }),
       messages: async ({ path, query }) => {
         messagesCalls.push({ path: path.id, query })
-        return { data: [{ parts: [childPartFor("ses_child_new", "call_new", "running")] }] }
+        return { data: [{ parts: [childPartFor("ses_child_new", "call_new")] }] }
       },
     },
   }
@@ -747,6 +755,37 @@ async function testCorrelationV2() {
   const afterBase = { message: { model: { providerID: "closedrouter", modelID: "glm-5.3" } }, parts: [] }
   await hooks["chat.message"]({ sessionID: "ses_child1", agent: "explore" }, afterBase)
   assert(afterBase.message.model.providerID === "closedrouter", "base continuation must not inherit the stale variant route")
+
+  // 5) Route-object identity: a call whose model applied via the pending/
+  //    correlation path must NOT trigger the never-applied diagnostic (the
+  //    pending entry and the byCall route are now the same instance).
+  newPartStatus = "completed"
+  await hooks["tool.execute.after"](
+    { tool: "task", sessionID: "ses_parent", callID: "call_new", args: { subagent_type: "explore", prompt: "x" } },
+    { title: "t", output: "ok", metadata: {} },
+  )
+  await new Promise((resolve) => setTimeout(resolve, 1100))
+  assert(!toasts.some((toast) => toast.includes("never applied")), `applied call must not warn (got: ${toasts.join(" | ")})`)
+
+  // 6) Genuine miss: route requested, no child message ever applied -> the
+  //    diagnostic fires with the call id, and lands in the debug log even
+  //    with debug mode off ([always] line).
+  await hooks["tool.execute.before"](
+    { tool: "task", sessionID: "ses_parent", callID: "call_miss" },
+    { args: { subagent_type: "explore-light", prompt: "x" } },
+  )
+  await hooks["tool.execute.after"](
+    { tool: "task", sessionID: "ses_parent", callID: "call_miss", args: { subagent_type: "explore", prompt: "x" } },
+    { title: "t", output: "ok", metadata: {} },
+  )
+  await new Promise((resolve) => setTimeout(resolve, 1100))
+  const missToast = toasts.find((toast) => toast.includes("never applied"))
+  assert(missToast, "genuine correlation miss must warn")
+  assert(missToast.includes("call_miss"), "the never-applied warning carries the call id")
+  const debugLogText = readFileSync(path.join(tmpHome, ".config", "opencode", "agent-variants.debug.log"), "utf8")
+  assert(debugLogText.includes("[always] Agent variant route never applied") && debugLogText.includes("call_miss"), "never-applied anomaly is captured unconditionally in the debug log")
+  assert(debugLogText.includes("[always] diagnostic queued"), "queued warning diagnostics are captured unconditionally")
+
   process.env.USERPROFILE = realProfile
   process.env.HOME = realHome
   rmSync(tmpHome, { recursive: true, force: true })
@@ -755,3 +794,4 @@ async function testCorrelationV2() {
 await testCorrelationV2()
 
 console.log("regression tests passed")
+process.exit(0)
