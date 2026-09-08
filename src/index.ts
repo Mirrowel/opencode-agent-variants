@@ -47,6 +47,12 @@ type RuntimeRoute = {
   base?: AgentPatch
   /** Name of the profile whose overlay shaped this route, if any. */
   profile?: string
+  /** Count of child messages this route's model override was applied to. */
+  appliedCount?: number
+  /** Child sessions bound to this route for the lifetime of its task call.
+   * Cleared in tool.execute.after so post-call manual/automated messages to a
+   * subagent session are never overridden by a stale route. */
+  boundSessions?: string[]
 }
 type PendingRoute = RuntimeRoute & {
   token?: string
@@ -262,6 +268,7 @@ export const __testInternals = {
   repairLiveTaskPart,
   persistCleanedParts,
   LIVE_REPAIR_DELAYS,
+  createHooks,
 }
 
 function routeModel(route: RuntimeRoute) {
@@ -502,6 +509,18 @@ function cleanupPending(list: PendingRoute[], routes?: Map<string, RuntimeRoute>
   }
 }
 
+function bindSessionRoute(routesBySession: Map<string, RuntimeRoute>, childSessionID: string, route: RuntimeRoute) {
+  routesBySession.set(childSessionID, route)
+  route.boundSessions = [...(route.boundSessions ?? []), childSessionID]
+}
+
+function unbindSessionRoutes(routesBySession: Map<string, RuntimeRoute>, route: RuntimeRoute) {
+  for (const child of route.boundSessions ?? []) {
+    if (routesBySession.get(child) === route) routesBySession.delete(child)
+  }
+  route.boundSessions = []
+}
+
 function correlateTaskRoute(
   list: PendingRoute[],
   routesByCall: Map<string, RuntimeRoute>,
@@ -511,13 +530,21 @@ function correlateTaskRoute(
   parentTaskPart: any,
 ) {
   if (!parentTaskPart) return { route: undefined, proof: undefined }
+  // The stored-alias fallback is only authoritative while the call is still
+  // in flight (or the status is unknown/legacy): once the part explicitly
+  // completed, this message belongs to a manual or automated continuation,
+  // and those must respect the session's own model.
+  const partRunning = (parentTaskPart.state as { status?: string } | undefined)?.status !== "completed"
   const metadataRoute = takePendingByCallID(list, parentTaskPart?.callID)
     ?? takePendingByCallID(list, parentTaskPart?.id)
     ?? routesByCall.get(parentTaskPart?.callID)
     ?? routesByCall.get(parentTaskPart?.id)
-    ?? routeForAlias(metadataAlias(parentTaskPart.state?.metadata, knownRoutes), knownRoutes)
+    // The stored-alias fallback is only authoritative while the call is still
+    // in flight: once the part completed, this message belongs to a manual or
+    // automated continuation, and those must respect the session's own model.
+    ?? (partRunning ? routeForAlias(metadataAlias(parentTaskPart.state?.metadata, knownRoutes), knownRoutes) : undefined)
   if (metadataRoute) {
-    routesBySession.set(childSessionID, metadataRoute)
+    bindSessionRoute(routesBySession, childSessionID, metadataRoute)
     return { route: metadataRoute, proof: "metadata" as const }
   }
   routesBySession.delete(childSessionID)
@@ -676,19 +703,25 @@ async function getStoredPart(client: any, directory: string, part: any) {
   return message?.parts?.find((item) => item?.id === part.id)
 }
 
-async function getStoredMessages(client: any, directory: string, sessionID: string, timeoutMs = CLIENT_CALL_TIMEOUT) {
+async function getStoredMessages(client: any, directory: string, sessionID: string, timeoutMs = CLIENT_CALL_TIMEOUT, limit?: number) {
   const response = await safeClientCall(() =>
     client?.session?.messages?.({
       path: { id: sessionID },
-      query: { directory },
+      query: limit !== undefined ? { directory, limit } : { directory },
     }),
     timeoutMs,
   )
   return getData(response) as Array<{ info?: unknown; parts?: any[] }> | undefined
 }
 
-async function findStoredTaskPartByCallID(client: any, directory: string, sessionID: string, callID: string) {
-  const messages = await getStoredMessages(client, directory, sessionID)
+/** Tail-window sizes for parent-history lookups. Correlation and repair only
+ * ever need the newest messages (the task part is at/near the end), so every
+ * fetch is bounded regardless of session size — full-list scans are gone. */
+const PARENT_TAIL_WINDOW = 16
+const PARENT_TAIL_WINDOW_WIDE = 48
+
+async function findStoredTaskPartByCallID(client: any, directory: string, sessionID: string, callID: string, limit?: number) {
+  const messages = await getStoredMessages(client, directory, sessionID, CLIENT_CALL_TIMEOUT, limit)
   if (!messages) return
   for (const message of [...messages].reverse()) {
     for (const part of [...(message.parts ?? [])].reverse()) {
@@ -704,9 +737,9 @@ function taskChildSessionID(part: any) {
   return typeof sessionID === "string" ? sessionID : undefined
 }
 
-async function findParentTaskPartForChild(client: any, directory: string, parentSessionID: string | undefined, childSessionID: string, timeoutMs = CLIENT_CALL_TIMEOUT) {
+async function findParentTaskPartForChild(client: any, directory: string, parentSessionID: string | undefined, childSessionID: string, timeoutMs = CLIENT_CALL_TIMEOUT, limit?: number) {
   if (!parentSessionID) return
-  const messages = await getStoredMessages(client, directory, parentSessionID, timeoutMs)
+  const messages = await getStoredMessages(client, directory, parentSessionID, timeoutMs, limit)
   if (!messages) return
   for (const message of [...messages].reverse()) {
     for (const part of [...(message.parts ?? [])].reverse()) {
@@ -717,14 +750,19 @@ async function findParentTaskPartForChild(client: any, directory: string, parent
 
 async function findParentTaskContext(client: any, directory: string, childSessionID: string) {
   let session: { parentID?: string; agent?: string; model?: { providerID?: string; id?: string; variant?: string } } | undefined
+  let attempt = 0
   for (const wait of ROUTE_LOOKUP_DELAYS) {
     await delay(wait)
     if (!session) {
       session = await getSession(client, childSessionID, ROUTE_LOOKUP_TIMEOUT)
       if (session && !session.parentID) return { parentTaskPart: undefined, parentSessionID: undefined }
     }
-    const parentTaskPart = await findParentTaskPartForChild(client, directory, session?.parentID, childSessionID, ROUTE_LOOKUP_TIMEOUT)
+    // Early retries scan a small tail window; later retries widen it in case
+    // the task part slid further back. Both stay bounded by message count.
+    const window = attempt === 0 ? PARENT_TAIL_WINDOW : PARENT_TAIL_WINDOW_WIDE
+    const parentTaskPart = await findParentTaskPartForChild(client, directory, session?.parentID, childSessionID, ROUTE_LOOKUP_TIMEOUT, window)
     if (parentTaskPart) return { parentTaskPart, parentSessionID: session?.parentID }
+    attempt++
   }
   return { parentTaskPart: undefined, parentSessionID: undefined }
 }
@@ -934,9 +972,11 @@ function toastVariant(diagnostic: Diagnostic) {
 }
 
 async function repairLiveTaskPart(input: { client: any; directory: string; sessionID: string; callID: string; route: RuntimeRoute; routes: Map<string, RuntimeRoute>; debug: boolean }) {
+  let attempt = 0
   for (const wait of LIVE_REPAIR_DELAYS) {
     await delay(wait)
-    const stored = await findStoredTaskPartByCallID(input.client, input.directory, input.sessionID, input.callID)
+    const stored = await findStoredTaskPartByCallID(input.client, input.directory, input.sessionID, input.callID, attempt === 0 ? PARENT_TAIL_WINDOW : PARENT_TAIL_WINDOW_WIDE)
+    attempt++
     if (!stored) {
       debugLog(input.debug, "Agent variant live repair pending", `${input.callID}: stored task part not found after ${wait}ms`)
       continue
@@ -1022,6 +1062,7 @@ function resetGeneratedRequest(output: { temperature?: number; topP?: number; op
 }
 
 function applyMessageModel(output: { message: { model?: { providerID: string; modelID: string; variant?: string } } }, route: RuntimeRoute) {
+  route.appliedCount = (route.appliedCount ?? 0) + 1
   const model = splitModelRef(route.model)
   const baseModel = splitModelRef(route.base?.model)
   if (model) {
@@ -1113,18 +1154,11 @@ function liveRoute(staticRoute: RuntimeRoute, catalog: ModelCatalog | undefined,
   }
 }
 
-const plugin: Plugin = async (input) => {
-  const sidecar = loadSidecar(defaultSidecarPath())
-  // v1-only: mirror the standalone server registration into tui.json at the
-  // same config level. Stands down entirely when Config Studio is registered
-  // anywhere (it embeds agent-variants and provides the wizard UI). v2 hosts
-  // never reach this - their setup auto-discovers ./tui.
-  const wire = ensureTuiRegistration({ directory: input.directory, worktree: input.worktree })
-  if (wire.status === "wired" || wire.status === "corrected") {
-    debugLog(sidecar.debug, "Agent variant self-wire", `${wire.status}: ${wire.spec} -> ${"target" in wire ? wire.target : ""}`)
-  } else if (wire.status === "failed") {
-    debugLog(sidecar.debug, "Agent variant self-wire failed", wire.error)
-  }
+type V1HookSet = Awaited<ReturnType<Plugin>>
+
+/** Builds the v1 hook set. `plugin` loads the real sidecar and runs the
+ * self-wire; tests inject their own sidecar through __testInternals. */
+async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig): Promise<V1HookSet> {
   let virtualRoutes = new Map<string, RuntimeRoute>()
   let parentPromptPatches = new Map<string, AgentPatch>()
   let parentRequestPatches = new Map<string, AgentPatch>()
@@ -1219,9 +1253,16 @@ const plugin: Plugin = async (input) => {
         subagent_type?: string
         prompt?: string
         description?: string
+        sessionID?: string
       }
       if (!args?.subagent_type || !args.prompt) return
       const staticRoute = virtualRoutes.get(args.subagent_type)
+      // Continuation calls (input.sessionID) address an existing child: clear
+      // any stale route state for it up front. For base (non-variant) calls
+      // this prevents a previous round's session-keyed route from leaking
+      // onto this call's messages; variant calls re-register below.
+      const continuation = typeof args.sessionID === "string" && args.sessionID ? args.sessionID : undefined
+      if (continuation && !staticRoute) bySession.delete(continuation)
       if (!staticRoute) return
       const primary = await sessionModel(input.client, hookInput.sessionID)
       const route = liveRoute(staticRoute, catalog, primary)
@@ -1231,6 +1272,10 @@ const plugin: Plugin = async (input) => {
       const token = usePromptMarker ? randomUUID() : undefined
       if (token) tokenRoutes.set(token, route)
       byCall.set(hookInput.callID, route)
+      // Continuation: the child session id is known up front, so the session
+      // route is registered immediately - chat.message then correlates with
+      // zero parent-history fetches (deterministic regardless of size).
+      if (continuation) bindSessionRoute(bySession, continuation, route)
       pending.push({
         ...route,
         token,
@@ -1256,6 +1301,10 @@ const plugin: Plugin = async (input) => {
       const route = byCall.get(hookInput.callID)
       if (!route) return
       byCall.delete(hookInput.callID)
+      // The call is over: release the session bindings it established. Later
+      // manual or automated messages to this subagent session must run the
+      // session's own model, not a stale variant route.
+      unbindSessionRoutes(bySession, route)
       if (hookInput.args && typeof hookInput.args === "object") {
         const args = hookInput.args as Record<string, unknown>
         args.subagent_type = route.alias
@@ -1273,6 +1322,21 @@ const plugin: Plugin = async (input) => {
         },
       }
       output.output = cleanTaskOutput(output.output)
+      if (!route.appliedCount) {
+        // The variant was requested and the after-hook annotated the part, but
+        // the model override never landed on any child message (correlation
+        // miss) - the child silently ran the default model. Surface it instead
+        // of letting the annotation claim otherwise.
+        debugLog(sidecar.debug, "Agent variant route never applied", `${routeSummary(route)}; call=${hookInput.callID}; child messages ran the session-default model`)
+        queueDiagnostics([
+          {
+            level: "warning",
+            message: `Variant ${route.alias} was requested but its model override was never applied - the subagent ran the default model (correlation miss). If this repeats, please report it.`,
+            agent: route.parent,
+            alias: route.alias,
+          },
+        ])
+      }
       void repairLiveTaskPart({
         client: input.client,
         directory: input.directory,
@@ -1300,6 +1364,21 @@ const plugin: Plugin = async (input) => {
       }
       if (markerRoute?.stripped) {
         await debugToast(input.client, sidecar.debug, "Agent variant marker stripped", `stripped ${markerRoute.stripped} route marker(s) without token match; session=${hookInput.sessionID}`)
+      }
+      // Session-keyed fast path: continuation calls pre-register the route at
+      // tool.execute.before (the child id is in the call args), and successful
+      // correlations cache it for the session's later messages. Zero
+      // parent-history fetches.
+      const sessionRoute = bySession.get(hookInput.sessionID)
+      if (sessionRoute) {
+        applyMessageModel(output, sessionRoute)
+        await debugToast(
+          input.client,
+          sidecar.debug,
+          "Agent variant model applied (session)",
+          `${routeSummary(sessionRoute)}; session=${hookInput.sessionID}`,
+        )
+        return
       }
       const { parentTaskPart, parentSessionID } = await findParentTaskContext(input.client, input.directory, hookInput.sessionID)
       const correlation = correlateTaskRoute(
@@ -1397,6 +1476,21 @@ const plugin: Plugin = async (input) => {
       if (parent && session?.agent) applySystemPatch(output.system, parent, templateContext(session.agent, undefined, {}, sidecar))
     },
   }
+}
+
+const plugin: Plugin = async (input) => {
+  const sidecar = loadSidecar(defaultSidecarPath())
+  // v1-only: mirror the standalone server registration into tui.json at the
+  // same config level. Stands down entirely when Config Studio is registered
+  // anywhere (it embeds agent-variants and provides the wizard UI). v2 hosts
+  // never reach this - their setup auto-discovers ./tui.
+  const wire = ensureTuiRegistration({ directory: input.directory, worktree: input.worktree })
+  if (wire.status === "wired" || wire.status === "corrected") {
+    debugLog(sidecar.debug, "Agent variant self-wire", `${wire.status}: ${wire.spec} -> ${"target" in wire ? wire.target : ""}`)
+  } else if (wire.status === "failed") {
+    debugLog(sidecar.debug, "Agent variant self-wire failed", wire.error)
+  }
+  return createHooks(input, sidecar)
 }
 
 export default plugin

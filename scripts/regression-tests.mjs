@@ -5,7 +5,8 @@ import { currentPaletteCategory, declarePaletteCategory, reconcilePaletteCategor
 import { isAgentVariantsSpec, isConfigStudioSpec, ensureTuiRegistration } from "../dist/selfwire.js"
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, sep } from "node:path"
+const path = { join, sep }
 import { pathToFileURL } from "node:url"
 
 function assert(condition, message) {
@@ -668,5 +669,89 @@ function testSelfwire() {
 testSelfwire()
 await testLiveRepairNeverRevertsRunningParts()
 await testHistoryRepairSkipsRunningParts()
+
+async function testCorrelationV2() {
+  const { createHooks } = __testInternals
+  const messagesCalls = []
+  // liveRoute hot-reloads the sidecar from the real config dir; point HOME at
+  // a temp profile so validation sees exactly this test's variant.
+  const tmpHome = mkdtempSync(path.join(tmpdir(), "av-live-"))
+  mkdirSync(path.join(tmpHome, ".config", "opencode"), { recursive: true })
+  const sidecar = emptyConfig()
+  sidecar.agents = { explore: { parent: {}, variants: { "explore-light": { name: "explore-light", model: "opencode/muse-spark-1.3-contributor-free", variant: "xhigh" } } } }
+  writeFileSync(path.join(tmpHome, ".config", "opencode", "agent-variants.jsonc"), JSON.stringify(sidecar), "utf8")
+  const realProfile = process.env.USERPROFILE
+  const realHome = process.env.HOME
+  process.env.USERPROFILE = tmpHome
+  process.env.HOME = tmpHome
+  const childPartFor = (child, callID, status) => ({
+    id: `prt_${child}`, type: "tool", tool: "task", callID,
+    state: { status, input: { subagent_type: "explore" }, metadata: { sessionId: child } },
+  })
+  const sessions = new Map([
+    ["ses_parent", { id: "ses_parent", model: { providerID: "closedrouter", modelID: "glm-5.3" } }],
+    ["ses_child1", { id: "ses_child1", parentID: "ses_parent" }],
+    ["ses_child_new", { id: "ses_child_new", parentID: "ses_parent" }],
+  ])
+  const fakeClient = {
+    session: {
+      get: async ({ path }) => ({ data: sessions.get(path.id) }),
+      messages: async ({ path, query }) => {
+        messagesCalls.push({ path: path.id, query })
+        return { data: [{ parts: [childPartFor("ses_child_new", "call_new", "running")] }] }
+      },
+    },
+  }
+  const hooks = await createHooks({ client: fakeClient, directory: "C:/x" }, sidecar)
+  await hooks.config({ agent: { explore: {} } })
+
+  // 1) Continuation: route pre-registered from call args, applies with ZERO
+  //    parent-history fetches.
+  await hooks["tool.execute.before"](
+    { tool: "task", sessionID: "ses_parent", callID: "call_cont" },
+    { args: { subagent_type: "explore-light", prompt: "x", description: "d", sessionID: "ses_child1" } },
+  )
+  const cont = { message: { model: { providerID: "closedrouter", modelID: "glm-5.3" } }, parts: [] }
+  await hooks["chat.message"]({ sessionID: "ses_child1", agent: "explore" }, cont)
+  assert(cont.message.model.providerID === "opencode", "continuation applies the variant model")
+  assert(messagesCalls.length === 0, `continuation must not fetch parent history (got ${messagesCalls.length})`)
+
+  // 2) The call completes -> bindings released; a manual/automated message to
+  //    the same child afterwards must NOT reapply the stale route.
+  await hooks["tool.execute.after"]({ tool: "task", sessionID: "ses_parent", callID: "call_cont" }, { title: "t", output: "ok" })
+  const manual = { message: { model: { providerID: "closedrouter", modelID: "glm-5.3" } }, parts: [] }
+  await hooks["chat.message"]({ sessionID: "ses_child1", agent: "explore" }, manual)
+  assert(manual.message.model.providerID === "closedrouter", "post-call manual messages keep the session model")
+
+  // 3) New call: correlation fetches ONLY a bounded tail window.
+  await hooks["tool.execute.before"](
+    { tool: "task", sessionID: "ses_parent", callID: "call_new" },
+    { args: { subagent_type: "explore-light", prompt: "x" } },
+  )
+  const fresh = { message: { model: {} }, parts: [] }
+  await hooks["chat.message"]({ sessionID: "ses_child_new", agent: "explore" }, fresh)
+  assert(fresh.message.model.providerID === "opencode", "new-call correlation applies the variant model")
+  assert(messagesCalls.length > 0 && messagesCalls.every((c) => Number.isFinite(c.query?.limit) && c.query.limit > 0), "every parent-history fetch is tail-window limited")
+  assert(messagesCalls.some((c) => c.query.limit === 16 || c.query.limit === 48), "windows use the configured sizes")
+
+  // 4) Base continuation to a child with stale route state clears it before
+  //    any message runs (no wrong-variant application).
+  await hooks["tool.execute.before"](
+    { tool: "task", sessionID: "ses_parent", callID: "call_cont2" },
+    { args: { subagent_type: "explore-light", prompt: "x", sessionID: "ses_child1" } },
+  )
+  await hooks["tool.execute.before"](
+    { tool: "task", sessionID: "ses_parent", callID: "call_base" },
+    { args: { subagent_type: "explore", prompt: "x", sessionID: "ses_child1" } },
+  )
+  const afterBase = { message: { model: { providerID: "closedrouter", modelID: "glm-5.3" } }, parts: [] }
+  await hooks["chat.message"]({ sessionID: "ses_child1", agent: "explore" }, afterBase)
+  assert(afterBase.message.model.providerID === "closedrouter", "base continuation must not inherit the stale variant route")
+  process.env.USERPROFILE = realProfile
+  process.env.HOME = realHome
+  rmSync(tmpHome, { recursive: true, force: true })
+}
+
+await testCorrelationV2()
 
 console.log("regression tests passed")
