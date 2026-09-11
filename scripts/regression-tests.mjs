@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs"
 import { __testAssembleAgents, __testInternals } from "../dist/index.js"
 import { emptyConfig, inferredSelectionPreset, SELECTION_PRESETS, SidecarConfig, profileMatchesModel, resolveActiveProfile, overlayProfilePatch, profileVariantPatch, profileParentPatch, profileFieldSource, setProfileFieldIn } from "../dist/config.js"
+import { applyWizardUiSettings } from "../dist/wizard.js"
 import { currentPaletteCategory, declarePaletteCategory, reconcilePaletteCategories, __resetPaletteRegistry } from "../dist/palette-category.js"
 import { isAgentVariantsSpec, isConfigStudioSpec, ensureTuiRegistration } from "../dist/selfwire.js"
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs"
@@ -666,6 +667,25 @@ function testSelfwire() {
   }
 }
 
+
+function testEmbeddedDialogScope() {
+  const record = []
+  const config = emptyConfig()
+  config.ui = { width: "xlarge", height: "max", height_percent: 100 }
+  const makeApi = (scope) => ({
+    dialogScope: scope,
+    kv: { get: (_key, fallback) => fallback, set: (key, value) => record.push([key, value]), ready: true },
+    ui: { dialog: { setSize: (size) => record.push(["setSize", size]) } },
+  })
+  applyWizardUiSettings(makeApi("standalone"), config)
+  if (record.length === 0) throw new Error("standalone scope must push ui settings into kv")
+  if (!record.some(([key]) => key === "agent-variants.ui-width")) throw new Error("standalone scope writes own keys: " + JSON.stringify(record))
+  record.length = 0
+  applyWizardUiSettings(makeApi("embedded"), config)
+  if (record.length !== 0) throw new Error("embedded scope must not touch kv/setSize: " + JSON.stringify(record))
+}
+
+testEmbeddedDialogScope()
 testSelfwire()
 await testLiveRepairNeverRevertsRunningParts()
 await testHistoryRepairSkipsRunningParts()

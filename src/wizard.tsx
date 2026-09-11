@@ -14,7 +14,7 @@
  */
 
 import { existsSync, readFileSync, writeFileSync } from "node:fs"
-import type { TuiPlugin, TuiPluginApi, TuiDialogSelectOption } from "@opencode-ai/plugin/tui"
+import type { TuiDialogSelectOption, TuiHostApi as TuiPluginApi } from "./tui-host.js"
 import type { ScrollBoxRenderable } from "@opentui/core"
 import { useTerminalDimensions } from "@opentui/solid"
 import { createEffect, createMemo, createSignal, For, onCleanup, Show } from "solid-js"
@@ -131,6 +131,14 @@ const BUILTIN_AGENT_KEYS = Object.keys(BUILTIN_AGENT_DESCRIPTIONS)
 const UI_SIZE_KV = "agent-variants.ui-width"
 const UI_HEIGHT_KV = "agent-variants.ui-height"
 const UI_HEIGHT_PERCENT_KV = "agent-variants.ui-height-percent"
+// Embedded scope (Config Studio): the host's dialog settings rule.
+const HOST_SIZE_KV = "config-studio.ui-width"
+const HOST_HEIGHT_PERCENT_KV = "config-studio.ui-height-percent"
+
+/** True when the wizard runs inside an embedding host that owns dialog sizing. */
+function isEmbeddedScope(api: TuiPluginApi): boolean {
+  return (api as TuiPluginApi & { dialogScope?: "standalone" | "embedded" }).dialogScope === "embedded"
+}
 const HEIGHT_PERCENT_MIN = 25
 const HEIGHT_PERCENT_MAX = 100
 const HEIGHT_PRESETS: Array<{ label: DialogHeight; value: number; key: string }> = [
@@ -324,7 +332,7 @@ export function agentModes(api: TuiPluginApi) {
 }
 
 function wizardDialogSize(api: TuiPluginApi): DialogSize {
-  const value = api.kv.get<DialogSize>(UI_SIZE_KV, "large")
+  const value = api.kv.get<DialogSize>(isEmbeddedScope(api) ? HOST_SIZE_KV : UI_SIZE_KV, "large")
   if (value === "medium" || value === "large" || value === "xlarge") return value
   return "large"
 }
@@ -364,7 +372,7 @@ function effectiveUiHeightPercent(ui: SidecarConfig["ui"]) {
 }
 
 function wizardDialogHeightPercent(api: TuiPluginApi) {
-  const value = api.kv.get<number>(UI_HEIGHT_PERCENT_KV, 50)
+  const value = api.kv.get<number>(isEmbeddedScope(api) ? HOST_HEIGHT_PERCENT_KV : UI_HEIGHT_PERCENT_KV, 50)
   return typeof value === "number" && Number.isFinite(value) ? clampHeightPercent(value) : 50
 }
 
@@ -372,8 +380,10 @@ function setWizardDialogHeightPercent(api: TuiPluginApi, value: number) {
   api.kv.set(UI_HEIGHT_PERCENT_KV, clampHeightPercent(value))
 }
 
-/** Pushes sidecar ui settings into the host kv (used by both entry points). */
+/** Pushes sidecar ui settings into the host kv (used by both entry points).
+ * Skipped when embedded: the embedding host's dialog settings rule. */
 export function applyWizardUiSettings(api: TuiPluginApi, config: SidecarConfig) {
+  if (isEmbeddedScope(api)) return
   setWizardDialogSize(api, config.ui.width)
   setWizardDialogHeight(api, config.ui.height)
   setWizardDialogHeightPercent(api, effectiveUiHeightPercent(config.ui))
@@ -3189,18 +3199,22 @@ async function debugAdvancedMenu(api: TuiPluginApi, config: SidecarConfig, setti
     { title: "View debug log", value: "view-log", description: "Show recent agent-variants.debug.log entries" },
     { title: "Clear debug log", value: "clear-log", description: "Empty agent-variants.debug.log" },
     { title: "Config backups", value: "backups", description: "Preview, restore, and snapshot sidecar config" },
-    {
-      title: `Wizard UI width: ${wizardDialogSize(api)}`,
-      value: "ui-size",
-      description: "Cycle dialog width: medium, large, xlarge",
-      help: "Controls the width of Agent Variants custom wizard screens. OpenCode currently exposes fixed widths only: medium = 60 columns, large = 88 columns, xlarge = 116 columns.",
-    },
-    {
-      title: `Wizard UI height: ${wizardDialogHeightPercent(api)}%`,
-      value: "ui-height",
-      description: "Adjust max height with slider or preset reference points",
-      help: `Controls the maximum height of Agent Variants custom wizard screens. Presets: ${HEIGHT_PRESETS.map((preset) => `${preset.label}=${preset.value}%`).join(", ")}. Short menus stay compact; long info screens can use the extra space.`,
-    },
+    ...(isEmbeddedScope(api)
+      ? []
+      : [
+          {
+            title: `Wizard UI width: ${wizardDialogSize(api)}`,
+            value: "ui-size",
+            description: "Cycle dialog width: medium, large, xlarge",
+            help: "Controls the width of Agent Variants custom wizard screens. OpenCode currently exposes fixed widths only: medium = 60 columns, large = 88 columns, xlarge = 116 columns.",
+          },
+          {
+            title: `Wizard UI height: ${wizardDialogHeightPercent(api)}%`,
+            value: "ui-height",
+            description: "Adjust max height with slider or preset reference points",
+            help: `Controls the maximum height of Agent Variants custom wizard screens. Presets: ${HEIGHT_PRESETS.map((preset) => `${preset.label}=${preset.value}%`).join(", ")}. Short menus stay compact; long info screens can use the extra space.`,
+          },
+        ]),
     {
       title: `Parent picker filter: ${settings.subagentCapableOnly ? "subagent-capable only" : "all agents"}`,
       value: "filter",
