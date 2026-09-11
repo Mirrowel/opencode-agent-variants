@@ -535,14 +535,37 @@ function correlateTaskRoute(
   // completed, this message belongs to a manual or automated continuation,
   // and those must respect the session's own model.
   const partRunning = (parentTaskPart.state as { status?: string } | undefined)?.status !== "completed"
+  // The stored-alias fallback is only authoritative while the call is still
+  // in flight (or the status is unknown/legacy): once the part explicitly
+  // completed, this message belongs to a manual or automated continuation,
+  // and those must respect the session's own model.
+  const aliasRoute = partRunning ? routeForAlias(metadataAlias(parentTaskPart.state?.metadata, knownRoutes), knownRoutes) : undefined
+  // Prefer the LIVE call's route over the static registry entry: per-call
+  // instances carry the bookkeeping (appliedCount, boundSessions) the
+  // after-hook reads. Resuming a prior round's task (task_id) makes the scan
+  // find the OLD part for the same child - the static registry would then
+  // apply the right model while splitting the counters in two (ghost
+  // never-applied warnings).
+  const liveAliasRoute = aliasRoute
+    ? [...list]
+        .filter((item) => item.alias === aliasRoute.alias && item.parent === aliasRoute.parent && typeof item.createdAt === "number")
+        .reduce<PendingRoute | undefined>((newest, item) => (!newest || item.createdAt > newest.createdAt ? item : newest), undefined) ??
+      [...routesByCall.values()]
+        .filter((item) => item.alias === aliasRoute.alias && item.parent === aliasRoute.parent)
+        .reduce<RuntimeRoute | undefined>((newest, item) => {
+          const created = (item as Partial<PendingRoute>).createdAt
+          if (typeof created !== "number") return newest ?? item
+          if (!newest) return item
+          const newestCreated = (newest as Partial<PendingRoute>).createdAt
+          return created > (typeof newestCreated === "number" ? newestCreated : -1) ? item : newest
+        }, undefined)
+    : undefined
   const metadataRoute = takePendingByCallID(list, parentTaskPart?.callID)
     ?? takePendingByCallID(list, parentTaskPart?.id)
     ?? routesByCall.get(parentTaskPart?.callID)
     ?? routesByCall.get(parentTaskPart?.id)
-    // The stored-alias fallback is only authoritative while the call is still
-    // in flight: once the part completed, this message belongs to a manual or
-    // automated continuation, and those must respect the session's own model.
-    ?? (partRunning ? routeForAlias(metadataAlias(parentTaskPart.state?.metadata, knownRoutes), knownRoutes) : undefined)
+    ?? liveAliasRoute
+    ?? aliasRoute
   if (metadataRoute) {
     bindSessionRoute(routesBySession, childSessionID, metadataRoute)
     return { route: metadataRoute, proof: "metadata" as const }
@@ -1271,6 +1294,7 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
         prompt?: string
         description?: string
         sessionID?: string
+        task_id?: string
       }
       if (!args?.subagent_type || !args.prompt) return
       const staticRoute = virtualRoutes.get(args.subagent_type)
@@ -1278,7 +1302,11 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
       // any stale route state for it up front. For base (non-variant) calls
       // this prevents a previous round's session-keyed route from leaking
       // onto this call's messages; variant calls re-register below.
-      const continuation = typeof args.sessionID === "string" && args.sessionID ? args.sessionID : undefined
+      // v1's task tool resumes via `task_id` (a prior task's child session
+      // id); the v2 port's subagent tool uses `sessionID`. Both identify the
+      // child session up front - accept either.
+      const continuationArg = args.task_id ?? args.sessionID
+      const continuation = typeof continuationArg === "string" && continuationArg ? continuationArg : undefined
       if (continuation && !staticRoute) bySession.delete(continuation)
       if (!staticRoute) return
       const primary = await sessionModel(input.client, hookInput.sessionID)

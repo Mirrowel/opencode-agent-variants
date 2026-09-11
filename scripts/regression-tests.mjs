@@ -694,6 +694,7 @@ async function testCorrelationV2() {
     ["ses_parent", { id: "ses_parent", model: { providerID: "closedrouter", modelID: "glm-5.3" } }],
     ["ses_child1", { id: "ses_child1", parentID: "ses_parent" }],
     ["ses_child_new", { id: "ses_child_new", parentID: "ses_parent" }],
+    ["ses_ghost_child", { id: "ses_ghost_child", parentID: "ses_parent" }],
   ])
   const fakeClient = {
     tui: {
@@ -785,6 +786,51 @@ async function testCorrelationV2() {
   const debugLogText = readFileSync(path.join(tmpHome, ".config", "opencode", "agent-variants.debug.log"), "utf8")
   assert(debugLogText.includes("[always] Agent variant route never applied") && debugLogText.includes("call_miss"), "never-applied anomaly is captured unconditionally in the debug log")
   assert(debugLogText.includes("[always] diagnostic queued"), "queued warning diagnostics are captured unconditionally")
+
+  // 7) v1 task_id resume: the model resumes a prior round's child via the
+  //    `task_id` arg (v1's actual resume key). Must pre-register (zero parent
+  //    fetches) and must NOT warn.
+  const fetchesBeforeResume = messagesCalls.length
+  await hooks["tool.execute.before"](
+    { tool: "task", sessionID: "ses_parent", callID: "call_resume" },
+    { args: { subagent_type: "explore-light", prompt: "resume it", task_id: "ses_child1" } },
+  )
+  const resumeOut = { message: { model: { providerID: "closedrouter", modelID: "glm-5.3" } }, parts: [] }
+  await hooks["chat.message"]({ sessionID: "ses_child1", agent: "explore" }, resumeOut)
+  assert(resumeOut.message.model.providerID === "opencode", "task_id resume applies the variant model")
+  assert(messagesCalls.length === fetchesBeforeResume, "task_id resume correlates without parent fetches")
+  await hooks["tool.execute.after"](
+    { tool: "task", sessionID: "ses_parent", callID: "call_resume", args: { subagent_type: "explore" } },
+    { title: "t", output: "ok", metadata: {} },
+  )
+
+  // 8) Ghost-warning suppression: a prior round's RUNNING part for the same
+  //    child (alias in metadata) + a live call for that alias -> the alias
+  //    fallback must resolve to the LIVE call instance so appliedCount is
+  //    visible to that call's after-hook.
+  const ghostPart = {
+    id: "prt_old_round", type: "tool", tool: "task", callID: "call_old_round",
+    state: { status: "running", input: { subagent_type: "explore" }, metadata: { sessionId: "ses_ghost_child", agentVariants: { alias: "explore-light" } } },
+  }
+  const messagesBase = fakeClient.session.messages
+  fakeClient.session.messages = async ({ path, query }) => {
+    messagesCalls.push({ path: path.id, query })
+    return { data: [{ parts: [ghostPart] }] }
+  }
+  await hooks["tool.execute.before"](
+    { tool: "task", sessionID: "ses_parent", callID: "call_ghost" },
+    { args: { subagent_type: "explore-light", prompt: "x" } },
+  )
+  const ghostOut = { message: { model: { providerID: "closedrouter", modelID: "glm-5.3" } }, parts: [] }
+  await hooks["chat.message"]({ sessionID: "ses_ghost_child", agent: "explore" }, ghostOut)
+  assert(ghostOut.message.model.providerID === "opencode", "alias fallback applies the variant model via the prior part")
+  await hooks["tool.execute.after"](
+    { tool: "task", sessionID: "ses_parent", callID: "call_ghost", args: { subagent_type: "explore" } },
+    { title: "t", output: "ok", metadata: {} },
+  )
+  await new Promise((resolve) => setTimeout(resolve, 1100))
+  const ghostToast = toasts.find((toast) => toast.includes("never applied") && toast.includes("call_ghost"))
+  assert(!ghostToast, `live-call alias fallback must not produce a ghost never-applied warning (got: ${ghostToast})`)
 
   process.env.USERPROFILE = realProfile
   process.env.HOME = realHome
