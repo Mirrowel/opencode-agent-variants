@@ -11,6 +11,7 @@
 
 import type { TuiPlugin } from "@opencode-ai/plugin/tui"
 import { defaultSidecarPath, loadSidecar } from "./config.js"
+import { createV2TuiSetup } from "./v2-tui.js"
 import { applyWizardUiSettings, mainMenu, newWizardSettings } from "./wizard.js"
 import { currentPaletteCategory, declarePaletteCategory, schedulePaletteReconcile } from "./palette-category.js"
 
@@ -60,4 +61,13 @@ const tui: TuiPlugin = async (api) => {
   })
 }
 
-export default { id: "agent-variants", tui }
+/**
+ * Dual-target TUI entry.
+ *
+ * - OpenCode v1 (strict loader) requires `default.tui` to be a function;
+ *   excess keys are ignored.
+ * - OpenCode v2 requires `default` to be `{ id, setup }`; its hand-written
+ *   plugin check only inspects `id` + `setup`, so the legacy `tui` factory
+ *   rides along harmlessly.
+ */
+export default { id: "agent-variants", tui, setup: createV2TuiSetup() }

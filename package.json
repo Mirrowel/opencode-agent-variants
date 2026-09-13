@@ -35,6 +35,14 @@
     "./config": {
       "types": "./dist/config.d.ts",
       "import": "./dist/config.js"
+    },
+    "./tui-host": {
+      "types": "./dist/tui-host.d.ts",
+      "import": "./dist/tui-host.js"
+    },
+    "./v2": {
+      "types": "./dist/v2-tui.d.ts",
+      "import": "./dist/v2-tui.js"
     }
   },
   "files": [

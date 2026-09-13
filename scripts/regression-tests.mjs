@@ -1,14 +1,17 @@
 import { readFileSync } from "node:fs"
 import { __testAssembleAgents, __testInternals } from "../dist/index.js"
 import { emptyConfig, inferredSelectionPreset, SELECTION_PRESETS, SidecarConfig, profileMatchesModel, resolveActiveProfile, overlayProfilePatch, profileVariantPatch, profileParentPatch, profileFieldSource, setProfileFieldIn } from "../dist/config.js"
-import { applyWizardUiSettings } from "../dist/wizard.js"
 import { currentPaletteCategory, declarePaletteCategory, reconcilePaletteCategories, __resetPaletteRegistry } from "../dist/palette-category.js"
+import { applyWizardUiSettings } from "../dist/wizard.js"
 import { isAgentVariantsSpec, isConfigStudioSpec, ensureTuiRegistration } from "../dist/selfwire.js"
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join, sep } from "node:path"
 const path = { join, sep }
 import { pathToFileURL } from "node:url"
+import * as serverEntry from "../dist/server.js"
+import * as tuiEntry from "../dist/tui.js"
+import { assembleV2Agents, applyContextOverrides, composeVariantPatch, parentCloneId, resolveExecutionAgent, variantCloneId } from "../dist/v2-server.js"
 
 function assert(condition, message) {
   if (!condition) throw new Error(message)
@@ -51,14 +54,365 @@ function testPaletteCategory() {
   declarePaletteCategory("Agent Variants")
   assert(currentPaletteCategory() === expected, "duplicate label does not duplicate in the join")
 
-  // Reconcile is idempotent and repairs stale categories.
+  // Reconcile is idempotent and repairs stale categories (v1 `category`
+  // field and the v2 `group` field stay in sync).
   avCommand.category = "stale"
   reconcilePaletteCategories()
   assert(avCommand.category === expected, "reconcile repairs stale categories")
+  assert(avCommand.group === expected, "reconcile stamps the v2 group field")
 
   __resetPaletteRegistry()
   assert(currentPaletteCategory() === "", "reset clears the registry")
 }
+
+// ---------------------------------------------------------------------------
+// OpenCode v2 dual-target surface
+// ---------------------------------------------------------------------------
+
+function testDualEntryModules() {
+  // v2 server module validation: default must be {id, setup} — excess keys
+  // (the v1 `server` factory) are ignored by the Effect Schema decode.
+  const serverModule = serverEntry.default
+  assert(typeof serverModule === "object" && serverModule !== null, "server entry default is a record")
+  assert(serverModule.id === "agent-variants", "server entry carries the plugin id")
+  assert(typeof serverModule.setup === "function", "server entry exposes a v2 setup function")
+
+  // v1 server detect-mode validation (packages/opencode readV1Plugin, detect):
+  // default record → reads .server (must be a function) → reads .tui (must be
+  // undefined here) → the both-present rejection can never fire.
+  assert(typeof serverModule.server === "function", "server entry exposes the v1 server factory")
+  assert(serverModule.tui === undefined, "server entry must not advertise a tui export (v1 both-present rejection)")
+
+  // v2 TUI validation (packages/tui isPlugin): id non-empty string + setup
+  // function; excess `tui` ignored.
+  const tuiModule = tuiEntry.default
+  assert(typeof tuiModule === "object" && tuiModule !== null, "tui entry default is a record")
+  assert(typeof tuiModule.id === "string" && tuiModule.id.length > 0, "tui entry carries a non-empty id")
+  assert(typeof tuiModule.setup === "function", "tui entry exposes a v2 setup function")
+
+  // v1 TUI strict-mode validation: default record + tui function required,
+  // no server key (strict mode rejects a non-function server, and the
+  // both-present rejection would fire if both existed).
+  assert(typeof tuiModule.tui === "function", "tui entry exposes the v1 tui factory")
+  assert(tuiModule.server === undefined, "tui entry must not carry a server export")
+}
+
+function stubV2Editor(agents) {
+  const map = new Map()
+  for (const [id, info] of Object.entries(agents ?? {})) map.set(id, structuredClone(info))
+  const defaults = (id) => ({ id, name: id, request: { settings: {}, headers: {}, body: {} }, mode: "primary", hidden: false, permissions: [] })
+  return {
+    map,
+    list: () => [...map.values()],
+    get: (id) => map.get(id),
+    default: (id) => {
+      if (id !== undefined) map.set(id, defaults(id))
+    },
+    remove: (id) => map.delete(id),
+    update(id, fn) {
+      const agent = structuredClone(map.get(id) ?? defaults(id))
+      fn(agent)
+      map.set(id, agent)
+    },
+  }
+}
+
+function v2TestSidecar() {
+  const config = emptyConfig()
+  config.agents = {
+    build: {
+      parent: { model: "zai/glm-5.4" },
+      variants: {
+        fast: { model: "zai/glm-4.7-flash", prompt_prepend: "Fast mode.", temperature: 0.3, top_p: 0.9, options: { thinking: { type: "enabled" } } },
+        plain: { temperature: 0.2 },
+      },
+    },
+    dyn: {
+      parent: {},
+      variants: { lite: { model: "zai/glm-4.7-flash", prompt_prepend: "Lite mode." } },
+    },
+  }
+  config.profiles = {
+    night: {
+      match: { model: "zai/glm-5.4" },
+      agents: {
+        build: {
+          parent: { model: "zai/glm-5.4-xhigh" },
+          variants: { fast: { model: "zai/glm-4.7-air" } },
+        },
+      },
+    },
+    tempOnly: {
+      agents: { build: { variants: { fast: { temperature: 0.9 } } } },
+    },
+  }
+  return config
+}
+
+function testV2Assembly() {
+  const editor = stubV2Editor({
+    build: { id: "build", name: "build", model: { providerID: "zai", id: "glm-5.3" }, request: { settings: {}, headers: {}, body: {} }, system: "You are build.", description: "Build things.", mode: "all", hidden: false, color: "#3af", steps: 5, permissions: [{ action: "*", resource: "*", effect: "allow" }] },
+    dyn: { id: "dyn", name: "dyn", request: { settings: {}, headers: {}, body: {} }, mode: "all", hidden: false, permissions: [] },
+    "build-fast": { id: "build-fast", name: "existing", request: { settings: {}, headers: {}, body: {} }, mode: "subagent", hidden: false, permissions: [] },
+  })
+  // "taken/echo" aliases to `build-echo`, no conflict; "build/fast" and
+  // "build/plain" alias to build-fast/build-plain — build-fast collides with
+  // the existing agent, so exactly that variant is skipped with an error.
+  const sidecar = v2TestSidecar()
+  const assembly = assembleV2Agents(editor, sidecar)
+
+  // Parent patch applied to the parent definition itself.
+  const build = editor.map.get("build")
+  assert(build.model.id === "glm-5.4", "parent model patch applied to parent definition")
+
+  // Visible alias clone: full copy of the patched parent.
+  assert(!assembly.aliases.has("build-fast"), "conflicting alias is skipped")
+  assert(assembly.diagnostics.some((item) => item.level === "error" && /conflicts with an existing agent/.test(item.message)), "conflict produces an error diagnostic")
+  const plain = editor.map.get("build-plain")
+  assert(plain, "non-conflicting variant alias registered")
+  assert(plain.mode === "subagent", "alias clone is subagent-capable")
+  assert(plain.hidden === false, "visible alias is not hidden")
+  assert(plain.model.id === "glm-5.4", "variant without model inherits the patched parent model")
+  assert(plain.system === "You are build.", "alias copies the parent system verbatim when the variant has no prompt patch")
+  assert(plain.permissions.length === 1 && plain.permissions[0].action === "*", "permissions inherited from parent")
+  assert(plain.steps === 5, "steps inherited from parent")
+
+  // Alias with prompt patch over a static-system parent: composed and baked.
+  const dynLite = editor.map.get("dyn-lite")
+  assert(dynLite, "dynamic-parent variant registered")
+  assert(dynLite.system === undefined, "dynamic parent leaves the clone system unset (dynamic default)")
+  const liteRoute = assembly.aliases.get("dyn-lite")
+  assert(liteRoute?.promptRuntime === true, "dynamic-parent prompt patch is applied at request time")
+
+  // Hidden profile clones.
+  const fastClone = editor.map.get(variantCloneId("build-plain", "night"))
+  assert(!fastClone, "no profile clone when the profile does not touch the variant")
+  const liteClone = editor.map.get(variantCloneId("dyn-lite", "night"))
+  assert(!liteClone, "no profile clone for a profile without a variant overlay")
+  assert(assembly.aliases.has("build-plain") && assembly.aliases.has("dyn-lite"), "visible aliases registered")
+
+  // tempOnly overlays only temperature: no model clone for build-plain/fast.
+  assert(!editor.map.has(variantCloneId("build-plain", "tempOnly")), "temperature-only profile overlay creates no clone")
+  // night overlays the fast variant model — but the fast alias was skipped
+  // (conflict), so no clone for it either; the parent clone still exists.
+  const parentClone = editor.map.get(parentCloneId("build", "night"))
+  assert(parentClone, "profile parent model patch creates a hidden parent clone")
+  assert(parentClone.hidden === true, "parent clone is hidden")
+  assert(parentClone.mode === "subagent", "parent clone is subagent-capable")
+  assert(parentClone.model.id === "glm-5.4-xhigh", "parent clone carries the overlaid model")
+  assert(parentClone.system === "You are build.", "parent clone copies the parent system")
+  assert(assembly.parentClones.get(parentCloneId("build", "night")) === "build", "parent clone maps back to its parent")
+}
+
+function testV2AssemblyProfileClone() {
+  // Separate fixture: the variant actually registers, so its profile clone exists.
+  const editor = stubV2Editor({
+    general: { id: "general", name: "general", model: { providerID: "zai", id: "glm-5.3" }, request: { settings: {}, headers: {}, body: {} }, system: "Base system.", mode: "all", hidden: false, permissions: [] },
+  })
+  const sidecar = emptyConfig()
+  sidecar.agents = {
+    general: {
+      parent: {},
+      variants: {
+        fast: { model: "zai/glm-4.7-flash", prompt_prepend: "Fast mode." },
+      },
+    },
+  }
+  sidecar.profiles = {
+    night: {
+      match: { model: "zai/glm-5.3" },
+      agents: { general: { variants: { fast: { model: "zai/glm-4.7-air", prompt_append: "Night rules." } } } },
+    },
+  }
+  const assembly = assembleV2Agents(editor, sidecar)
+  const alias = editor.map.get("general-fast")
+  assert(alias, "alias registered")
+  assert(alias.model.id === "glm-4.7-flash", "alias carries the variant model")
+  assert(alias.system === "Fast mode.\n\nBase system.", "alias system composed from parent with prepend")
+
+  const cloneId = variantCloneId("general-fast", "night")
+  const clone = editor.map.get(cloneId)
+  assert(clone, "profile clone registered when the overlaid model differs")
+  assert(clone.hidden === true, "profile clone hidden")
+  assert(clone.model.id === "glm-4.7-air", "profile clone carries the overlaid model")
+  assert(clone.system === "Fast mode.\n\nBase system.\n\nNight rules.", "profile clone system composed with the overlaid prompt")
+  const route = assembly.routes.get(cloneId)
+  assert(route?.profile === "night" && route.alias === "general-fast", "clone route maps back to the visible alias")
+
+  // Request params on the alias patch are applied per request, not baked.
+  assert(alias.request.body.temperature === undefined, "request params are not baked into the agent definition")
+}
+
+function testV2ExecutionRouting() {
+  const editor = stubV2Editor({
+    general: { id: "general", name: "general", model: { providerID: "zai", id: "glm-5.3" }, request: { settings: {}, headers: {}, body: {} }, system: "Base system.", mode: "all", hidden: false, permissions: [] },
+  })
+  const sidecar = emptyConfig()
+  sidecar.agents = {
+    general: {
+      parent: { temperature: 0.7 },
+      variants: { fast: { model: "zai/glm-4.7-flash", temperature: 0.3, top_p: 0.9, options: { thinking: { type: "enabled" } } } },
+    },
+  }
+  sidecar.profiles = {
+    night: {
+      match: { model: "zai/glm-5.3" },
+      agents: { general: { parent: { model: "zai/glm-5.3-xhigh" }, variants: { fast: { model: "zai/glm-4.7-air" } } } },
+    },
+  }
+  const assembly = assembleV2Agents(editor, sidecar)
+
+  // No profile: alias executes as itself.
+  const direct = resolveExecutionAgent({ agent: "general-fast" }, assembly, undefined)
+  assert(direct?.agent === "general-fast" && direct.changed === false, "alias executes as itself without a profile")
+
+  // Profile active: rewritten to the hidden clone.
+  const rewritten = resolveExecutionAgent({ agent: "general-fast" }, assembly, { name: "night" })
+  assert(rewritten?.agent === variantCloneId("general-fast", "night") && rewritten.changed === true && rewritten.alias === "general-fast", "profile rewrites alias to hidden clone")
+
+  // Base task call under a profile: parent rewritten to the parent clone.
+  const baseNoProfile = resolveExecutionAgent({ agent: "general" }, assembly, undefined)
+  assert(baseNoProfile?.changed === false, "base parent call untouched without a profile")
+  const baseProfile = resolveExecutionAgent({ agent: "general" }, assembly, { name: "night" })
+  assert(baseProfile?.agent === parentCloneId("general", "night") && baseProfile.changed === true, "base parent call rewritten under a profile")
+
+  // Unknown agents are left alone.
+  assert(resolveExecutionAgent({ agent: "explore" }, assembly, { name: "night" }) === undefined, "unknown agents are not routed")
+
+  // session.context overrides.
+  const event = { sessionID: "s1", agent: "general-fast", model: { providerID: "zai", id: "glm-4.7-flash" }, system: [{ type: "text", text: "Fast mode.\n\nBase system." }], messages: [], tools: {}, generation: {}, providerOptions: {} }
+  applyContextOverrides(event, { assembly, sidecar, activeProfile: undefined })
+  assert(event.generation.temperature === 0.3, "variant temperature applied per request")
+  assert(event.generation.topP === 0.9, "variant top_p applied per request")
+  assert(event.providerOptions.thinking?.type === "enabled", "variant options applied to providerOptions")
+  assert(event.system[0].text === "Fast mode.\n\nBase system.", "baked system left untouched without profile prompt overlay")
+
+  // Profile overlay without a model change still patches the request params.
+  const profileEvent = { sessionID: "s1", agent: "general-fast", model: { providerID: "zai", id: "glm-4.7-flash" }, system: [{ type: "text", text: "Fast mode.\n\nBase system." }], messages: [], tools: {}, generation: {}, providerOptions: {} }
+  const tempSidecar = emptyConfig()
+  tempSidecar.agents = sidecar.agents
+  tempSidecar.profiles = { warm: { agents: { general: { variants: { fast: { temperature: 0.8, prompt_append: "Warm rules." } } } } } }
+  applyContextOverrides(profileEvent, { assembly, sidecar: tempSidecar, activeProfile: { name: "warm" } })
+  assert(profileEvent.generation.temperature === 0.8, "profile-overlaid temperature applied")
+  assert(profileEvent.system[0].text === "Base system.\n\nWarm rules.", "profile prompt overlay recomputed from the parent base")
+
+  // Clone route: overlay baked, nothing dynamic.
+  const cloneEvent = { sessionID: "s2", agent: variantCloneId("general-fast", "night"), model: { providerID: "zai", id: "glm-4.7-air" }, system: [{ type: "text", text: "baked" }], messages: [], tools: {}, generation: {}, providerOptions: {} }
+  applyContextOverrides(cloneEvent, { assembly, sidecar, activeProfile: undefined })
+  assert(cloneEvent.system[0].text === "baked", "clone system stays baked")
+
+  // Parent route: global parent patch applies wherever the parent runs.
+  const parentEvent = { sessionID: "s3", agent: "general", model: { providerID: "zai", id: "glm-5.3" }, system: [{ type: "text", text: "Base system." }], messages: [], tools: {}, generation: {}, providerOptions: {} }
+  applyContextOverrides(parentEvent, { assembly, sidecar, activeProfile: undefined })
+  assert(parentEvent.generation.temperature === 0.7, "parent temperature patch applied by agent key")
+  assert(parentEvent.system[0].text === "Base system.", "static parent system already baked at assembly")
+
+  // Hidden parent clone normalizes to its parent for request params.
+  const parentCloneEvent = { sessionID: "s4", agent: parentCloneId("general", "night"), model: { providerID: "zai", id: "glm-5.3-xhigh" }, system: [{ type: "text", text: "Base system." }], messages: [], tools: {}, generation: {}, providerOptions: {} }
+  applyContextOverrides(parentCloneEvent, { assembly, sidecar, activeProfile: undefined })
+  assert(parentCloneEvent.generation.temperature === 0.7, "parent clone inherits the parent request patch")
+}
+
+function testV2VariantOnlyProfileOverlay() {
+  // A profile that overrides ONLY the model variant must still produce a
+  // clone: effective refs (parent model + variant) differ even though the
+  // patches carry no `model` field.
+  const editor = stubV2Editor({
+    general: { id: "general", name: "general", model: { providerID: "zai", id: "glm-5.3" }, request: { settings: { a: 1 }, headers: { h: "1" }, body: { b: 1 } }, system: "Base.", mode: "all", hidden: false, permissions: [] },
+  })
+  const sidecar = emptyConfig()
+  sidecar.agents = {
+    general: {
+      parent: {},
+      variants: { deep: { variant: "high" } },
+    },
+  }
+  sidecar.profiles = {
+    quick: { match: { model: "zai/glm-5.3" }, agents: { general: { variants: { deep: { variant: "low" } } } } },
+  }
+  const assembly = assembleV2Agents(editor, sidecar)
+  const alias = editor.map.get("general-deep")
+  assert(alias, "variant-only alias registered")
+  assert(alias.model.id === "glm-5.3" && alias.model.variant === "high", "alias stamps the variant over the parent model")
+  const clone = editor.map.get(variantCloneId("general-deep", "quick"))
+  assert(clone, "variant-only profile overlay registers a clone")
+  assert(clone.model.id === "glm-5.3" && clone.model.variant === "low", "clone carries the overlaid variant")
+  assert(clone.request.settings.a === 1 && clone.request.body.b === 1, "clone copies the parent request block")
+}
+
+function testV2ProfileParentOnVariantLessAgent() {
+  // v1 parity: profile parent patches apply to base task calls of agents
+  // that have NO variants configured at all.
+  const editor = stubV2Editor({
+    explore: { id: "explore", name: "explore", model: { providerID: "zai", id: "glm-5.3" }, request: { settings: {}, headers: {}, body: {} }, system: "Explore.", mode: "all", hidden: false, permissions: [] },
+  })
+  const sidecar = emptyConfig()
+  sidecar.agents = {}
+  sidecar.profiles = {
+    night: { match: { model: "zai/glm-5.3" }, agents: { explore: { parent: { model: "zai/glm-5.3-xhigh" }, variants: {} } } },
+  }
+  const assembly = assembleV2Agents(editor, sidecar)
+  assert(assembly.parents.has("explore"), "profile-referenced agent becomes a parent route without sidecar variants")
+  const clone = editor.map.get(parentCloneId("explore", "night"))
+  assert(clone, "profile parent patch creates a clone for a variant-less agent")
+  assert(clone.hidden === true && clone.model.id === "glm-5.3-xhigh", "variant-less parent clone carries the overlaid model")
+  const rewritten = resolveExecutionAgent({ agent: "explore" }, assembly, { name: "night" })
+  assert(rewritten?.agent === parentCloneId("explore", "night") && rewritten.changed === true, "base call to variant-less agent rewrites under profile")
+}
+
+function testV2ProfileParentFlowsIntoVariants() {
+  // v1 liveRoute parity: profile parent patches compose into variant
+  // execution through the propagate/inherit rules.
+  const editor = stubV2Editor({
+    general: { id: "general", name: "general", model: { providerID: "zai", id: "glm-5.3" }, request: { settings: {}, headers: {}, body: {} }, system: "Base.", mode: "all", hidden: false, permissions: [] },
+  })
+  const sidecar = emptyConfig()
+  sidecar.agents = {
+    general: {
+      parent: { temperature: 0.5, propagate: { temperature: true } },
+      variants: { fast: { model: "zai/glm-4.7-flash" } },
+    },
+  }
+  sidecar.profiles = {
+    hot: { match: { model: "zai/glm-5.3" }, agents: { general: { parent: { temperature: 0.9 }, variants: {} } } },
+  }
+  const assembly = assembleV2Agents(editor, sidecar)
+
+  const noProfile = { sessionID: "s", agent: "general-fast", model: { providerID: "zai", id: "glm-4.7-flash" }, system: [{ type: "text", text: "Base." }], messages: [], tools: {}, generation: {}, providerOptions: {} }
+  applyContextOverrides(noProfile, { assembly, sidecar, activeProfile: undefined })
+  assert(noProfile.generation.temperature === 0.5, "propagated parent temperature reaches the variant without a profile")
+
+  const hot = { sessionID: "s", agent: "general-fast", model: { providerID: "zai", id: "glm-4.7-flash" }, system: [{ type: "text", text: "Base." }], messages: [], tools: {}, generation: {}, providerOptions: {} }
+  applyContextOverrides(hot, { assembly, sidecar, activeProfile: { name: "hot" } })
+  assert(hot.generation.temperature === 0.9, "profile parent temperature flows into variant execution")
+
+  const composed = composeVariantPatch({ temperature: 0.5, propagate: { temperature: true } }, { temperature: 0.9 }, { model: "zai/glm-4.7-flash" }, undefined, sidecar)
+  assert(composed.temperature === 0.9, "composeVariantPatch overlays the profile parent patch before inheritance")
+}
+
+function testV2ParentDescriptionAndCollisions() {
+  const editor = stubV2Editor({
+    general: { id: "general", name: "general", request: { settings: {}, headers: {}, body: {} }, system: "Base.", description: "General agent.", mode: "all", hidden: false, permissions: [] },
+    "av:general-fast@night": { id: "av:general-fast@night", name: "user clone", request: { settings: {}, headers: {}, body: {} }, mode: "subagent", hidden: false, permissions: [] },
+  })
+  const sidecar = emptyConfig()
+  sidecar.agents = {
+    general: {
+      parent: {},
+      variants: { fast: { model: "zai/glm-4.7-flash" } },
+    },
+  }
+  sidecar.profiles = {
+    night: { match: { model: "zai/glm-5.3" }, agents: { general: { variants: { fast: { model: "zai/glm-4.7-air" } } } } },
+  }
+  const assembly = assembleV2Agents(editor, sidecar)
+  const parent = editor.map.get("general")
+  assert(/Available variants: general-fast\./.test(parent.description ?? ""), "parent description advertises its aliases (v1 parity)")
+  assert(parent.description?.startsWith("General agent."), "parent description patch preserves the base text")
+  assert(!editor.map.has("av:general-fast@night") || editor.map.get("av:general-fast@night").name === "user clone", "clone id collision leaves the user agent untouched")
+  assert(assembly.diagnostics.some((item) => item.level === "error" && /conflicts with an existing agent/.test(item.message)), "clone collision produces an error diagnostic")
+}
+
 
 function testPartialProviderOverrideWithVariants() {
   const sidecar = {
@@ -411,18 +765,6 @@ function testProfiles() {
   assert(sameModel.profiles.fresh.agents.build.parent.variant === "high", "rewriting the same model keeps the variant override")
 }
 
-testProfiles()
-testPaletteCategory()
-testPartialProviderOverrideWithVariants()
-testMissingCustomProviderModelIsDeferred()
-testMalformedModelShapeStillSkips()
-testMarkerlessDefaultAndLegacyScrub()
-testParallelBaseTaskCannotClaimVariantRoute()
-testRuntimeDependencyMetadata()
-testSelectionTierInference()
-await testLiveRepairNeverRevertsRunningParts()
-await testHistoryRepairSkipsRunningParts()
-
 async function testLiveRepairNeverRevertsRunningParts() {
   const { repairLiveTaskPart, persistCleanedParts, LIVE_REPAIR_DELAYS } = __testInternals
   const route = { alias: "explore-light", targetAgent: "explore", parent: "explore", model: "opencode/muse" }
@@ -577,119 +919,29 @@ async function testHistoryRepairSkipsRunningParts() {
   if (result.repaired !== 0) throw new Error(`history repair should skip running parts, repaired=${result.repaired}`)
 }
 
-function testSelfwire() {
-  // Identity matching: npm specs AND local checkout folders.
-  assert(isAgentVariantsSpec("@mirrowel/opencode-agent-variants"), "npm spec matches")
-  assert(isAgentVariantsSpec("@mirrowel/opencode-agent-variants@dev"), "tagged npm spec matches")
-  assert(isAgentVariantsSpec("file:///C:/Projects/OC%20Plugins/agent-variants"), "local checkout folder matches")
-  assert(isAgentVariantsSpec("file:///C:/cache/@mirrowel/opencode-agent-variants@dev"), "cache folder matches")
-  assert(!isAgentVariantsSpec("@mirrowel/opencode-config-studio"), "studio spec does not match")
-  assert(!isAgentVariantsSpec("file:///C:/Projects/OC%20Plugins/opencode-config-studio"), "studio folder does not match")
-  assert(isConfigStudioSpec("file:///C:/Projects/OC%20Plugins/opencode-config-studio"), "studio folder detected")
-  assert(isConfigStudioSpec("@mirrowel/opencode-config-studio@latest"), "studio npm detected")
-
-  // No registration -> no-op.
-  {
-    const dir = mkdtempSync(join(tmpdir(), "av-selfwire-"))
-    const globalDir = join(dir, "global")
-    mkdirSync(globalDir, { recursive: true })
-    try {
-      writeFileSync(join(globalDir, "opencode.json"), JSON.stringify({ plugin: ["@cortexkit/other"] }), "utf8")
-      const result = ensureTuiRegistration({ env: { OPENCODE_CONFIG_DIR: globalDir } })
-      if (result.status !== "not-registered") throw new Error(`expected not-registered, got ${result.status}`)
-      if (existsSync(join(globalDir, "tui.json"))) throw new Error("tui.json must not be created")
-    } finally {
-      rmSync(dir, { recursive: true, force: true })
-    }
-  }
-
-  // Studio present anywhere -> stands down even with AV registered.
-  {
-    const dir = mkdtempSync(join(tmpdir(), "av-selfwire-"))
-    const globalDir = join(dir, "global")
-    mkdirSync(globalDir, { recursive: true })
-    try {
-      writeFileSync(
-        join(globalDir, "opencode.json"),
-        JSON.stringify({ plugin: ["@mirrowel/opencode-agent-variants", "file:///C:/somewhere/opencode-config-studio"] }),
-        "utf8",
-      )
-      const result = ensureTuiRegistration({ env: { OPENCODE_CONFIG_DIR: globalDir } })
-      if (result.status !== "skipped-studio") throw new Error(`expected skipped-studio, got ${result.status}`)
-    } finally {
-      rmSync(dir, { recursive: true, force: true })
-    }
-  }
-
-  // Mirrors the registration level; local wins over npm; already-wired is a
-  // no-op; stale/mismatched mirrors auto-correct.
-  {
-    const dir = mkdtempSync(join(tmpdir(), "av-selfwire-"))
-    const globalDir = join(dir, "global")
-    const project = join(dir, "project", "src")
-    const localRepo = join(dir, "agent-variants")
-    mkdirSync(globalDir, { recursive: true })
-    mkdirSync(project, { recursive: true })
-    mkdirSync(localRepo, { recursive: true })
-    const localSpec = pathToFileURL(localRepo).href
-    try {
-      writeFileSync(join(globalDir, "opencode.json"), JSON.stringify({ plugin: ["@cortexkit/other", "@mirrowel/opencode-agent-variants@latest", localSpec] }), "utf8")
-      writeFileSync(join(globalDir, "tui.json"), JSON.stringify({ plugin: ["@cortexkit/magic"] }), "utf8")
-
-      const first = ensureTuiRegistration({ env: { OPENCODE_CONFIG_DIR: globalDir } })
-      if (first.status !== "wired" || first.spec !== localSpec) throw new Error(`local must win: ${JSON.stringify(first)}`)
-      const tui = JSON.parse(readFileSync(join(globalDir, "tui.json"), "utf8"))
-      if (!tui.plugin.includes(localSpec) || !tui.plugin.includes("@cortexkit/magic")) throw new Error(`wire keeps foreign entries: ${JSON.stringify(tui.plugin)}`)
-
-      const second = ensureTuiRegistration({ env: { OPENCODE_CONFIG_DIR: globalDir } })
-      if (second.status !== "already-wired") throw new Error(`idempotent: ${second.status}`)
-
-      // Mismatch correction: tui carries npm while server prefers local.
-      writeFileSync(join(globalDir, "tui.json"), JSON.stringify({ plugin: ["@cortexkit/magic", "@mirrowel/opencode-agent-variants@dev", "@mirrowel/opencode-agent-variants@latest"] }), "utf8")
-      const third = ensureTuiRegistration({ env: { OPENCODE_CONFIG_DIR: globalDir } })
-      if (third.status !== "corrected") throw new Error(`expected corrected, got ${third.status}`)
-      const fixed = JSON.parse(readFileSync(join(globalDir, "tui.json"), "utf8"))
-      const own = fixed.plugin.filter((entry) => isAgentVariantsSpec(entry))
-      if (own.length !== 1 || own[0] !== localSpec) throw new Error(`dedup + local alignment failed: ${JSON.stringify(fixed.plugin)}`)
-
-      // Project-level registration mirrors to the project tui.json.
-      writeFileSync(join(project, "opencode.json"), JSON.stringify({ plugin: [localSpec] }), "utf8")
-      rmSync(join(globalDir, "opencode.json"))
-      const fourth = ensureTuiRegistration({ env: { OPENCODE_CONFIG_DIR: globalDir }, directory: project, worktree: join(dir, "project") })
-      if (fourth.status !== "corrected" && fourth.status !== "wired") throw new Error(`project mirror failed: ${JSON.stringify(fourth)}`)
-      const projectTui = JSON.parse(readFileSync(join(project, "tui.json"), "utf8"))
-      if (!projectTui.plugin.includes(localSpec)) throw new Error(`project tui must carry the spec: ${JSON.stringify(projectTui)}`)
-      const globalTui = JSON.parse(readFileSync(join(globalDir, "tui.json"), "utf8"))
-      if (globalTui.plugin.some((entry) => isAgentVariantsSpec(entry))) throw new Error(`stale global mirror must be pruned: ${JSON.stringify(globalTui)}`)
-    } finally {
-      rmSync(dir, { recursive: true, force: true })
-    }
-  }
-}
-
-
-function testEmbeddedDialogScope() {
-  const record = []
-  const config = emptyConfig()
-  config.ui = { width: "xlarge", height: "max", height_percent: 100 }
-  const makeApi = (scope) => ({
-    dialogScope: scope,
-    kv: { get: (_key, fallback) => fallback, set: (key, value) => record.push([key, value]), ready: true },
-    ui: { dialog: { setSize: (size) => record.push(["setSize", size]) } },
-  })
-  applyWizardUiSettings(makeApi("standalone"), config)
-  if (record.length === 0) throw new Error("standalone scope must push ui settings into kv")
-  if (!record.some(([key]) => key === "agent-variants.ui-width")) throw new Error("standalone scope writes own keys: " + JSON.stringify(record))
-  record.length = 0
-  applyWizardUiSettings(makeApi("embedded"), config)
-  if (record.length !== 0) throw new Error("embedded scope must not touch kv/setSize: " + JSON.stringify(record))
-}
-
-testEmbeddedDialogScope()
-testSelfwire()
+testProfiles()
+testPaletteCategory()
+testDualEntryModules()
+testV2Assembly()
+testV2AssemblyProfileClone()
+testV2ExecutionRouting()
+testV2VariantOnlyProfileOverlay()
+testV2ProfileParentOnVariantLessAgent()
+testV2ProfileParentFlowsIntoVariants()
+testV2ParentDescriptionAndCollisions()
+testPartialProviderOverrideWithVariants()
+testMissingCustomProviderModelIsDeferred()
+testMalformedModelShapeStillSkips()
+testMarkerlessDefaultAndLegacyScrub()
+testParallelBaseTaskCannotClaimVariantRoute()
+testRuntimeDependencyMetadata()
+testSelectionTierInference()
 await testLiveRepairNeverRevertsRunningParts()
-await testHistoryRepairSkipsRunningParts()
+await testCorrelationV2()
 
+// Correlation v2: tail-windowed parent fetches (never full-list), continuation
+// pre-registration (zero parent fetches), stale-state safety for manual or
+// automated post-call messages, and base-continuation clears.
 async function testCorrelationV2() {
   const { createHooks } = __testInternals
   const messagesCalls = []
@@ -856,8 +1108,118 @@ async function testCorrelationV2() {
   process.env.HOME = realHome
   rmSync(tmpHome, { recursive: true, force: true })
 }
+await testHistoryRepairSkipsRunningParts()
 
-await testCorrelationV2()
+function testSelfwire() {
+  // Identity matching: npm specs AND local checkout folders.
+  assert(isAgentVariantsSpec("@mirrowel/opencode-agent-variants"), "npm spec matches")
+  assert(isAgentVariantsSpec("@mirrowel/opencode-agent-variants@dev"), "tagged npm spec matches")
+  assert(isAgentVariantsSpec("file:///C:/Projects/OC%20Plugins/agent-variants"), "local checkout folder matches")
+  assert(isAgentVariantsSpec("file:///C:/cache/@mirrowel/opencode-agent-variants@dev"), "cache folder matches")
+  assert(!isAgentVariantsSpec("@mirrowel/opencode-config-studio"), "studio spec does not match")
+  assert(!isAgentVariantsSpec("file:///C:/Projects/OC%20Plugins/opencode-config-studio"), "studio folder does not match")
+  assert(isConfigStudioSpec("file:///C:/Projects/OC%20Plugins/opencode-config-studio"), "studio folder detected")
+  assert(isConfigStudioSpec("@mirrowel/opencode-config-studio@latest"), "studio npm detected")
 
+  // No registration -> no-op.
+  {
+    const dir = mkdtempSync(join(tmpdir(), "av-selfwire-"))
+    const globalDir = join(dir, "global")
+    mkdirSync(globalDir, { recursive: true })
+    try {
+      writeFileSync(join(globalDir, "opencode.json"), JSON.stringify({ plugin: ["@cortexkit/other"] }), "utf8")
+      const result = ensureTuiRegistration({ env: { OPENCODE_CONFIG_DIR: globalDir } })
+      if (result.status !== "not-registered") throw new Error(`expected not-registered, got ${result.status}`)
+      if (existsSync(join(globalDir, "tui.json"))) throw new Error("tui.json must not be created")
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  // Studio present anywhere -> stands down even with AV registered.
+  {
+    const dir = mkdtempSync(join(tmpdir(), "av-selfwire-"))
+    const globalDir = join(dir, "global")
+    mkdirSync(globalDir, { recursive: true })
+    try {
+      writeFileSync(
+        join(globalDir, "opencode.json"),
+        JSON.stringify({ plugin: ["@mirrowel/opencode-agent-variants", "file:///C:/somewhere/opencode-config-studio"] }),
+        "utf8",
+      )
+      const result = ensureTuiRegistration({ env: { OPENCODE_CONFIG_DIR: globalDir } })
+      if (result.status !== "skipped-studio") throw new Error(`expected skipped-studio, got ${result.status}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+
+  // Mirrors the registration level; local wins over npm; already-wired is a
+  // no-op; stale/mismatched mirrors auto-correct.
+  {
+    const dir = mkdtempSync(join(tmpdir(), "av-selfwire-"))
+    const globalDir = join(dir, "global")
+    const project = join(dir, "project", "src")
+    const localRepo = join(dir, "agent-variants")
+    mkdirSync(globalDir, { recursive: true })
+    mkdirSync(project, { recursive: true })
+    mkdirSync(localRepo, { recursive: true })
+    const localSpec = pathToFileURL(localRepo).href
+    try {
+      writeFileSync(join(globalDir, "opencode.json"), JSON.stringify({ plugin: ["@cortexkit/other", "@mirrowel/opencode-agent-variants@latest", localSpec] }), "utf8")
+      writeFileSync(join(globalDir, "tui.json"), JSON.stringify({ plugin: ["@cortexkit/magic"] }), "utf8")
+
+      const first = ensureTuiRegistration({ env: { OPENCODE_CONFIG_DIR: globalDir } })
+      if (first.status !== "wired" || first.spec !== localSpec) throw new Error(`local must win: ${JSON.stringify(first)}`)
+      const tui = JSON.parse(readFileSync(join(globalDir, "tui.json"), "utf8"))
+      if (!tui.plugin.includes(localSpec) || !tui.plugin.includes("@cortexkit/magic")) throw new Error(`wire keeps foreign entries: ${JSON.stringify(tui.plugin)}`)
+
+      const second = ensureTuiRegistration({ env: { OPENCODE_CONFIG_DIR: globalDir } })
+      if (second.status !== "already-wired") throw new Error(`idempotent: ${second.status}`)
+
+      // Mismatch correction: tui carries npm while server prefers local.
+      writeFileSync(join(globalDir, "tui.json"), JSON.stringify({ plugin: ["@cortexkit/magic", "@mirrowel/opencode-agent-variants@dev", "@mirrowel/opencode-agent-variants@latest"] }), "utf8")
+      const third = ensureTuiRegistration({ env: { OPENCODE_CONFIG_DIR: globalDir } })
+      if (third.status !== "corrected") throw new Error(`expected corrected, got ${third.status}`)
+      const fixed = JSON.parse(readFileSync(join(globalDir, "tui.json"), "utf8"))
+      const own = fixed.plugin.filter((entry) => isAgentVariantsSpec(entry))
+      if (own.length !== 1 || own[0] !== localSpec) throw new Error(`dedup + local alignment failed: ${JSON.stringify(fixed.plugin)}`)
+
+      // Project-level registration mirrors to the project tui.json.
+      writeFileSync(join(project, "opencode.json"), JSON.stringify({ plugin: [localSpec] }), "utf8")
+      rmSync(join(globalDir, "opencode.json"))
+      const fourth = ensureTuiRegistration({ env: { OPENCODE_CONFIG_DIR: globalDir }, directory: project, worktree: join(dir, "project") })
+      if (fourth.status !== "corrected" && fourth.status !== "wired") throw new Error(`project mirror failed: ${JSON.stringify(fourth)}`)
+      const projectTui = JSON.parse(readFileSync(join(project, "tui.json"), "utf8"))
+      if (!projectTui.plugin.includes(localSpec)) throw new Error(`project tui must carry the spec: ${JSON.stringify(projectTui)}`)
+      const globalTui = JSON.parse(readFileSync(join(globalDir, "tui.json"), "utf8"))
+      if (globalTui.plugin.some((entry) => isAgentVariantsSpec(entry))) throw new Error(`stale global mirror must be pruned: ${JSON.stringify(globalTui)}`)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+}
+
+function testEmbeddedDialogScope() {
+  // Embedded scope (Config Studio): applyWizardUiSettings must NOT push
+  // sidecar ui values into the host kv - the host's dialog settings rule.
+  const record = []
+  const config = emptyConfig()
+  config.ui = { width: "xlarge", height: "max", height_percent: 100 }
+  const makeApi = (scope) => ({
+    dialogScope: scope,
+    kv: { get: (_key, fallback) => fallback, set: (key, value) => record.push([key, value]), ready: true },
+    ui: { dialog: { setSize: (size) => record.push(["setSize", size]) } },
+  })
+  applyWizardUiSettings(makeApi("standalone"), config)
+  if (record.length === 0) throw new Error("standalone scope must push ui settings into kv")
+  if (!record.some(([key]) => key === "agent-variants.ui-width")) throw new Error(`standalone scope writes own keys: ${JSON.stringify(record)}`)
+  record.length = 0
+  applyWizardUiSettings(makeApi("embedded"), config)
+  if (record.length !== 0) throw new Error(`embedded scope must not touch kv/setSize: ${JSON.stringify(record)}`)
+}
+
+testSelfwire()
+testEmbeddedDialogScope()
 console.log("regression tests passed")
 process.exit(0)

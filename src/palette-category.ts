@@ -12,7 +12,9 @@
 
 const REGISTRY_KEY = Symbol.for("mirrowel.opencode.paletteCategory")
 
-type CategorizedCommand = { category?: string }
+// v1 command objects group via `category`; v2 keymap commands use `group`.
+// Stamping both keeps one registry meaningful on both hosts.
+type CategorizedCommand = { category?: string; group?: string }
 type RegistryEntry = { label: string; commands: CategorizedCommand[] }
 type Registry = { entries: RegistryEntry[] }
 
@@ -60,7 +62,10 @@ export function currentPaletteCategory(): string {
 export function reconcilePaletteCategories(): void {
   const category = joinedCategory()
   for (const entry of registry().entries) {
-    for (const command of entry.commands) command.category = category
+    for (const command of entry.commands) {
+      command.category = category
+      command.group = category
+    }
   }
 }
 

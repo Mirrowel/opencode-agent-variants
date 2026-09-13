@@ -5,14 +5,16 @@
 **Overall:** OpenCode plugin with server-side hook routing and TUI wizard UI
 
 **Key Characteristics:**
+- Dual-host support: one package serves both OpenCode v1 and v2 — `dist/server.js` and `dist/tui.js` each default-export `{ id, server/tui (v1 factory), setup (v2 setup) }`; v1's loader reads only the legacy key, v2's loader reads only `setup`, and both ignore the excess key
+- v1 TUI self-wiring: the v1 server plugin mirrors its own registration into a same-level `tui.json` when a matching TUI entry is absent, correcting stale mirrors and duplicates so the wizard command loads; it stands down entirely when Config Studio is registered anywhere
 - Dual-entry plugin architecture: server hooks for runtime routing + TUI for configuration
 - Sidecar config file (`agent-variants.jsonc`) separate from OpenCode's own config
-- Markerless route correlation by default: child sessions are matched through OpenCode task metadata (`sessionId`) and task call IDs with fail-closed semantics (no fingerprint heuristics); legacy prompt markers are an opt-in debug fallback
-- Hot-reload boundary: runtime fields (model, prompt, temperature) apply per-call; structural fields (description, color, name) require restart
+- Markerless route correlation by default: child sessions are matched through OpenCode task metadata (`sessionId`) and task call IDs with fail-closed semantics (no fingerprint heuristics); legacy prompt markers are an opt-in debug fallback (v1 only — v2 routing is structural and needs no correlation)
+- Hot-reload boundary: runtime fields (model, prompt, temperature) apply per-call; structural fields (description, color, name) require restart on v1 — on v2, a sidecar directory watcher triggers `ctx.agent.reload()`, so structural changes apply live
 - Conditional profile overlays: named profiles patch hot-reload fields only, activated automatically by the primary session's model (last-match-wins) or manually pinned via `routing.activeProfile`; overlays stack on top of the global default per task call with no restart
 - Two-phase model validation: shape (`provider/model` format) checks run synchronously at startup; provider/model existence checks run asynchronously once OpenCode's merged provider catalog is available, with diagnostic toasts delivered through a retry-capable queue
 - Automatic config backups with patch-chain reversal on every save
-- Internal-only routing metadata: route state stays in memory and task `state.metadata`; legacy markers and residual artifacts are stripped from model-visible output; stored task parts are auto-repaired when needed
+- Internal-only routing metadata: route state stays in memory and task `state.metadata`; legacy markers and residual artifacts are stripped from model-visible output; stored task parts are auto-repaired when needed, but a repair only ever rewrites a completed snapshot — a running or unknown-status part is never reverted
 
 ## Layers
 
@@ -23,12 +25,33 @@
 - Depends on: `src/config.ts` for config loading, validation, and model resolution
 - Used by: OpenCode runtime via `src/server.ts` entry point
 
+**TUI Self-Wiring (v1):**
+- Purpose: Ensures the wizard command loads when agent-variants is registered as a server plugin without a matching TUI registration
+- Location: `src/selfwire.ts`
+- Contains: `ensureTuiRegistration()` mirrors the standalone server registration into `tui.json` at the same config level (global → global, project → project), recognizing any agent-variants checkout (`isAgentVariantsSpec()`), preferring local checkouts over npm installs, removing stale mirrors, and deduping duplicates; writes atomically with timestamped backups under `~/.config/opencode/agent-variants/selfwire-backups`
+- Depends on: `comment-json`, `node:fs`, `node:path`, `node:url`
+- Used by: the v1 plugin factory in `src/index.ts`; skipped entirely when Config Studio is registered anywhere (it embeds the wizard), and never imported by the v2 setup (v2 auto-discovers `./tui` from server-declared plugins)
+
+**OpenCode v2 Server Layer:**
+- Purpose: Same routing semantics on OpenCode v2, mapped onto its replayable agent transforms and request hooks
+- Location: `src/v2-server.ts` (setup) and `src/v2-types.ts` (hand-written minimal context types — the v2 SDK is beta and v2 modules must not import `@opencode-ai/plugin` at runtime)
+- Contains: `assembleV2Agents()` registers every variant alias as a REAL agent (a full copy of its parent — model/variant, composed system prompt for static-system parents, description guidance, inherited permissions/steps/request block); profiles get hidden per-model clones (`av:<alias>@<profile>` / `av:<parent>@<profile>`) selected by a `tool.execute.before` `input.agent` rewrite keyed on the active profile (manual pin, else the root primary session's model via `ctx.session.get` parentID walk); request parameters (temperature/top_p/provider options) are applied per request through the `session.context` hook (v2's `agent.request` is currently inert on the wire) keyed by the executing agent id; `tool.execute.after` stamps `agentVariants` metadata; a parent-directory file watcher triggers a debounced `ctx.agent.reload()` so sidecar edits apply live
+- Depends on: `src/config.ts` (shared pure helpers; v1 parity via `composeVariantPatch` = the v1 `liveRoute` overlay order)
+- Used by: `src/server.ts` (v2 `setup` export) and Config Studio's embedded v2 composition
+
+**OpenCode v2 TUI Layer:**
+- Purpose: Runs the unchanged wizard on the v2 TUI runtime
+- Location: `src/v2-tui.ts` (adapter + setup) and `src/tui-host.ts` (the bounded host-agnostic `TuiHostApi` interface the wizard is typed against — v1 api instances satisfy it structurally)
+- Contains: promise-dialog bridging (v1 component-style dialogs over v2's promise dialogs, with esc settling through the enclosing `dialog.replace` onClose), sync kv mirror over v2 storage, reactive keymap layers with signal-based disposal, theme token mapping, live state mirrors (agents from the v2 data store with hidden agents excluded, providers composed from provider+model stores), palette/slash command registration (`group` from the shared category join), and TUI-side startup diagnostics toasts (v2 has no server-side toast API)
+- Depends on: `src/config.ts`, `src/palette-category.ts`, `src/wizard.tsx`, `solid-js`
+- Used by: `src/tui.tsx` (v2 `setup` export)
+
 **Config & Schema Layer:**
 - Purpose: Defines Zod schemas for sidecar config, backup journal, and patches; loads/saves JSONC config; validates model references
 - Location: `src/config.ts`
 - Contains: Zod schemas (`SidecarConfig`, `Patch`, `Variant`, `ModelShortcut`, `Profile`, `ProfilePatch`, `BackupJournal`), config I/O, model catalog builder, diagnostics engine, template rendering, selection presets, profile overlay resolution and lens helpers
 - Depends on: `zod`, `comment-json`, `node:crypto`, `node:fs`, `node:path`, `node:os`
-- Used by: `src/index.ts`, `src/tui.tsx`, and `src/wizard.tsx`
+- Used by: `src/index.ts`, `src/v2-server.ts`, `src/v2-tui.ts`, `src/tui.tsx`, and `src/wizard.tsx`
 
 **TUI Plugin (Wizard UI):**
 - Purpose: Interactive terminal UI for creating, editing, and managing agent variants, model presets, and profiles
@@ -40,7 +63,7 @@
 **Build Output:**
 - Purpose: Compiled JavaScript and type declarations for distribution
 - Location: `dist/`
-- Contains: `index.js`, `server.js`, `config.js`, `tui.js`, `wizard.js`, `tui.d.ts`, `wizard.d.ts`, `server.d.ts`, `index.d.ts`, `config.d.ts`
+- Contains: `index.js`, `server.js`, `v2-server.js`, `config.js`, `palette-category.js`, `selfwire.js`, `tui.js`, `wizard.js`, `tui-host.js`, `v2-tui.js`, `v2-types.js` and matching `.d.ts` declarations
 - Depends on: TypeScript compilation from `src/`, followed by a Bun/OpenTUI Solid compilation pass for both `src/tui.tsx` and `src/wizard.tsx` (each gets its own reactive bundle); OpenTUI and Solid remain external host-provided runtime imports
 - Used by: npm package consumers
 
@@ -50,12 +73,13 @@
 
 1. OpenCode loads plugin via `src/server.ts` — `src/server.ts`
 2. `loadSidecar()` reads `~/.config/opencode/agent-variants.jsonc` — `src/config.ts`
-3. `assembleAgents()` merges parent patches, variant patches, model presets, and auto-inferred selection-guidance descriptions into `cfg.agent` entries — `src/index.ts`, `src/config.ts`
-4. Parent descriptions get appended variant alias list and selection guidance via `generatedParentDescription()` when variants exist — `src/index.ts`, `src/config.ts`
-5. Generated aliases are registered as virtual routes with metadata-based routing (built-ins) or cloned agents (custom agents) — `src/index.ts`
-6. Shape diagnostics (malformed `provider/model` references, conflicts, alias collisions, disabled entries) are emitted immediately; patches with shape errors have their model fields stripped — `src/index.ts`, `src/config.ts`
-7. `refreshMergedCatalog()` asynchronously fetches OpenCode's merged provider catalog via `client.provider.list` (falling back to `client.config.providers`) with retry backoff, then runs existence validation against it — `src/index.ts`
-8. `flushDiagnosticQueue()` delivers deferred diagnostics as warning toasts with retry support (toasts can be undeliverable before the TUI is ready) — `src/index.ts`
+3. The v1 plugin factory calls `ensureTuiRegistration()` to mirror the server registration into the same-level `tui.json` so the wizard command loads (a no-op on v2 and when Config Studio is registered) — `src/selfwire.ts`, `src/index.ts`
+4. `assembleAgents()` merges parent patches, variant patches, model presets, and auto-inferred selection-guidance descriptions into `cfg.agent` entries — `src/index.ts`, `src/config.ts`
+5. Parent descriptions get appended variant alias list and selection guidance via `generatedParentDescription()` when variants exist — `src/index.ts`, `src/config.ts`
+6. Generated aliases are registered as virtual routes with metadata-based routing (built-ins) or cloned agents (custom agents) — `src/index.ts`
+7. Shape diagnostics (malformed `provider/model` references, conflicts, alias collisions, disabled entries) are emitted immediately; patches with shape errors have their model fields stripped — `src/index.ts`, `src/config.ts`
+8. `refreshMergedCatalog()` asynchronously fetches OpenCode's merged provider catalog via `client.provider.list` (falling back to `client.config.providers`) with retry backoff, then runs existence validation against it — `src/index.ts`
+9. `flushDiagnosticQueue()` delivers deferred diagnostics as warning toasts with retry support (toasts can be undeliverable before the TUI is ready) — `src/index.ts`
 
 **Variant Call Routing (Runtime):**
 
@@ -68,8 +92,8 @@
 7. When no variant route matched but the child is a provable base task call (parent task part exists, no variant alias in metadata), `applyProfileBaseParent()` resolves the active profile and applies its parent model patch to the child message so non-variant children still honor profile overrides — `src/index.ts`
 8. `chat.params` hook patches temperature, top_p, and options on API requests — `src/index.ts`
 9. `experimental.chat.system.transform` hook patches the system prompt with variant prepend/append — `src/index.ts`
-10. `tool.execute.after` hook stores minimal internal metadata (`agentVariants.alias`, `agentVariants.routedAgent`) and scrubs all routing artifacts from task output — `src/index.ts`
-11. `experimental.chat.messages.transform` strips route markers and routing metadata from replayed chat history before any model sees it; when stored task parts contain residual artifacts, they are repaired via the session message API with read-back verification — `src/index.ts`
+10. `tool.execute.after` hook stores minimal internal metadata (`agentVariants.alias`, `agentVariants.routedAgent`), scrubs all routing artifacts from task output, and clears the route's session bindings so later continuations resolve their own model — `src/index.ts`
+11. `experimental.chat.messages.transform` strips route markers and routing metadata from replayed chat history before any model sees it; when stored task parts contain residual artifacts, they are repaired via the session message API with read-back verification, and only completed task parts are ever rewritten (a running or unknown-status part is left untouched and retried) — `src/index.ts`
 
 **Wizard Config Editing:**
 
@@ -94,7 +118,7 @@
 **RuntimeRoute:**
 - Purpose: Tracks a resolved variant alias with its parent agent, target agent, effective model, patch data, and the active profile (if any) that shaped it at runtime
 - Location: `src/index.ts`
-- Pattern: In-memory lookup object stored in `virtualRoutes`, `pending`, `bySession`, and `byCall` maps
+- Pattern: In-memory lookup object stored in `virtualRoutes`, `pending`, `bySession`, and `byCall` maps; session bindings are tracked on the route (`boundSessions`) and cleared in `tool.execute.after` so post-call messages to a subagent session never inherit a stale route
 
 **SidecarConfig:**
 - Purpose: The top-level configuration schema for the plugin, containing agents, model presets, profiles, UI settings, and debug flag
@@ -109,7 +133,7 @@
 **SelectionPreset:**
 - Purpose: Built-in task-list guidance presets that make variants easier for the main model to choose correctly
 - Location: `src/config.ts` (`SELECTION_PRESETS`, `inferredSelectionPreset()`, `selectionPresetText()`, `generatedVariantBase()`)
-- Pattern: 9 presets (basic, light, heavy, verification, parallel, strict-review, conservative, creative, synthesis) auto-inferred from variant key/name/model/model-variant; model-tier inference distinguishes entry-level/high-volume models (for example GPT nano and GPT-5.6 Luna), balanced models (GPT mini and GPT-5.6 Terra), and flagship models (GPT-5.5 and GPT-5.6 Sol); literal canonical tier words (`basic`, `light`, `heavy`) are explicit overrides, otherwise recognized model capability wins and semantic task names such as `data-entry` are fallback evidence only when the model tier is unknown; specialized purpose presets remain purpose-driven; the wizard can materialize preset text into the Description field or leave it auto-inferred
+- Pattern: 10 presets (basic, flash, light, heavy, verification, parallel, strict-review, conservative, creative, synthesis) auto-inferred from variant key/name/model/model-variant; model-tier inference distinguishes four capability tiers — basic (genuinely small lines such as GPT nano, GPT-5.6 Luna, Haiku, and `-lite` models), flash (distinct fast/secondary speed-optimized lines such as GLM flash, `-fast`, `-quick`, and low-reasoning variants), light (weaker siblings of the main model family such as GPT mini, GPT-5.6 Terra, and Sonnet), and heavy (flagship lines such as GPT-5.5 and GPT-5.6 Sol, Opus, `-fable`, and max/reasoning variants); literal canonical tier words (`basic`, `flash`, `light`, `heavy`) are explicit overrides, otherwise recognized model capability wins and semantic task names such as `data-entry` are fallback evidence only when the model tier is unknown; specialized purpose presets remain purpose-driven; the wizard can materialize preset text into the Description field or leave it auto-inferred
 
 **Profile:**
 - Purpose: Named conditional overlay of hot-reload fields (model, variant, temperature, top_p, prompt, prompt_prepend/append, options) applied on top of the global default, activated by primary-model match or manual pin
@@ -161,10 +185,10 @@
 
 ## Cross-Cutting Concerns
 
-**Logging:** Debug mode writes to `~/.config/opencode/agent-variants.debug.log` and shows toast notifications only while enabled. Controlled by `sidecar.debug` flag or runtime toggle in wizard, and hot-read by server hooks.
+**Logging:** Debug mode writes to `~/.config/opencode/agent-variants.debug.log` and shows toast notifications only while enabled. Controlled by `sidecar.debug` flag or runtime toggle in wizard, and hot-read by server hooks. User-visible warnings and errors are additionally captured to the same log unconditionally via `alwaysLog()` so anomaly evidence never depends on the debug switch.
 
 **Caching:** OpenCode caches the task list at startup. Structural changes (add/delete/disable variant, description, color) require restart. Runtime fields (model, prompt, temperature, top_p, options) hot-reload per call. Profile overlays apply per task call with no restart.
 
-**Palette Category:** Sibling Mirrowel plugins loaded in the same session share one combined palette section via the process-wide registry in `src/palette-category.ts`. Each plugin declares its label at TUI activation; a delayed reconciler joins all labels (alphabetical, deterministic) into every registered command's `category` field.
+**Palette Category:** Sibling Mirrowel plugins loaded in the same session share one combined palette section via the process-wide registry in `src/palette-category.ts`. Each plugin declares its label at TUI activation; a delayed reconciler joins all labels (alphabetical, deterministic) and stamps both `category` (v1 command objects) and `group` (v2 keymap commands) on every registered command.
 
 **Storage:** Sidecar config at `~/.config/opencode/agent-variants.jsonc`, backup journal at `~/.config/opencode/agent-variants.backup.json`, debug log at `~/.config/opencode/agent-variants.debug.log`.
