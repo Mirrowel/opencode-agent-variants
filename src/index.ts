@@ -406,6 +406,11 @@ export function __testAssembleAgents(cfg: Record<string, any>, sidecar: SidecarC
       diagnostics.push({ level: "warning", agent: parent, message: `${issue}; model fields skipped for parent override.` })
     }
     cfg.agent[parent] = applyConfigPatch({ ...(parentConfig ?? {}) }, parentPatch, sidecar, base, isBuiltin, templateContext(parent, undefined, {}, sidecar))
+    // Base-only disable: hide the parent from the model's task list while
+    // keeping it registered (AV's variant routing executes it internally).
+    // The before-hook additionally rejects fresh direct calls with the
+    // enabled-variant list; resumes (task_id) stay allowed.
+    if (entry.disable_base === true) (cfg.agent[parent] as AgentConfig).hidden = true
     if (isBuiltin && hasPromptPatch(parentPatch)) parentPromptPatches.set(parent, parentPatch)
     if (isBuiltin && hasRequestPatch(parentPatch)) parentRequestPatches.set(parent, parentPatch)
 
@@ -451,6 +456,9 @@ export function __testAssembleAgents(cfg: Record<string, any>, sidecar: SidecarC
       const copy = applyPatch({ ...(parentConfig ?? {}) }, effective, sidecar, parentConfig, templateContext(parent, key, effective, sidecar))
       copy.description = description
       delete copy.disable
+      // A hidden parent (disable_base) must not leak hidden onto its variant
+      // copies - variants stay visible in the task list.
+      delete (copy as AgentConfig & { hidden?: boolean }).hidden
       cfg.agent[alias] = copy
       virtualRoutes.set(alias, {
         alias,
@@ -1308,7 +1316,27 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
       const continuationArg = args.task_id ?? args.sessionID
       const continuation = typeof continuationArg === "string" && continuationArg ? continuationArg : undefined
       if (continuation && !staticRoute) bySession.delete(continuation)
-      if (!staticRoute) return
+      if (!staticRoute) {
+        // Base-only disable: fresh direct calls to the parent are rejected
+        // with the enabled-variant list (v1 runs before-hooks uncaught, so
+        // this throw surfaces as the tool's error - same class as OpenCode's
+        // own "Unknown agent type" failures). Continuation calls (task_id
+        // resumes of historical tasks) stay allowed by design.
+        if (!continuation) {
+          const baseEntry = sidecar.agents[args.subagent_type]
+          if (baseEntry && baseEntry.disable_base === true && !baseEntry.disable) {
+            const variants = Object.entries(baseEntry.variants)
+              .filter(([, variant]) => variant.disable !== true)
+              .map(([key, variant]) => variantName(args.subagent_type!, key, variant))
+            throw new Error(
+              variants.length > 0
+                ? `Agent "${args.subagent_type}" is disabled - use one of its variants: ${variants.join(", ")}`
+                : `Agent "${args.subagent_type}" is disabled and has no enabled variants - re-enable it or a variant in agent-variants`,
+            )
+          }
+        }
+        return
+      }
       const primary = await sessionModel(input.client, hookInput.sessionID)
       const route = liveRoute(staticRoute, catalog, primary)
       if (!catalog) debugLog(debugEnabled(), "Agent variant validation deferred", `${route.alias}: merged provider catalog is not ready; OpenCode provider validation will be used if needed`)

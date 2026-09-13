@@ -938,6 +938,96 @@ testRuntimeDependencyMetadata()
 testSelectionTierInference()
 await testLiveRepairNeverRevertsRunningParts()
 await testCorrelationV2()
+await testDisableBase()
+
+// Base-only disable: parent hidden + fresh direct calls rejected with the
+// variant list; variants stay registered and alias/resume calls unaffected.
+async function testDisableBase() {
+  // --- v1 assembly ---
+  {
+    const cfg = { agent: { explore: {}, custom: { description: "Custom agent." } } }
+    const sidecar = emptyConfig()
+    sidecar.agents = {
+      explore: { parent: {}, disable_base: true, variants: { light: { name: "explore-light", model: "opencode/muse-spark-1.3-contributor-free" } } },
+      custom: { parent: {}, disable_base: true, variants: { lite: { name: "custom-lite" } } },
+    }
+    __testAssembleAgents(cfg, sidecar)
+    assert(cfg.agent.explore.hidden === true, "v1: disable_base hides the builtin parent")
+    assert(cfg.agent.custom.hidden === true, "v1: disable_base hides the custom parent")
+    assert(cfg.agent["explore-light"] !== undefined, "v1: builtin variant still registered")
+    assert(cfg.agent["custom-lite"] !== undefined, "v1: custom variant still registered")
+    assert(cfg.agent["custom-lite"].hidden === undefined, "v1: hidden does not leak onto variant copies")
+    assert(cfg.agent["explore-light"].hidden === undefined, "v1: builtin variant copy stays visible")
+  }
+  {
+    // Full disable still removes the family entirely.
+    const cfg = { agent: { explore: {} } }
+    const sidecar = emptyConfig()
+    sidecar.agents = { explore: { parent: {}, disable: true, disable_base: true, variants: { light: { name: "explore-light" } } } }
+    __testAssembleAgents(cfg, sidecar)
+    assert(cfg.agent["explore-light"] === undefined, "v1: full disable skips variants")
+  }
+
+  // --- v1 before-hook: rejection semantics ---
+  {
+    const tmpHome = mkdtempSync(path.join(tmpdir(), "av-base-"))
+    mkdirSync(path.join(tmpHome, ".config", "opencode"), { recursive: true })
+    const sidecar = emptyConfig()
+    sidecar.agents = { explore: { parent: {}, disable_base: true, variants: { "explore-light": { name: "explore-light", model: "opencode/muse-spark-1.3-contributor-free" } } } }
+    writeFileSync(path.join(tmpHome, ".config", "opencode", "agent-variants.jsonc"), JSON.stringify(sidecar), "utf8")
+    const realProfile = process.env.USERPROFILE
+    const realHome = process.env.HOME
+    process.env.USERPROFILE = tmpHome
+    process.env.HOME = tmpHome
+    try {
+      const fakeClient = {
+        tui: { showToast: async () => true },
+        session: {
+          get: async ({ path }) => ({ data: { id: path.id, model: { providerID: "closedrouter", modelID: "glm-5.3" } } }),
+          messages: async () => ({ data: [] }),
+        },
+      }
+      const hooks = await __testInternals.createHooks({ client: fakeClient, directory: "C:/x" }, sidecar)
+      await hooks.config({ agent: { explore: {} } })
+
+      // Fresh direct call: rejected with the variant list.
+      let rejected
+      try {
+        await hooks["tool.execute.before"]({ tool: "task", sessionID: "ses_parent", callID: "c1" }, { args: { subagent_type: "explore", prompt: "x" } })
+        rejected = undefined
+      } catch (error) {
+        rejected = error
+      }
+      assert(rejected && /Agent "explore" is disabled - use one of its variants: explore-light/.test(String(rejected?.message)), `fresh base call is rejected with the variant list (got ${rejected?.message ?? "no error"})`)
+
+      // task_id resume of an old base task: allowed.
+      await hooks["tool.execute.before"]({ tool: "task", sessionID: "ses_parent", callID: "c2" }, { args: { subagent_type: "explore", prompt: "x", task_id: "ses_old_child" } })
+
+      // Alias call: routes normally (rewrites to the hidden parent).
+      await hooks["tool.execute.before"]({ tool: "task", sessionID: "ses_parent", callID: "c3" }, { args: { subagent_type: "explore-light", prompt: "x" } })
+    } finally {
+      process.env.USERPROFILE = realProfile
+      process.env.HOME = realHome
+      rmSync(tmpHome, { recursive: true, force: true })
+    }
+  }
+
+  // --- v2 assembly: parent hidden, alias visible ---
+  {
+    const editor = stubV2Editor({
+      build: { id: "build", name: "build", model: { providerID: "zai", id: "glm-5.3" }, request: { settings: {}, headers: {}, body: {} }, system: "You are build.", description: "Build things.", mode: "all", hidden: false, color: "#3af", steps: 5, permissions: [{ action: "*", resource: "*", effect: "allow" }] },
+    })
+    const sidecar = emptyConfig()
+    sidecar.agents = { build: { parent: {}, disable_base: true, variants: { plain: { temperature: 0.2 } } } }
+    const assembly = assembleV2Agents(editor, sidecar)
+    const parent = editor.map.get("build")
+    assert(parent.hidden === true, "v2: disable_base hides the parent definition")
+    const alias = editor.map.get("build-plain")
+    assert(alias && alias.hidden === false, "v2: variant alias stays visible")
+    assert(assembly.aliases.has("build-plain"), "v2: variant route registered")
+  }
+}
+
 
 // Correlation v2: tail-windowed parent fetches (never full-list), continuation
 // pre-registration (zero parent fetches), stale-state safety for manual or

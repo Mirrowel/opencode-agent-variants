@@ -337,7 +337,11 @@ export function assembleV2Agents(editor: V2AgentEditor, sidecar: SidecarConfig):
     }
 
     const parentPromptRuntime = parentInfo.system === undefined && hasPromptPatch(parentPatch)
-    if (Object.keys(parentPatch).length > 0) {
+    // Base-only disable: hide the parent from the subagent list (v2 filters
+    // hidden agents) while keeping it registered; the before-hook rejects
+    // fresh direct calls with the enabled-variant list.
+    const disableBase = entry?.disable_base === true && entry?.disable !== true
+    if (Object.keys(parentPatch).length > 0 || disableBase) {
       const tctx = templateContext(parent, undefined, {}, sidecar)
       editor.update(parent, (agent) => {
         applyAgentModel(agent, parentPatch, sidecar)
@@ -348,6 +352,7 @@ export function assembleV2Agents(editor: V2AgentEditor, sidecar: SidecarConfig):
         if (parentInfo.system !== undefined && hasPromptPatch(parentPatch)) {
           agent.system = applyPromptPatch(parentInfo.system, parentPatch, tctx)
         }
+        if (disableBase) agent.hidden = true
       })
     }
     assembly.parents.set(parent, { parent, patch: parentPatch, promptRuntime: parentPromptRuntime })
@@ -661,12 +666,31 @@ export function createV2ServerSetup(): V2ServerSetup {
       if (event.tool !== "subagent") return
       const input = event.input
       if (!input || typeof input !== "object") return
-      const args = input as { agent?: unknown; prompt?: unknown }
+      const args = input as { agent?: unknown; prompt?: unknown; sessionID?: unknown }
       if (typeof args.prompt === "string" && args.prompt.includes("agent-variants-route")) {
         args.prompt = stripLegacyMarkers(args.prompt)
       }
       if (typeof args.agent !== "string" || args.agent === "") return
       const sidecar = safeSidecar()
+      // Base-only disable: fresh direct calls to the parent are rejected
+      // with the enabled-variant list. v2's failure channel turns a
+      // before-hook rejection into the tool's error before it runs.
+      // Continuation calls (sessionID resumes) stay allowed by design.
+      const continuation = typeof args.sessionID === "string" && args.sessionID ? args.sessionID : undefined
+      const directAgent = typeof args.agent === "string" ? args.agent : undefined
+      if (!continuation && directAgent) {
+        const baseEntry = sidecar.agents[directAgent]
+        if (baseEntry && baseEntry.disable_base === true && !baseEntry.disable && !assembly.aliases.has(directAgent)) {
+          const variants = Object.entries(baseEntry.variants)
+            .filter(([, variant]) => variant.disable !== true)
+            .map(([key, variant]) => variantName(directAgent, key, variant))
+          throw new Error(
+            variants.length > 0
+              ? `Agent "${directAgent}" is disabled - use one of its variants: ${variants.join(", ")}`
+              : `Agent "${directAgent}" is disabled and has no enabled variants - re-enable it or a variant in agent-variants`,
+          )
+        }
+      }
       let profile: { name: string } | undefined
       try {
         profile = await activeProfileFor(sidecar, event.sessionID)

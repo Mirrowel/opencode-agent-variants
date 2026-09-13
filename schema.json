@@ -232,6 +232,9 @@
           "disable": {
             "type": "boolean"
           },
+          "disable_base": {
+            "type": "boolean"
+          },
           "parent": {
             "default": {},
             "type": "object",

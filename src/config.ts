@@ -145,6 +145,13 @@ export const SidecarConfig = z.object({
     z.string(),
     z.object({
       disable: z.boolean().optional(),
+      /**
+       * Disable the BASE agent only: the parent is hidden from the model's
+       * task-list and fresh direct calls are rejected ("use a variant"),
+       * while every variant stays fully callable. Full `disable` still
+       * removes the entire family.
+       */
+      disable_base: z.boolean().optional(),
       parent: ParentPatch.default({}),
       variants: z.record(z.string(), Variant).default({}),
     }),
@@ -957,6 +964,15 @@ export function diagnoseConfig(config: SidecarConfig, input: { agents: string[];
     if (!knownAgents.has(agent)) diagnostics.push({ level: "warning", agent, message: `Parent agent "${agent}" is not a known built-in or configured agent.` })
     if (!isSubagentCapableMode(input.agentModes?.[agent])) diagnostics.push({ level: "warning", agent, message: `Parent agent "${agent}" is primary-only and will not be callable by the task tool.` })
     if (entry.disable) diagnostics.push({ level: "info", agent, message: `Parent "${agent}" is disabled in sidecar config.` })
+    if (!entry.disable && entry.disable_base) {
+      const enabledVariants = Object.entries(entry.variants).filter(([, variant]) => variant.disable !== true)
+      if (enabledVariants.length === 0) {
+        diagnostics.push({ level: "warning", agent, message: `Parent "${agent}" has the base disabled but no enabled variants - the agent is unreachable. Disable it fully or enable a variant.` })
+      } else {
+        const names = enabledVariants.map(([key, variant]) => variantName(agent, key, variant)).join(", ")
+        diagnostics.push({ level: "info", agent, message: `Parent "${agent}" base is disabled - variants only (${names}). Direct calls are rejected with the variant list.` })
+      }
+    }
     for (const key of unknownFlagKeys(entry.parent.propagate)) {
       diagnostics.push({ level: "warning", agent, message: `Parent "${agent}" has unknown propagate key "${key}".` })
     }

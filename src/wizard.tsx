@@ -2025,13 +2025,26 @@ async function toggleDisable(api: TuiPluginApi, config: SidecarConfig, settings:
   for (const [agent, raw] of agentEntries(config)) {
     const entry = raw as AgentEntry
     const parentDisabled = entry.disable === true
+    const baseDisabled = !parentDisabled && entry.disable_base === true
+    const enabledVariantCount = Object.values(entry.variants).filter((variant) => (variant as VariantConfig).disable !== true).length
     items.push({
-      title: `${parentDisabled ? "x" : "ok"} ${agent} (parent)`,
+      title: `${parentDisabled ? "x" : baseDisabled ? "base-off" : "ok"} ${agent} (parent)`,
       value: { agent },
-      description: parentDisabled ? "Disabled - no variants active" : "Enabled",
+      description: parentDisabled
+        ? "Disabled - no variants active"
+        : baseDisabled
+          ? enabledVariantCount > 0
+            ? `Base disabled - variants only (${enabledVariantCount})`
+            : "Base disabled - UNREACHABLE (no enabled variants)"
+          : "Enabled",
       category: "Parents",
       color: parentColor(api, config, agent),
-      danger: parentDisabled,
+      danger: parentDisabled || (baseDisabled && enabledVariantCount === 0),
+      help: parentDisabled
+        ? "Fully disabled: the parent and every variant are removed from the task list. Pick to re-enable or switch to base-only disable."
+        : baseDisabled
+          ? "Base-only disable: the parent is hidden from the task list and fresh direct calls are rejected with the variant list, while every variant stays callable. Resumes of old base tasks still work. Pick for the full-disable submenu."
+          : "Enabled. Pick for disable options: full (parent + variants) or base-only (variants must be used).",
     })
     for (const [key, rawVar] of variantEntries(entry)) {
       const variant = rawVar as VariantConfig
@@ -2068,10 +2081,47 @@ async function toggleDisable(api: TuiPluginApi, config: SidecarConfig, settings:
       next.agents[picked.agent] = { parent: {}, variants: {} }
     }
     const entry = next.agents[picked.agent] as AgentEntry
-    entry.disable = !entry.disable
-    const state = entry.disable ? "disabled" : "enabled"
-    markRestart(settings, `${picked.agent}: parent ${state} requires restart.`)
-    await warnRestartField(api, "Parent disable", `Parent ${state}; restart OpenCode to update task-list visibility.`)
+    const variantCount = Object.values(entry.variants).filter((variant) => (variant as VariantConfig).disable !== true).length
+    const choice = await showMenu(api, {
+      title: `${picked.agent} disable`,
+      options: [
+        {
+          title: `${entry.disable ? "Disable parent + variants (current)" : "Disable parent + variants"}`,
+          value: "full",
+          description: entry.disable ? "currently: fully disabled - pick to re-enable" : "removes the parent and all variants from the task list",
+          danger: !entry.disable,
+          help: "Full disable: the parent and every variant disappear from the task list entirely (existing sidecar entry.disable).",
+        },
+        {
+          title: `${!entry.disable && entry.disable_base ? "Disable base only - variants must be used (current)" : "Disable base only - variants must be used"}`,
+          value: "base",
+          description:
+            entry.disable_base && !entry.disable
+              ? variantCount > 0
+                ? `currently: base disabled, ${variantCount} variant(s) active - pick to re-enable the base`
+                : "currently: base disabled with NO enabled variants - agent unreachable"
+              : "hides the parent from the task list; variants stay callable",
+          danger: !entry.disable && !entry.disable_base && variantCount === 0,
+          help:
+            "Base-only disable: the parent is hidden from the task list and fresh direct calls fail with the enabled-variant list (the model has to use a variant). Existing variant calls and task_id resumes of old base tasks keep working. Requires restart to apply.",
+        },
+        { title: "< Back", value: "__back__", description: "" },
+      ],
+    })
+    if (!choice || choice === "__back__") return config
+    if (choice === "full") {
+      entry.disable = !entry.disable
+      if (entry.disable) entry.disable_base = false
+      const state = entry.disable ? "disabled" : "enabled"
+      markRestart(settings, `${picked.agent}: parent ${state} requires restart.`)
+      await warnRestartField(api, "Parent disable", `Parent ${state}; restart OpenCode to update task-list visibility.`)
+    } else {
+      entry.disable_base = entry.disable_base !== true
+      if (entry.disable_base) entry.disable = false
+      const state = entry.disable_base ? "base disabled - variants only" : "base enabled"
+      markRestart(settings, `${picked.agent}: ${state} requires restart.`)
+      await warnRestartField(api, "Base disable", `Base ${state}; restart OpenCode to update task-list visibility.`)
+    }
   } else {
     const entry = next.agents[picked.agent] as AgentEntry | undefined
     const variant = entry?.variants[picked.variant] as VariantConfig | undefined
