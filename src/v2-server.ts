@@ -121,6 +121,14 @@ export type V2Assembly = {
   parents: Map<string, V2ParentRoute>
   /** Hidden parent clone id (`av:parent@profile`) → parent id. */
   parentClones: Map<string, string>
+  /**
+   * Sidecar-managed parents whose BASE is hidden (sidecar disable_base OR a
+   * hidden parent definition): fresh direct calls are rejected with the
+   * enabled-variant list; resumes stay allowed. Only populated for parents
+   * with at least one enabled variant (config-hidden alone never applies to
+   * agent definitions AV does not manage).
+   */
+  hiddenBaseParents: Set<string>
   diagnostics: Diagnostic[]
 }
 
@@ -133,7 +141,7 @@ export function parentCloneId(parent: string, profile: string) {
 }
 
 function emptyAssembly(): V2Assembly {
-  return { routes: new Map(), aliases: new Map(), parents: new Map(), parentClones: new Map(), diagnostics: [] }
+  return { routes: new Map(), aliases: new Map(), parents: new Map(), parentClones: new Map(), hiddenBaseParents: new Set(), diagnostics: [] }
 }
 
 function modelRefOf(patch: AgentPatch, sidecar: SidecarConfig): V2ModelRef | undefined {
@@ -339,8 +347,13 @@ export function assembleV2Agents(editor: V2AgentEditor, sidecar: SidecarConfig):
     const parentPromptRuntime = parentInfo.system === undefined && hasPromptPatch(parentPatch)
     // Base-only disable: hide the parent from the subagent list (v2 filters
     // hidden agents) while keeping it registered; the before-hook rejects
-    // fresh direct calls with the enabled-variant list.
+    // fresh direct calls with the enabled-variant list. A config-hidden
+    // parent definition behaves the same automatically - gated on at least
+    // one enabled variant so the agent stays reachable and unrelated hidden
+    // agents are never touched.
     const disableBase = entry?.disable_base === true && entry?.disable !== true
+    const configHiddenBase = !disableBase && entry && entry.disable !== true && parentInfo.hidden === true && enabledVariants.length > 0
+    if (disableBase || configHiddenBase) assembly.hiddenBaseParents.add(parent)
     if (Object.keys(parentPatch).length > 0 || disableBase) {
       const tctx = templateContext(parent, undefined, {}, sidecar)
       editor.update(parent, (agent) => {
@@ -672,24 +685,22 @@ export function createV2ServerSetup(): V2ServerSetup {
       }
       if (typeof args.agent !== "string" || args.agent === "") return
       const sidecar = safeSidecar()
-      // Base-only disable: fresh direct calls to the parent are rejected
-      // with the enabled-variant list. v2's failure channel turns a
-      // before-hook rejection into the tool's error before it runs.
-      // Continuation calls (sessionID resumes) stay allowed by design.
+      // Base-only disable: reject fresh direct calls with the enabled-variant
+      // list. v2's failure channel turns a before-hook rejection into the
+      // tool's error before it runs. Continuation calls (sessionID resumes)
+      // stay allowed by design.
       const continuation = typeof args.sessionID === "string" && args.sessionID ? args.sessionID : undefined
       const directAgent = typeof args.agent === "string" ? args.agent : undefined
-      if (!continuation && directAgent) {
+      if (!continuation && directAgent && assembly.hiddenBaseParents.has(directAgent) && !assembly.aliases.has(directAgent)) {
         const baseEntry = sidecar.agents[directAgent]
-        if (baseEntry && baseEntry.disable_base === true && !baseEntry.disable && !assembly.aliases.has(directAgent)) {
-          const variants = Object.entries(baseEntry.variants)
-            .filter(([, variant]) => variant.disable !== true)
-            .map(([key, variant]) => variantName(directAgent, key, variant))
-          throw new Error(
-            variants.length > 0
-              ? `Agent "${directAgent}" is disabled - use one of its variants: ${variants.join(", ")}`
-              : `Agent "${directAgent}" is disabled and has no enabled variants - re-enable it or a variant in agent-variants`,
-          )
-        }
+        const variants = Object.entries(baseEntry?.variants ?? {})
+          .filter(([, variant]) => variant.disable !== true)
+          .map(([key, variant]) => variantName(directAgent, key, variant))
+        throw new Error(
+          variants.length > 0
+            ? `Agent "${directAgent}" is disabled - use one of its variants: ${variants.join(", ")}`
+            : `Agent "${directAgent}" is disabled and has no enabled variants - re-enable it or a variant in agent-variants`,
+        )
       }
       let profile: { name: string } | undefined
       try {

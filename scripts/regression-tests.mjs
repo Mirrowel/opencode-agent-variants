@@ -1012,6 +1012,80 @@ async function testDisableBase() {
     }
   }
 
+  // --- v1 assembly: unification - config-hidden AV parents are base-disabled ---
+  {
+    const cfg = { agent: { explore: { hidden: true }, historian: { hidden: true }, plain: { hidden: true }, noentry: { hidden: true } } }
+    const sidecar = emptyConfig()
+    sidecar.agents = {
+      explore: { parent: {}, variants: { light: { name: "explore-light", model: "opencode/muse-spark-1.3-contributor-free" } } },
+      // No enabled variants: config-hidden must NOT reject (agent stays reachable... via nothing, but no silent lockout).
+      plain: { parent: {}, variants: { dead: { disable: true } } },
+      // Sidecar entry without variants at all: never auto-disabled.
+      bare: { parent: {}, variants: {} },
+    }
+    const assembled = __testAssembleAgents(cfg, sidecar)
+    assert(assembled.hiddenBaseParents.has("explore"), "v1: config-hidden AV parent with enabled variants is base-disabled")
+    assert(!assembled.hiddenBaseParents.has("plain"), "v1: config-hidden parent without enabled variants stays callable")
+    assert(!assembled.hiddenBaseParents.has("bare"), "v1: variant-less sidecar parent is never auto-disabled")
+    assert(!assembled.hiddenBaseParents.has("historian") && !assembled.hiddenBaseParents.has("noentry"), "v1: hidden agents without sidecar entries are never touched")
+  }
+
+  // --- v1 before-hook: unification rejection ---
+  {
+    const tmpHome = mkdtempSync(path.join(tmpdir(), "av-unify-"))
+    mkdirSync(path.join(tmpHome, ".config", "opencode"), { recursive: true })
+    const sidecar = emptyConfig()
+    sidecar.agents = { explore: { parent: {}, variants: { "explore-light": { name: "explore-light", model: "opencode/muse-spark-1.3-contributor-free" } } } }
+    writeFileSync(path.join(tmpHome, ".config", "opencode", "agent-variants.jsonc"), JSON.stringify(sidecar), "utf8")
+    const realProfile = process.env.USERPROFILE
+    const realHome = process.env.HOME
+    process.env.USERPROFILE = tmpHome
+    process.env.HOME = tmpHome
+    try {
+      const fakeClient = {
+        tui: { showToast: async () => true },
+        session: {
+          get: async ({ path }) => ({ data: { id: path.id, model: { providerID: "closedrouter", modelID: "glm-5.3" } } }),
+          messages: async () => ({ data: [] }),
+        },
+      }
+      const hooks = await __testInternals.createHooks({ client: fakeClient, directory: "C:/x" }, sidecar)
+      await hooks.config({ agent: { explore: { hidden: true }, historian: { hidden: true } } })
+
+      // Config-hidden AV parent: fresh direct call rejected.
+      let rejected
+      try {
+        await hooks["tool.execute.before"]({ tool: "task", sessionID: "ses_parent", callID: "c1" }, { args: { subagent_type: "explore", prompt: "x" } })
+        rejected = undefined
+      } catch (error) {
+        rejected = error
+      }
+      assert(rejected && /Agent "explore" is disabled - use one of its variants: explore-light/.test(String(rejected?.message)), `config-hidden parent rejects fresh calls (got ${rejected?.message ?? "no error"})`)
+
+      // Hidden agent WITHOUT a sidecar entry: never rejected (plugin agents keep working).
+      await hooks["tool.execute.before"]({ tool: "task", sessionID: "ses_parent", callID: "c2" }, { args: { subagent_type: "historian", prompt: "x" } })
+    } finally {
+      process.env.USERPROFILE = realProfile
+      process.env.HOME = realHome
+      rmSync(tmpHome, { recursive: true, force: true })
+    }
+  }
+
+  // --- v2 assembly: unification - hidden parent definition base-disables ---
+  {
+    const editor = stubV2Editor({
+      build: { id: "build", name: "build", model: { providerID: "zai", id: "glm-5.3" }, request: { settings: {}, headers: {}, body: {} }, system: "You are build.", description: "Build things.", mode: "all", hidden: true, color: "#3af", steps: 5, permissions: [{ action: "*", resource: "*", effect: "allow" }] },
+      dreamer: { id: "dreamer", name: "dreamer", request: { settings: {}, headers: {}, body: {} }, mode: "subagent", hidden: true, permissions: [] },
+    })
+    const sidecar = emptyConfig()
+    sidecar.agents = { build: { parent: {}, variants: { plain: { temperature: 0.2 } } } }
+    const assembly = assembleV2Agents(editor, sidecar)
+    assert(assembly.hiddenBaseParents.has("build"), "v2: hidden parent definition with enabled variants is base-disabled")
+    assert(!assembly.hiddenBaseParents.has("dreamer"), "v2: hidden agent without a sidecar entry is never touched")
+    const alias = editor.map.get("build-plain")
+    assert(alias && alias.hidden === false, "v2: variant alias stays visible")
+  }
+
   // --- v2 assembly: parent hidden, alias visible ---
   {
     const editor = stubV2Editor({

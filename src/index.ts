@@ -373,6 +373,11 @@ export function __testAssembleAgents(cfg: Record<string, any>, sidecar: SidecarC
   const virtualRoutes = new Map<string, RuntimeRoute>()
   const parentPromptPatches = new Map<string, AgentPatch>()
   const parentRequestPatches = new Map<string, AgentPatch>()
+  // Sidecar-managed parents whose BASE is hidden (either via the sidecar
+  // disable_base toggle or a config agent.<parent>.hidden entry): the model
+  // must use a variant. Fresh direct calls are rejected by the before-hook;
+  // task_id resumes stay allowed.
+  const hiddenBaseParents = new Set<string>()
   const diagnostics: Diagnostic[] = []
   const originalAgents = new Set([...Object.keys(cfg.agent), ...Object.keys(BUILTIN_AGENT_DESCRIPTIONS)])
   const generatedAliases = new Map<string, string>()
@@ -382,6 +387,17 @@ export function __testAssembleAgents(cfg: Record<string, any>, sidecar: SidecarC
     if (entry.disable) {
       diagnostics.push({ level: "info", agent: parent, message: `Parent "${parent}" is disabled in sidecar config.` })
       continue
+    }
+    if (!entry.disable_base && parentConfig?.hidden === true) {
+      // Config-hidden AV parents behave as base-only disable automatically -
+      // but ONLY when the parent actually has an enabled variant to fall
+      // back on, so the agent can never become unreachable and unrelated
+      // hidden agents (plugin agents like historians) are never touched.
+      const hasEnabledVariant = Object.values(entry.variants).some((variant) => variant.disable !== true)
+      if (hasEnabledVariant) {
+        hiddenBaseParents.add(parent)
+        diagnostics.push({ level: "info", agent: parent, message: `Parent "${parent}" is hidden via OpenCode config - treated as base-only disable (variants only); fresh direct calls are rejected.` })
+      }
     }
     if (parentConfig?.disable === true) {
       diagnostics.push({ level: "info", agent: parent, message: `Parent "${parent}" is disabled in OpenCode config; variants skipped.` })
@@ -410,7 +426,10 @@ export function __testAssembleAgents(cfg: Record<string, any>, sidecar: SidecarC
     // keeping it registered (AV's variant routing executes it internally).
     // The before-hook additionally rejects fresh direct calls with the
     // enabled-variant list; resumes (task_id) stay allowed.
-    if (entry.disable_base === true) (cfg.agent[parent] as AgentConfig).hidden = true
+    if (entry.disable_base === true) {
+      ;(cfg.agent[parent] as AgentConfig).hidden = true
+      hiddenBaseParents.add(parent)
+    }
     if (isBuiltin && hasPromptPatch(parentPatch)) parentPromptPatches.set(parent, parentPatch)
     if (isBuiltin && hasRequestPatch(parentPatch)) parentRequestPatches.set(parent, parentPatch)
 
@@ -487,7 +506,7 @@ export function __testAssembleAgents(cfg: Record<string, any>, sidecar: SidecarC
     }
   }
 
-  return { virtualRoutes, parentPromptPatches, parentRequestPatches, diagnostics }
+  return { virtualRoutes, parentPromptPatches, parentRequestPatches, hiddenBaseParents, diagnostics }
 }
 
 function takeMarkerRoute(parts: any[], routes: Map<string, RuntimeRoute>) {
@@ -1202,6 +1221,7 @@ type V1HookSet = Awaited<ReturnType<Plugin>>
  * self-wire; tests inject their own sidecar through __testInternals. */
 async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig): Promise<V1HookSet> {
   let virtualRoutes = new Map<string, RuntimeRoute>()
+  let hiddenBaseParents = new Set<string>()
   let parentPromptPatches = new Map<string, AgentPatch>()
   let parentRequestPatches = new Map<string, AgentPatch>()
   let catalog: ModelCatalog | undefined
@@ -1288,6 +1308,7 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
     config: async (cfg) => {
       const assembled = __testAssembleAgents(cfg as Record<string, any>, sidecar)
       virtualRoutes = assembled.virtualRoutes
+      hiddenBaseParents = assembled.hiddenBaseParents
       parentPromptPatches = assembled.parentPromptPatches
       parentRequestPatches = assembled.parentRequestPatches
       queueDiagnostics(assembled.diagnostics)
@@ -1317,23 +1338,22 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
       const continuation = typeof continuationArg === "string" && continuationArg ? continuationArg : undefined
       if (continuation && !staticRoute) bySession.delete(continuation)
       if (!staticRoute) {
-        // Base-only disable: fresh direct calls to the parent are rejected
-        // with the enabled-variant list (v1 runs before-hooks uncaught, so
-        // this throw surfaces as the tool's error - same class as OpenCode's
-        // own "Unknown agent type" failures). Continuation calls (task_id
-        // resumes of historical tasks) stay allowed by design.
-        if (!continuation) {
+        // Base-only disable (sidecar disable_base OR config agent.<parent>.hidden):
+        // fresh direct calls to the parent are rejected with the enabled-variant
+        // list (v1 runs before-hooks uncaught, so this throw surfaces as the
+        // tool's error - same class as OpenCode's own "Unknown agent type"
+        // failures). Continuation calls (task_id resumes of historical tasks)
+        // stay allowed by design.
+        if (!continuation && hiddenBaseParents.has(args.subagent_type)) {
           const baseEntry = sidecar.agents[args.subagent_type]
-          if (baseEntry && baseEntry.disable_base === true && !baseEntry.disable) {
-            const variants = Object.entries(baseEntry.variants)
-              .filter(([, variant]) => variant.disable !== true)
-              .map(([key, variant]) => variantName(args.subagent_type!, key, variant))
-            throw new Error(
-              variants.length > 0
-                ? `Agent "${args.subagent_type}" is disabled - use one of its variants: ${variants.join(", ")}`
-                : `Agent "${args.subagent_type}" is disabled and has no enabled variants - re-enable it or a variant in agent-variants`,
-            )
-          }
+          const variants = Object.entries(baseEntry?.variants ?? {})
+            .filter(([, variant]) => variant.disable !== true)
+            .map(([key, variant]) => variantName(args.subagent_type!, key, variant))
+          throw new Error(
+            variants.length > 0
+              ? `Agent "${args.subagent_type}" is disabled - use one of its variants: ${variants.join(", ")}`
+              : `Agent "${args.subagent_type}" is disabled and has no enabled variants - re-enable it or a variant in agent-variants`,
+          )
         }
         return
       }
