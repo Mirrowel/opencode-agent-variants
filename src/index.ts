@@ -1345,7 +1345,11 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
       // enforces this natively (not-found + parent check).
       if (continuation) {
         const info = await getSession(input.client, continuation)
-        if (!info) {
+        // Shape-validate: a missing session surfaces either as an SDK throw
+        // (caught -> undefined) or as an {error} envelope WITHOUT `data`,
+        // which getData passes through as a truthy object. A real Session.Info
+        // always carries a string id.
+        if (!info || typeof (info as { id?: unknown }).id !== "string") {
           throw new Error(
             `Unknown task id "${continuation}" - no such session. Start a new task without task_id${
               hiddenBaseParents.has(args.subagent_type) ? " (or use one of its variants)" : ""

@@ -1047,6 +1047,9 @@ async function testDisableBase() {
         ["ses_base_child", { id: "ses_base_child", parentID: "ses_parent" }],
         ["ses_variant_child", { id: "ses_variant_child", parentID: "ses_parent" }],
         ["ses_foreign_child", { id: "ses_foreign_child", parentID: "ses_other_parent" }],
+        // The live runtime returns an {error} envelope WITHOUT `data` for
+        // missing sessions - getData passes it through as a truthy object.
+        ["ses_envelope_child", { error: "Session not found" }],
       ])
       const partsByChild = new Map([
         // Genuine old base task: no AV alias metadata.
@@ -1090,6 +1093,14 @@ async function testDisableBase() {
         "bogus task id is rejected",
         /Unknown task id "ses_bogus" - no such session/,
         [{ tool: "task", sessionID: "ses_parent", callID: "c3" }, { args: { subagent_type: "explore", prompt: "x", task_id: "ses_bogus" } }],
+      )
+
+      // Error-envelope response (missing session): the envelope has no string
+      // id and must be treated as unknown, not as a truthy session.
+      await expectRejection(
+        "error-envelope task id is rejected",
+        /Unknown task id "ses_envelope_child" - no such session/,
+        [{ tool: "task", sessionID: "ses_parent", callID: "c3b" }, { args: { subagent_type: "explore", prompt: "x", task_id: "ses_envelope_child" } }],
       )
 
       // Foreign-parent task id: rejected (hijack guard, matches v2 core behavior).
