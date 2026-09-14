@@ -1337,23 +1337,52 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
       const continuationArg = args.task_id ?? args.sessionID
       const continuation = typeof continuationArg === "string" && continuationArg ? continuationArg : undefined
       if (continuation && !staticRoute) bySession.delete(continuation)
+      // Task-id validation: v1's task tool silently degrades unresolvable
+      // ids to a fresh session (task.ts: sessions.get(id).catchCause(() =>
+      // undefined), then `session ?? create(...)`) - so a hallucinated id is
+      // indistinguishable from a resume. Reject instead: the id must address
+      // an existing child of the calling session. v2's subagent tool
+      // enforces this natively (not-found + parent check).
+      if (continuation) {
+        const info = await getSession(input.client, continuation)
+        if (!info) {
+          throw new Error(
+            `Unknown task id "${continuation}" - no such session. Start a new task without task_id${
+              hiddenBaseParents.has(args.subagent_type) ? " (or use one of its variants)" : ""
+            }.`,
+          )
+        }
+        if (info.parentID && info.parentID !== hookInput.sessionID) {
+          throw new Error(`Task ${continuation} belongs to a different parent session - start a new task instead.`)
+        }
+      }
       if (!staticRoute) {
         // Base-only disable (sidecar disable_base OR config agent.<parent>.hidden):
         // fresh direct calls to the parent are rejected with the enabled-variant
         // list (v1 runs before-hooks uncaught, so this throw surfaces as the
         // tool's error - same class as OpenCode's own "Unknown agent type"
-        // failures). Continuation calls (task_id resumes of historical tasks)
-        // stay allowed by design.
-        if (!continuation && hiddenBaseParents.has(args.subagent_type)) {
+        // failures). Continuation calls may only resume tasks that actually
+        // ran the base: v1 variant children carry the AV alias in their task
+        // part metadata (session.agent is always the parent). The lookup is
+        // tail-windowed, so deep/old tasks without reachable metadata fail
+        // OPEN - which is exactly the historical-base-task exemption.
+        if (hiddenBaseParents.has(args.subagent_type)) {
           const baseEntry = sidecar.agents[args.subagent_type]
           const variants = Object.entries(baseEntry?.variants ?? {})
             .filter(([, variant]) => variant.disable !== true)
             .map(([key, variant]) => variantName(args.subagent_type!, key, variant))
-          throw new Error(
-            variants.length > 0
-              ? `Agent "${args.subagent_type}" is disabled - use one of its variants: ${variants.join(", ")}`
-              : `Agent "${args.subagent_type}" is disabled and has no enabled variants - re-enable it or a variant in agent-variants`,
-          )
+          const variantListError = () =>
+            new Error(
+              variants.length > 0
+                ? `Agent "${args.subagent_type}" is disabled - use one of its variants: ${variants.join(", ")}`
+                : `Agent "${args.subagent_type}" is disabled and has no enabled variants - re-enable it or a variant in agent-variants`,
+            )
+          if (!continuation) throw variantListError()
+          const part = await findParentTaskPartForChild(input.client, input.directory, hookInput.sessionID, continuation)
+          const alias = metadataAlias(part?.state?.metadata, virtualRoutes)
+          if (alias) {
+            throw new Error(`Task ${continuation} belongs to variant "${alias}" - resume it with ${alias} instead of the disabled base "${args.subagent_type}".`)
+          }
         }
         return
       }

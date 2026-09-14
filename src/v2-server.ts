@@ -691,7 +691,8 @@ export function createV2ServerSetup(): V2ServerSetup {
       // stay allowed by design.
       const continuation = typeof args.sessionID === "string" && args.sessionID ? args.sessionID : undefined
       const directAgent = typeof args.agent === "string" ? args.agent : undefined
-      if (!continuation && directAgent && assembly.hiddenBaseParents.has(directAgent) && !assembly.aliases.has(directAgent)) {
+      const hiddenBase = directAgent !== undefined && assembly.hiddenBaseParents.has(directAgent) && !assembly.aliases.has(directAgent)
+      if (hiddenBase && !continuation && directAgent) {
         const baseEntry = sidecar.agents[directAgent]
         const variants = Object.entries(baseEntry?.variants ?? {})
           .filter(([, variant]) => variant.disable !== true)
@@ -701,6 +702,19 @@ export function createV2ServerSetup(): V2ServerSetup {
             ? `Agent "${directAgent}" is disabled - use one of its variants: ${variants.join(", ")}`
             : `Agent "${directAgent}" is disabled and has no enabled variants - re-enable it or a variant in agent-variants`,
         )
+      }
+      // Resume rule for hidden bases: the base may only resume tasks that ran
+      // the base itself. v2 stores the EXECUTING agent on the child session
+      // (variant children carry the real alias id), and the subagent tool
+      // switches the child's agent on mismatch - so a base resume of a
+      // variant child would convert it. Reject unless the session's agent IS
+      // the called base. (Bogus session ids are rejected by v2 core before
+      // the tool runs; nothing to validate here.)
+      if (hiddenBase && continuation && directAgent) {
+        const child = await safeSessionGet(context, continuation)
+        if (child?.agent !== undefined && child.agent !== directAgent) {
+          throw new Error(`Task ${continuation} belongs to agent "${child.agent}" - resume it with that agent instead of the disabled base "${directAgent}".`)
+        }
       }
       let profile: { name: string } | undefined
       try {

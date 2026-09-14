@@ -1042,28 +1042,79 @@ async function testDisableBase() {
     process.env.USERPROFILE = tmpHome
     process.env.HOME = tmpHome
     try {
+      const sessions = new Map([
+        ["ses_parent", { id: "ses_parent", model: { providerID: "closedrouter", modelID: "glm-5.3" } }],
+        ["ses_base_child", { id: "ses_base_child", parentID: "ses_parent" }],
+        ["ses_variant_child", { id: "ses_variant_child", parentID: "ses_parent" }],
+        ["ses_foreign_child", { id: "ses_foreign_child", parentID: "ses_other_parent" }],
+      ])
+      const partsByChild = new Map([
+        // Genuine old base task: no AV alias metadata.
+        ["ses_base_child", { id: "prt_base", type: "tool", tool: "task", callID: "call_base", state: { status: "completed", input: { subagent_type: "explore" }, metadata: { sessionId: "ses_base_child" } } }],
+        // Variant child: carries the alias (what the correlation machinery writes).
+        ["ses_variant_child", { id: "prt_variant", type: "tool", tool: "task", callID: "call_variant", state: { status: "completed", input: { subagent_type: "explore-light" }, metadata: { sessionId: "ses_variant_child", agentVariants: { alias: "explore-light" } } } }],
+      ])
       const fakeClient = {
         tui: { showToast: async () => true },
         session: {
-          get: async ({ path }) => ({ data: { id: path.id, model: { providerID: "closedrouter", modelID: "glm-5.3" } } }),
-          messages: async () => ({ data: [] }),
+          get: async ({ path }) => ({ data: sessions.get(path.id) }),
+          messages: async () => ({ data: partsByChild.size > 0 ? [{ parts: [...partsByChild.values()] }] : [{ parts: [] }] }),
         },
       }
       const hooks = await __testInternals.createHooks({ client: fakeClient, directory: "C:/x" }, sidecar)
       await hooks.config({ agent: { explore: { hidden: true }, historian: { hidden: true } } })
 
-      // Config-hidden AV parent: fresh direct call rejected.
-      let rejected
-      try {
-        await hooks["tool.execute.before"]({ tool: "task", sessionID: "ses_parent", callID: "c1" }, { args: { subagent_type: "explore", prompt: "x" } })
-        rejected = undefined
-      } catch (error) {
-        rejected = error
+      const expectRejection = async (label, regex, call) => {
+        let rejected
+        try {
+          await hooks["tool.execute.before"](call[0], call[1])
+          rejected = undefined
+        } catch (error) {
+          rejected = error
+        }
+        assert(rejected && regex.test(String(rejected?.message)), `${label} (got ${rejected?.message ?? "no error"})`)
       }
-      assert(rejected && /Agent "explore" is disabled - use one of its variants: explore-light/.test(String(rejected?.message)), `config-hidden parent rejects fresh calls (got ${rejected?.message ?? "no error"})`)
+
+      // Config-hidden AV parent: fresh direct call rejected.
+      await expectRejection(
+        "config-hidden parent rejects fresh calls",
+        /Agent "explore" is disabled - use one of its variants: explore-light/,
+        [{ tool: "task", sessionID: "ses_parent", callID: "c1" }, { args: { subagent_type: "explore", prompt: "x" } }],
+      )
 
       // Hidden agent WITHOUT a sidecar entry: never rejected (plugin agents keep working).
       await hooks["tool.execute.before"]({ tool: "task", sessionID: "ses_parent", callID: "c2" }, { args: { subagent_type: "historian", prompt: "x" } })
+
+      // Bogus task id: rejected (v1 core would silently create a fresh session).
+      await expectRejection(
+        "bogus task id is rejected",
+        /Unknown task id "ses_bogus" - no such session/,
+        [{ tool: "task", sessionID: "ses_parent", callID: "c3" }, { args: { subagent_type: "explore", prompt: "x", task_id: "ses_bogus" } }],
+      )
+
+      // Foreign-parent task id: rejected (hijack guard, matches v2 core behavior).
+      await expectRejection(
+        "foreign-parent task id is rejected",
+        /belongs to a different parent session/,
+        [{ tool: "task", sessionID: "ses_parent", callID: "c4" }, { args: { subagent_type: "explore", prompt: "x", task_id: "ses_foreign_child" } }],
+      )
+
+      // Variant child resumed with the disabled base: rejected with the alias hint.
+      await expectRejection(
+        "base resume of a variant child is rejected with the alias",
+        /Task ses_variant_child belongs to variant "explore-light" - resume it with explore-light/,
+        [{ tool: "task", sessionID: "ses_parent", callID: "c5" }, { args: { subagent_type: "explore", prompt: "x", task_id: "ses_variant_child" } }],
+      )
+
+      // Genuine old base task: resume allowed (the exemption's whole point).
+      await hooks["tool.execute.before"]({ tool: "task", sessionID: "ses_parent", callID: "c6" }, { args: { subagent_type: "explore", prompt: "x", task_id: "ses_base_child" } })
+
+      // Bogus task id on a NON-hidden agent is still rejected (general task-tool guard).
+      await expectRejection(
+        "bogus task id rejected for any agent",
+        /Unknown task id "ses_bogus2" - no such session/,
+        [{ tool: "task", sessionID: "ses_parent", callID: "c7" }, { args: { subagent_type: "historian", prompt: "x", task_id: "ses_bogus2" } }],
+      )
     } finally {
       process.env.USERPROFILE = realProfile
       process.env.HOME = realHome
