@@ -37,6 +37,7 @@ import {
   applyModelPresetPatch,
   applyPromptPatch,
   applyTextPatch,
+  buildUnknownTaskIdMessage,
   defaultConfigDir,
   defaultSidecarPath,
   debugLogPath,
@@ -59,6 +60,7 @@ import {
   type Diagnostic,
   type ProfilePatch,
   type SidecarConfig,
+  type TaskCandidate,
   type VariantConfig,
 } from "./config.js"
 import type {
@@ -514,6 +516,43 @@ async function safeSessionGet(context: V2PluginContext, sessionID: string): Prom
   }
 }
 
+/** Children of `parentSessionID` for the enriched unknown-task-id message.
+ * Feature-detected: when the v2 context exposes no session listing the
+ * message simply carries no suggestions. */
+async function fetchV2TaskCandidates(context: V2PluginContext, parentSessionID: string): Promise<TaskCandidate[]> {
+  try {
+    const session = context.session as unknown as { list?: (args?: unknown) => Promise<unknown> }
+    if (typeof session.list !== "function") return []
+    const timer = new Promise<undefined>((resolve) => {
+      const handle = setTimeout(() => resolve(undefined), SESSION_CALL_TIMEOUT_MS)
+      ;(handle as unknown as { unref?: () => void }).unref?.()
+    })
+    const result = await Promise.race([session.list(), timer])
+    const list = Array.isArray(result)
+      ? result
+      : result && typeof result === "object"
+        ? ((result as { data?: unknown }).data ?? undefined)
+        : undefined
+    if (!Array.isArray(list)) return []
+    const candidates: TaskCandidate[] = []
+    for (const raw of list as Record<string, any>[]) {
+      if (!raw || typeof raw !== "object" || typeof raw.id !== "string") continue
+      if (raw.parentID !== parentSessionID) continue
+      const time = raw.time && typeof raw.time === "object" ? raw.time : {}
+      candidates.push({
+        id: raw.id,
+        title: typeof raw.title === "string" && raw.title !== "" ? raw.title : undefined,
+        agent: typeof raw.agent === "string" ? raw.agent : typeof raw.agent?.id === "string" ? raw.agent.id : undefined,
+        created: typeof time.created === "number" ? time.created : undefined,
+        updated: typeof time.updated === "number" ? time.updated : undefined,
+      })
+    }
+    return candidates
+  } catch {
+    return []
+  }
+}
+
 function createSessionCaches(context: V2PluginContext) {
   // parentID links are immutable, so the hop cache lives for the plugin;
   // the resolved root model is TTL-cached because primary sessions can
@@ -703,16 +742,27 @@ export function createV2ServerSetup(): V2ServerSetup {
             : `Agent "${directAgent}" is disabled and has no enabled variants - re-enable it or a variant in agent-variants`,
         )
       }
-      // Resume rule for hidden bases: the base may only resume tasks that ran
-      // the base itself. v2 stores the EXECUTING agent on the child session
-      // (variant children carry the real alias id), and the subagent tool
-      // switches the child's agent on mismatch - so a base resume of a
-      // variant child would convert it. Reject unless the session's agent IS
-      // the called base. (Bogus session ids are rejected by v2 core before
-      // the tool runs; nothing to validate here.)
-      if (hiddenBase && continuation && directAgent) {
+      // Unknown-id enrichment + resume rule for continuations. v2 core
+      // rejects unresolvable ids with a bare "Subagent session not found" -
+      // pre-empt it with the typo-corrected id and the recent-subagent
+      // list. (Unverifiable lookups fail closed here, same as v1.)
+      if (continuation) {
         const child = await safeSessionGet(context, continuation)
-        if (child?.agent !== undefined && child.agent !== directAgent) {
+        if (!child || typeof (child as { id?: unknown }).id !== "string") {
+          throw new Error(
+            buildUnknownTaskIdMessage(continuation, await fetchV2TaskCandidates(context, event.sessionID), {
+              typoDistance: sidecar.taskValidation.typoDistance,
+              suggestLimit: sidecar.taskValidation.suggestLimit,
+              variantsHint: hiddenBase,
+            }),
+          )
+        }
+        // Hidden bases may only resume tasks that ran the base itself. v2
+        // stores the EXECUTING agent on the child session (variant children
+        // carry the real alias id), and the subagent tool switches the
+        // child's agent on mismatch - so a base resume of a variant child
+        // would convert it. Reject unless the session's agent IS the base.
+        if (hiddenBase && directAgent && child.agent !== undefined && child.agent !== directAgent) {
           throw new Error(`Task ${continuation} belongs to agent "${child.agent}" - resume it with that agent instead of the disabled base "${directAgent}".`)
         }
       }

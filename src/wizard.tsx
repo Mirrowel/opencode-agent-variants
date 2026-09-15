@@ -3130,6 +3130,47 @@ async function profileEditorFlow(api: TuiPluginApi, config: SidecarConfig, setti
   }
 }
 
+/**
+ * Task-id suggestion settings (enriched unknown-task-id rejection).
+ * Shared by the standalone wizard menu and the Config Studio Tools entry.
+ */
+export async function taskValidationScreen(api: TuiPluginApi, config: SidecarConfig): Promise<SidecarConfig> {
+  while (true) {
+    const action = await showMenu(api, {
+      title: "Task id suggestions",
+      options: [
+        {
+          title: `Typo distance: ${config.taskValidation.typoDistance}`,
+          value: "distance",
+          description: "0 disables id matching",
+          help: "When a resumed task id does not exist, agent-variants fuzzy-matches it against this session's subagent ids. Matches within 2 edits are proposed confidently; matches within this distance are proposed as fuzzy (verify by title). 0 turns matching off.",
+        },
+        {
+          title: `Suggestion list: ${config.taskValidation.suggestLimit}`,
+          value: "limit",
+          description: "recent subagent sessions listed (0 disables)",
+          help: "The unknown-task-id error also lists this many recent subagent sessions of the calling session, newest first, so the model can pick the right one by title. 0 turns the list off.",
+        },
+      ],
+    })
+    if (!action) return config
+    const bound = action === "distance" ? { min: 0, max: 8, label: "Typo distance" } : { min: 0, max: 50, label: "Suggestion list" }
+    const input = await showPrompt(api.ui, {
+      title: bound.label,
+      placeholder: `${bound.min}-${bound.max}`,
+      value: String(action === "distance" ? config.taskValidation.typoDistance : config.taskValidation.suggestLimit),
+    })
+    if (input === undefined) continue
+    const value = Number(input)
+    if (!Number.isInteger(value) || value < bound.min || value > bound.max) {
+      await showAlert(api.ui, { title: "Invalid value", message: `Enter a whole number from ${bound.min} to ${bound.max}.` })
+      continue
+    }
+    if (action === "distance") config.taskValidation.typoDistance = value
+    else config.taskValidation.suggestLimit = value
+  }
+}
+
 export async function mainMenu(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings, host?: WizardHost, lens?: string): Promise<SidecarConfig> {
   const agentCount = Object.keys(config.agents).length
   const vCount = variantCount(config)
@@ -3144,6 +3185,7 @@ export async function mainMenu(api: TuiPluginApi, config: SidecarConfig, setting
     { title: "Add variant", value: "add", description: "Create a new agent variant", danger: true, help: "Creates a new variant under a parent subagent. New task-list aliases require restart before they appear." },
     { title: "Model presets", value: "models", description: `${Object.keys(config.models).length} shortcut(s)`, help: "Create reusable model shortcuts like light or heavy. Presets appear in Model pickers and can include model, model variant, temperature, top_p, and options." },
     { title: "Profiles", value: "profiles", description: `${Object.keys(config.profiles).length} profile(s)${config.routing.activeProfile ? `, pinned: ${config.routing.activeProfile}` : ""}`, help: "Conditional overrides applied on top of the global default, activated manually or by matching the primary session model. Profiles may only edit hot-reload fields (model, variant, temperature, top_p, prompt patches, options); structural changes (description, color, add/delete/disable) stay in the global default." },
+    { title: "Task id suggestions", value: "task-validation", description: `typo distance ${config.taskValidation.typoDistance}, list ${config.taskValidation.suggestLimit}`, help: "Tunes the enriched unknown-task-id rejection: when a resumed task id does not exist, agent-variants proposes the typo-corrected id (confident within 2 edits, fuzzy within the configured distance) and lists the session's recent subagent sessions. 0 disables either feature." },
     { title: "Edit parent fields", value: "edit-parent", description: "Override fields on an agent parent", help: "Parent fields can be propagated per field to variants. Red fields change cached task-list/UI metadata and require restart." },
     { title: "Edit variant", value: "edit-variant", description: "Change fields on an existing variant", help: "Variant fields override inherited parent values. Red fields require restart before OpenCode's task list/UI reflects them." },
     { title: "Toggle disable", value: "toggle", description: "Enable or disable agents/variants", danger: true, help: "Disable keeps config without deleting it. Task-list visibility updates after restart, and stale calls are blocked at runtime." },
@@ -3173,6 +3215,8 @@ export async function mainMenu(api: TuiPluginApi, config: SidecarConfig, setting
       return mainMenu(api, await manageModelPresets(api, config), settings, host, lens)
     case "profiles":
       return mainMenu(api, await manageProfiles(api, config, settings), settings, host, lens)
+    case "task-validation":
+      return mainMenu(api, await taskValidationScreen(api, config), settings, host, lens)
     case "edit-parent":
       return editParentFlow(api, config, settings, lens)
     case "edit-variant":

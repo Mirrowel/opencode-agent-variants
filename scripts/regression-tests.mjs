@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs"
 import { __testAssembleAgents, __testInternals } from "../dist/index.js"
-import { emptyConfig, inferredSelectionPreset, SELECTION_PRESETS, SidecarConfig, profileMatchesModel, resolveActiveProfile, overlayProfilePatch, profileVariantPatch, profileParentPatch, profileFieldSource, setProfileFieldIn } from "../dist/config.js"
+import { emptyConfig, inferredSelectionPreset, SELECTION_PRESETS, SidecarConfig, profileMatchesModel, resolveActiveProfile, overlayProfilePatch, profileVariantPatch, profileParentPatch, profileFieldSource, setProfileFieldIn, buildUnknownTaskIdMessage, levenshteinWithin } from "../dist/config.js"
 import { currentPaletteCategory, declarePaletteCategory, reconcilePaletteCategories, __resetPaletteRegistry } from "../dist/palette-category.js"
 import { applyWizardUiSettings } from "../dist/wizard.js"
 import { isAgentVariantsSpec, isConfigStudioSpec, ensureTuiRegistration } from "../dist/selfwire.js"
@@ -1126,6 +1126,40 @@ async function testDisableBase() {
         /Unknown task id "ses_bogus2" - no such session/,
         [{ tool: "task", sessionID: "ses_parent", callID: "c7" }, { args: { subagent_type: "historian", prompt: "x", task_id: "ses_bogus2" } }],
       )
+
+      // Enriched rejection: with session.list available, a distance-1 typo
+      // gets the confident closest-match line plus the recent list.
+      {
+        const listed = {
+          tui: { showToast: async () => true },
+          session: {
+            get: async () => ({ data: undefined }),
+            messages: async () => ({ data: [{ parts: [] }] }),
+            list: async () => ({
+              data: [
+                { id: "ses_child_nearmiss", parentID: "ses_parent", title: "Seek: verify W10.4", agent: "explore", time: { created: Date.now() - 3_600_000, updated: Date.now() - 600_000 } },
+                { id: "ses_child_unrelated_zzzzzzzzzzzzzz", parentID: "ses_parent", title: "Other", agent: "general", time: { created: Date.now() - 100_000 } },
+                { id: "ses_child_foreign", parentID: "ses_other", title: "Not mine", agent: "general", time: { created: Date.now() } },
+              ],
+            }),
+          },
+        }
+        const hooks2 = await __testInternals.createHooks({ client: listed, directory: "C:/x" }, sidecar)
+        let rejected
+        try {
+          await hooks2["tool.execute.before"]({ tool: "task", sessionID: "ses_parent", callID: "c8" }, { args: { subagent_type: "explore", prompt: "x", task_id: "ses_child_nearmisss" } })
+        } catch (error) {
+          rejected = error
+        }
+        const message = String(rejected?.message ?? "")
+        assert(/Closest match: ses_child_nearmiss/.test(message), `distance-1 typo proposes the confident closest match (got ${message})`)
+        assert(message.includes(`"Seek: verify W10.4"`), "closest-match line carries the title")
+        assert(message.includes("retry with that exact id"), "confident tier wording present")
+        assert(message.includes("Recent subagent sessions (newest first):"), "recent list present")
+        const listSection = message.slice(message.indexOf("Recent subagent sessions"))
+        assert(listSection.indexOf("ses_child_unrelated_zzzzzzzzzzzzzz") < listSection.indexOf("ses_child_nearmiss"), "list is newest-first")
+        assert(!message.includes("ses_child_foreign"), "foreign-parent sessions excluded from suggestions")
+      }
     } finally {
       process.env.USERPROFILE = realProfile
       process.env.HOME = realHome
@@ -1447,5 +1481,61 @@ function testEmbeddedDialogScope() {
 
 testSelfwire()
 testEmbeddedDialogScope()
+
+// --- unknown-task-id suggestions (tiered fuzzy match + list) ---
+
+function testUnknownTaskIdSuggestions() {
+  // levenshteinWithin basics.
+  if (levenshteinWithin("ses_pzh4v", "ses_pzh4v4", 1) !== 1) throw new Error("levenshtein: one extra char is distance 1")
+  if (levenshteinWithin("ses_abc", "ses_abd", 2) !== 1) throw new Error("levenshtein: substitution is distance 1")
+  if (levenshteinWithin("ses_abc", "ses_xyz", 2) !== undefined) throw new Error("levenshtein: beyond max returns undefined")
+
+  const near = [{ id: "ses_f595127c9ffeeenrCSx2Lpzh4v", title: "Seek: verify W10.4", agent: "explore-seek", updated: Date.now() - 3_600_000 }]
+  // The user's real case: one char too many -> confident tier.
+  {
+    const message = buildUnknownTaskIdMessage("ses_f595127c9ffeeenrCSx2Lpzh4v4", near, { typoDistance: 3, suggestLimit: 10 })
+    if (!message.includes("Closest match: ses_f595127c9ffeeenrCSx2Lpzh4v")) throw new Error(`distance-1 typo must be a confident match (got ${message})`)
+    if (!message.includes("retry with that exact id")) throw new Error("confident tier wording")
+    if (!message.includes("1h ago")) throw new Error("candidate age rendered")
+  }
+  // Distance 3 (within outer bound, beyond confident bound) -> fuzzy tier.
+  {
+    const message = buildUnknownTaskIdMessage("ses_f595127c9ffeeenrCSx2Lpzh4xyz", near, { typoDistance: 3, suggestLimit: 10 })
+    if (!message.includes("Possible match (fuzzy): ses_f595127c9ffeeenrCSx2Lpzh4v")) throw new Error(`distance-3 typo must be fuzzy (got ${message})`)
+    if (!message.includes("verify the title before resuming")) throw new Error("fuzzy tier wording")
+  }
+  // Distance 4 (beyond bound) -> explicit no-close-match note, list still there.
+  {
+    const message = buildUnknownTaskIdMessage("ses_f595127c9ffeeenrCSx2Lpqxyz", near, { typoDistance: 3, suggestLimit: 10 })
+    if (!message.includes("No close match found")) throw new Error("beyond-bound typo notes no close match")
+    if (!message.includes("Recent subagent sessions")) throw new Error("list survives a failed match")
+  }
+  // typoDistance 0 disables matching but keeps the list; suggestLimit 0 the reverse.
+  {
+    const noMatch = buildUnknownTaskIdMessage("ses_f595127c9ffeeenrCSx2Lpzh4v4", near, { typoDistance: 0, suggestLimit: 10 })
+    if (noMatch.includes("Closest match") || noMatch.includes("Possible match")) throw new Error("typoDistance 0 disables matching")
+    if (!noMatch.includes("Recent subagent sessions")) throw new Error("typoDistance 0 keeps the list")
+    const noList = buildUnknownTaskIdMessage("ses_f595127c9ffeeenrCSx2Lpzh4v4", near, { typoDistance: 3, suggestLimit: 0 })
+    if (!noList.includes("Closest match")) throw new Error("suggestLimit 0 keeps matching")
+    if (noList.includes("Recent subagent sessions")) throw new Error("suggestLimit 0 disables the list")
+  }
+  // Cap + newest-first ordering.
+  {
+    const many = Array.from({ length: 12 }, (_, index) => ({ id: `ses_c${String(index).padStart(2, "0")}`, created: Date.now() - index * 1000 }))
+    const message = buildUnknownTaskIdMessage("ses_totally_bogus_no_match", many, { typoDistance: 3, suggestLimit: 10 })
+    const section = message.slice(message.indexOf("Recent subagent sessions"))
+    if (section.includes("ses_c11")) throw new Error("list capped at 10 excludes the oldest")
+    if (!section.includes("ses_c00") || section.indexOf("ses_c00") > section.indexOf("ses_c01")) throw new Error("list is newest-first")
+  }
+  // No candidates at all -> terse fallback shape.
+  {
+    const message = buildUnknownTaskIdMessage("ses_nope", [], { typoDistance: 3, suggestLimit: 10, variantsHint: true })
+    if (!message.includes('Unknown task id "ses_nope" - no such session.')) throw new Error("terse first line")
+    if (!message.includes("(or use one of its variants)")) throw new Error("variants hint respected")
+    if (message.includes("No close match found")) throw new Error("no-candidate case skips the no-match note")
+  }
+}
+
+testUnknownTaskIdSuggestions()
 console.log("regression tests passed")
 process.exit(0)

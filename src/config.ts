@@ -101,6 +101,18 @@ const RoutingSettings = z.object({
 }).default({ prompt_markers: false })
 
 /**
+ * Unknown-task-id rejection tuning. `typoDistance` is the OUTER fuzzy
+ * bound: matches within min(2, typoDistance) edits are proposed
+ * confidently, matches within typoDistance edits are proposed as fuzzy
+ * (verify-by-title). 0 disables id matching entirely. `suggestLimit` caps
+ * the recent subagent-session list in the same message; 0 disables it.
+ */
+const TaskValidationSettings = z.object({
+  typoDistance: z.number().int().min(0).max(8).default(3),
+  suggestLimit: z.number().int().min(0).max(50).default(10),
+}).default({ typoDistance: 3, suggestLimit: 10 })
+
+/**
  * Profile patches may only override hot-reload fields: a profile activates
  * mid-session (manual switch or primary-model match), so structural changes
  * (description/color/disable/add/delete) are global-default-only.
@@ -138,6 +150,7 @@ const Profile = z.object({
 export const SidecarConfig = z.object({
   debug: z.boolean().default(false),
   routing: RoutingSettings,
+  taskValidation: TaskValidationSettings,
   ui: UiSettings,
   models: z.record(z.string(), ModelShortcut).default({}),
   profiles: z.record(z.string(), Profile).default({}),
@@ -461,7 +474,7 @@ export function backupJournalPath(configDir = defaultConfigDir()) {
 }
 
 export function emptyConfig(): SidecarConfig {
-  return { debug: false, routing: { prompt_markers: false }, ui: { width: "large", height: "normal" }, models: {}, profiles: {}, agents: {} }
+  return { debug: false, routing: { prompt_markers: false }, taskValidation: { typoDistance: 3, suggestLimit: 10 }, ui: { width: "large", height: "normal" }, models: {}, profiles: {}, agents: {} }
 }
 
 export function loadSidecar(filePath = defaultSidecarPath()) {
@@ -1018,4 +1031,108 @@ export function hasPromptPatch(patch: AgentPatch) {
 
 export function hasRequestPatch(patch: AgentPatch) {
   return patch.model !== undefined || patch.temperature !== undefined || patch.top_p !== undefined || patch.options !== undefined
+}
+
+// --- unknown-task-id suggestions ---------------------------------------------------
+
+/** A subagent session of the calling session, for typo correction lists. */
+export type TaskCandidate = {
+  id: string
+  title?: string
+  agent?: string
+  updated?: number
+  created?: number
+}
+
+/** Bounded Levenshtein distance: returns the distance only when it is <= max,
+ * otherwise undefined. Early-exits per row, so long ids stay cheap. */
+export function levenshteinWithin(a: string, b: string, max: number): number | undefined {
+  if (Math.abs(a.length - b.length) > max) return undefined
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index)
+  for (let i = 1; i <= a.length; i++) {
+    const current = [i]
+    let rowMin = i
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1
+      const value = Math.min(current[j - 1] + 1, previous[j] + 1, previous[j - 1] + cost)
+      current.push(value)
+      if (value < rowMin) rowMin = value
+    }
+    if (rowMin > max) return undefined
+    previous = current
+  }
+  const distance = previous[b.length]
+  return distance <= max ? distance : undefined
+}
+
+function describeCandidateAge(candidate: TaskCandidate): string {
+  const timestamp = candidate.updated ?? candidate.created
+  if (typeof timestamp !== "number") return ""
+  const delta = Math.max(0, Date.now() - timestamp)
+  const minutes = Math.round(delta / 60000)
+  if (minutes < 1) return "just now"
+  if (minutes < 60) return `${minutes}m ago`
+  const hours = Math.round(minutes / 60)
+  if (hours < 24) return `${hours}h ago`
+  return `${Math.round(hours / 24)}d ago`
+}
+
+function describeCandidate(candidate: TaskCandidate): string {
+  const parts: string[] = []
+  if (candidate.title) {
+    const title = candidate.title.length > 40 ? `${candidate.title.slice(0, 39)}…` : candidate.title
+    parts.push(`"${title}"`)
+  }
+  if (candidate.agent) parts.push(candidate.agent)
+  const age = describeCandidateAge(candidate)
+  if (age) parts.push(age)
+  return parts.length > 0 ? ` (${parts.join(" - ")})` : ""
+}
+
+/**
+ * Builds the enriched unknown-task-id rejection. Tiered fuzzy matching:
+ * within min(2, typoDistance) edits -> confident "retry with that exact id";
+ * within typoDistance edits -> hedged "possible match, verify the title";
+ * both fail -> explicit "no close match" note. The recent-session list
+ * (newest first, capped at suggestLimit) is always appended when candidates
+ * exist. Both features can be disabled with 0.
+ */
+export function buildUnknownTaskIdMessage(
+  bogusId: string,
+  candidates: TaskCandidate[],
+  options: { typoDistance: number; suggestLimit: number; variantsHint?: boolean },
+): string {
+  const lines: string[] = [`Unknown task id "${bogusId}" - no such session.`]
+  const sorted = [...candidates].sort(
+    (a, b) => (b.updated ?? b.created ?? 0) - (a.updated ?? a.created ?? 0),
+  )
+  if (options.typoDistance > 0 && sorted.length > 0) {
+    const confidentBound = Math.min(2, options.typoDistance)
+    let confident: { candidate: TaskCandidate; distance: number } | undefined
+    let fuzzy: { candidate: TaskCandidate; distance: number } | undefined
+    for (const candidate of sorted) {
+      const distance = levenshteinWithin(bogusId, candidate.id, options.typoDistance)
+      if (distance === undefined) continue
+      if (distance <= confidentBound) {
+        if (!confident || distance < confident.distance) confident = { candidate, distance }
+      } else if (!fuzzy || distance < fuzzy.distance) {
+        fuzzy = { candidate, distance }
+      }
+    }
+    if (confident) {
+      lines.push(`Closest match: ${confident.candidate.id}${describeCandidate(confident.candidate)} - retry with that exact id.`)
+    } else if (fuzzy) {
+      lines.push(`Possible match (fuzzy): ${fuzzy.candidate.id}${describeCandidate(fuzzy.candidate)} - verify the title before resuming with it.`)
+    } else {
+      lines.push("No close match found among this session's subagent sessions.")
+    }
+  }
+  if (options.suggestLimit > 0 && sorted.length > 0) {
+    lines.push("Recent subagent sessions (newest first):")
+    for (const candidate of sorted.slice(0, options.suggestLimit)) {
+      lines.push(`  ${candidate.id}${describeCandidate(candidate)}`)
+    }
+  }
+  lines.push(`Or start a new task without task_id${options.variantsHint ? " (or use one of its variants)" : ""}.`)
+  return lines.join("\n")
 }

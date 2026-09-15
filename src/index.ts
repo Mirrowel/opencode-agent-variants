@@ -6,6 +6,7 @@ import {
   applyPromptPatch,
   applyModelPresetPatch,
   applyTextPatch,
+  buildUnknownTaskIdMessage,
   BUILTIN_AGENT_MODES,
   BUILTIN_AGENT_DESCRIPTIONS,
   defaultConfigDir,
@@ -30,6 +31,7 @@ import {
   type Diagnostic,
   type ModelCatalog,
   type SidecarConfig,
+  type TaskCandidate,
   type TemplateContext,
   type VariantConfig,
   variantName,
@@ -612,6 +614,39 @@ async function getSession(client: any, sessionID: string, timeoutMs = CLIENT_CAL
   return getData(await safeClientCall(() => client?.session?.get?.({ path: { id: sessionID } }), timeoutMs)) as
     | ({ parentID?: string; agent?: string; model?: { providerID?: string; id?: string; variant?: string } })
     | undefined
+}
+
+/** Children of `parentSessionID` for unknown-task-id suggestions. Fail-soft:
+ * absent API or errors -> empty list (the rejection stays terse). */
+async function fetchTaskCandidates(client: any, directory: string | undefined, parentSessionID: string): Promise<TaskCandidate[]> {
+  const list = client?.session?.list
+  if (typeof list !== "function") return []
+  const calls: (() => Promise<unknown>)[] = [
+    () => list.call(client.session, { query: { directory } }),
+    () => list.call(client.session, { directory }),
+  ]
+  for (const call of calls) {
+    const result = getData(await safeClientCall(call, CLIENT_CALL_TIMEOUT))
+    if (!Array.isArray(result)) continue
+    const candidates: TaskCandidate[] = []
+    for (const raw of result as Record<string, any>[]) {
+      if (!raw || typeof raw !== "object" || typeof raw.id !== "string") continue
+      if (raw.parentID !== parentSessionID) continue
+      const agentRaw = raw.agent
+      const agent =
+        typeof agentRaw === "string" ? agentRaw : typeof agentRaw?.id === "string" ? agentRaw.id : undefined
+      const time = raw.time && typeof raw.time === "object" ? raw.time : {}
+      candidates.push({
+        id: raw.id,
+        title: typeof raw.title === "string" && raw.title !== "" ? raw.title : undefined,
+        agent,
+        created: typeof time.created === "number" ? time.created : typeof raw.time_created === "number" ? raw.time_created : undefined,
+        updated: typeof time.updated === "number" ? time.updated : typeof raw.time_updated === "number" ? raw.time_updated : undefined,
+      })
+    }
+    return candidates
+  }
+  return []
 }
 
 /** Short-TTL cache of a session's current model (primary-model profile matching). */
@@ -1350,10 +1385,16 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
         // which getData passes through as a truthy object. A real Session.Info
         // always carries a string id.
         if (!info || typeof (info as { id?: unknown }).id !== "string") {
+          // Enriched rejection: propose the typo-corrected id (tiered fuzzy
+          // match) plus the recent subagent sessions of this session, so the
+          // model can self-correct instead of spawning a stray task.
+          const candidates = await fetchTaskCandidates(input.client, input.directory, hookInput.sessionID)
           throw new Error(
-            `Unknown task id "${continuation}" - no such session. Start a new task without task_id${
-              hiddenBaseParents.has(args.subagent_type) ? " (or use one of its variants)" : ""
-            }.`,
+            buildUnknownTaskIdMessage(continuation, candidates, {
+              typoDistance: sidecar.taskValidation.typoDistance,
+              suggestLimit: sidecar.taskValidation.suggestLimit,
+              variantsHint: hiddenBaseParents.has(args.subagent_type),
+            }),
           )
         }
         if (info.parentID && info.parentID !== hookInput.sessionID) {
