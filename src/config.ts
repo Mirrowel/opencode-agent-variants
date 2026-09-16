@@ -1077,25 +1077,53 @@ function describeCandidateAge(candidate: TaskCandidate): string {
   return `${Math.round(hours / 24)}d ago`
 }
 
+/** Strips AV's trailing " (@alias variant)" title annotation, returning the
+ * clean title and the alias (when the complete annotation is present). */
+function splitTitleAnnotation(title: string): { title: string; alias?: string } {
+  const match = title.match(/\s+\(@(\S+) variant\)$/)
+  if (!match) return { title }
+  return { title: title.slice(0, match.index), alias: match[1] }
+}
+
+/** Word-boundary truncation: never cuts mid-token, and drops a dangling
+ * incomplete "(@..." fragment when the cut lands inside an annotation. */
+function truncateTitleWordBoundary(title: string, maxLength = 40): string {
+  if (title.length <= maxLength) return title
+  let cut = title.slice(0, maxLength - 1)
+  const lastSpace = cut.lastIndexOf(" ")
+  if (lastSpace > 24) cut = cut.slice(0, lastSpace)
+  cut = cut.replace(/\s*\(@[^)]*$/, "").replace(/\s+$/, "")
+  return cut.length > 0 ? `${cut}…` : `${title.slice(0, maxLength - 1)}…`
+}
+
 function describeCandidate(candidate: TaskCandidate): string {
   const parts: string[] = []
   if (candidate.title) {
-    const title = candidate.title.length > 40 ? `${candidate.title.slice(0, 39)}…` : candidate.title
-    parts.push(`"${title}"`)
+    const { title, alias } = splitTitleAnnotation(candidate.title)
+    const shown = title.length > 40 ? truncateTitleWordBoundary(title) : title
+    if (shown) parts.push(`"${shown}"`)
+    // The alias embeds the parent name (explore-seek), so the parent agent
+    // is dropped when the alias is known - never both.
+    const agent = alias ?? candidate.agent
+    if (agent) parts.push(agent)
+  } else if (candidate.agent) {
+    parts.push(candidate.agent)
   }
-  if (candidate.agent) parts.push(candidate.agent)
   const age = describeCandidateAge(candidate)
   if (age) parts.push(age)
   return parts.length > 0 ? ` (${parts.join(" - ")})` : ""
 }
 
 /**
- * Builds the enriched unknown-task-id rejection. Tiered fuzzy matching:
- * within min(2, typoDistance) edits -> confident "retry with that exact id";
- * within typoDistance edits -> hedged "possible match, verify the title";
- * both fail -> explicit "no close match" note. The recent-session list
- * (newest first, capped at suggestLimit) is always appended when candidates
- * exist. Both features can be disabled with 0.
+ * Builds the enriched unknown-task-id rejection. Prefix-aligned matches
+ * (either id is a prefix of the other - pure truncation or tail extension,
+ * no substitutions) are confident within the whole configured distance:
+ * the shared prefix carries the identity, so a clipped tail is strong
+ * evidence, not a fuzzy guess. Remaining matches tier by edit distance:
+ * within min(2, typoDistance) edits -> confident; within typoDistance ->
+ * hedged "verify the title"; both fail -> explicit "no close match" note.
+ * The recent-session list (newest first, capped at suggestLimit) is always
+ * appended when candidates exist. Both features can be disabled with 0.
  */
 export function buildUnknownTaskIdMessage(
   bogusId: string,
@@ -1108,9 +1136,21 @@ export function buildUnknownTaskIdMessage(
   )
   if (options.typoDistance > 0 && sorted.length > 0) {
     const confidentBound = Math.min(2, options.typoDistance)
+    let truncated: TaskCandidate | undefined
     let confident: { candidate: TaskCandidate; distance: number } | undefined
     let fuzzy: { candidate: TaskCandidate; distance: number } | undefined
     for (const candidate of sorted) {
+      const delta = Math.abs(bogusId.length - candidate.id.length)
+      if (delta > 0 && delta <= options.typoDistance && candidate.id.startsWith(bogusId)) {
+        // bogus is a strict prefix of the real id: the model truncated it.
+        truncated = truncated ?? candidate
+        continue
+      }
+      if (delta > 0 && delta <= options.typoDistance && bogusId.startsWith(candidate.id)) {
+        // real id is a strict prefix of bogus: hallucinated tail junk.
+        if (!confident || delta < confident.distance) confident = { candidate, distance: delta }
+        continue
+      }
       const distance = levenshteinWithin(bogusId, candidate.id, options.typoDistance)
       if (distance === undefined) continue
       if (distance <= confidentBound) {
@@ -1119,7 +1159,9 @@ export function buildUnknownTaskIdMessage(
         fuzzy = { candidate, distance }
       }
     }
-    if (confident) {
+    if (truncated) {
+      lines.push(`id looks truncated - full id: ${truncated.id}${describeCandidate(truncated)} - retry with that exact id.`)
+    } else if (confident) {
       lines.push(`Closest match: ${confident.candidate.id}${describeCandidate(confident.candidate)} - retry with that exact id.`)
     } else if (fuzzy) {
       lines.push(`Possible match (fuzzy): ${fuzzy.candidate.id}${describeCandidate(fuzzy.candidate)} - verify the title before resuming with it.`)

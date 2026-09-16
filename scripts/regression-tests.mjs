@@ -1527,6 +1527,42 @@ function testUnknownTaskIdSuggestions() {
     if (section.includes("ses_c11")) throw new Error("list capped at 10 excludes the oldest")
     if (!section.includes("ses_c00") || section.indexOf("ses_c00") > section.indexOf("ses_c01")) throw new Error("list is newest-first")
   }
+  // Truncation class: bogus is a strict prefix of the real id. Confident
+  // regardless of edit distance within the bound, tailored wording, alias
+  // replaces the parent agent, annotation stripped from the title.
+  {
+    const real = [{ id: "ses_f58bc8e97ffe9LtnJ3JJ6u9Q7J", title: "Embeddings research — seek (@explore-seek variant)", agent: "explore", updated: Date.now() - 3_600_000 }]
+    const message = buildUnknownTaskIdMessage("ses_f58bc8e97ffe9LtnJ3JJ6u9Q", real, { typoDistance: 3, suggestLimit: 10 })
+    if (!message.includes("id looks truncated - full id: ses_f58bc8e97ffe9LtnJ3JJ6u9Q7J")) throw new Error(`2-char truncation gets the truncated-class wording (got ${message})`)
+    if (!message.includes(`"Embeddings research — seek" - explore-seek`)) throw new Error(`alias replaces parent agent, annotation stripped (got ${message})`)
+    if (message.includes("(@explore-se")) throw new Error("no dangling partial annotation survives")
+    if (message.includes("- explore -")) throw new Error("parent agent dropped when alias known")
+  }
+  // 3-char truncation: prefix evidence is confident even beyond the 2-edit
+  // substitution bound (was fuzzy before the prefix tier).
+  {
+    const real = [{ id: "ses_real_child_abcde", title: "T", agent: "explore" }]
+    const message = buildUnknownTaskIdMessage("ses_real_child_ab", real, { typoDistance: 3, suggestLimit: 10 })
+    if (!message.includes("id looks truncated - full id: ses_real_child_abcde")) throw new Error(`3-char truncation is confident (got ${message})`)
+    if (message.includes("Possible match")) throw new Error("3-char truncation must not fall to the fuzzy tier")
+  }
+  // 5-char truncation: beyond the bound entirely - no proposal, list only.
+  {
+    const real = [{ id: "ses_real_child_abcde", title: "T", agent: "explore" }]
+    const message = buildUnknownTaskIdMessage("ses_real_child", real, { typoDistance: 3, suggestLimit: 10 })
+    if (message.includes("truncated") || message.includes("Closest match") || message.includes("Possible match")) throw new Error(`beyond-bound truncation gets no proposal (got ${message})`)
+    if (!message.includes("No close match found")) throw new Error("beyond-bound truncation notes no close match")
+    if (!message.includes("Recent subagent sessions")) throw new Error("list still present for beyond-bound truncation")
+  }
+  // Word-boundary title truncation: no mid-token cuts, no dangling "(@...".
+  {
+    const long = [{ id: "ses_wordy_child", title: "Investigate the routing table regression reported in W10.4 (@explore-light variant)", agent: "explore" }]
+    const message = buildUnknownTaskIdMessage("ses_wordy_childe", long, { typoDistance: 3, suggestLimit: 10 })
+    if (message.includes("(@explore")) throw new Error("annotation must be stripped, never partially shown")
+    if (!message.includes("- explore-light")) throw new Error(`stripped alias replaces the parent agent (got ${message})`)
+    const quoted = message.match(/"([^"]*)…"/)
+    if (quoted && /\S…$/.test(quoted[1])) throw new Error(`ellipsis must cut at a word boundary (got "${quoted[0]}")`)
+  }
   // No candidates at all -> terse fallback shape.
   {
     const message = buildUnknownTaskIdMessage("ses_nope", [], { typoDistance: 3, suggestLimit: 10, variantsHint: true })
