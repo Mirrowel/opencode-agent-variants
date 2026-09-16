@@ -11,7 +11,7 @@ const path = { join, sep }
 import { pathToFileURL } from "node:url"
 import * as serverEntry from "../dist/server.js"
 import * as tuiEntry from "../dist/tui.js"
-import { assembleV2Agents, applyContextOverrides, composeVariantPatch, parentCloneId, resolveExecutionAgent, variantCloneId } from "../dist/v2-server.js"
+import { assembleV2Agents, applyContextOverrides, composeVariantPatch, parentCloneId, resolveExecutionAgent, variantCloneId, v2CounterpartAlias, v2ResumeViolation } from "../dist/v2-server.js"
 
 function assert(condition, message) {
   if (!condition) throw new Error(message)
@@ -1113,7 +1113,7 @@ async function testDisableBase() {
       // Variant child resumed with the disabled base: rejected with the alias hint.
       await expectRejection(
         "base resume of a variant child is rejected with the alias",
-        /Task ses_variant_child belongs to variant "explore-light" - resume it with explore-light/,
+        /Task ses_variant_child belongs to variant "explore-light" - resume it with "explore-light" instead of the disabled base "explore"/,
         [{ tool: "task", sessionID: "ses_parent", callID: "c5" }, { args: { subagent_type: "explore", prompt: "x", task_id: "ses_variant_child" } }],
       )
 
@@ -1165,6 +1165,110 @@ async function testDisableBase() {
       process.env.HOME = realHome
       rmSync(tmpHome, { recursive: true, force: true })
     }
+  }
+
+  // --- v1 before-hook: variant-key resume matching (parent flipping) ---
+  {
+    const tmpHome = mkdtempSync(path.join(tmpdir(), "av-flip-"))
+    mkdirSync(path.join(tmpHome, ".config", "opencode"), { recursive: true })
+    const sidecar = emptyConfig()
+    sidecar.agents = {
+      explore: { parent: {}, variants: { seek: { name: "explore-seek", model: "opencode/muse-spark-1.3-contributor-free" } } },
+      general: {
+        parent: {},
+        variants: {
+          seek: { name: "general-seek", model: "opencode/muse-spark-1.3-contributor-free" },
+          light: { name: "general-light", model: "opencode/muse-spark-1.3-contributor-free" },
+        },
+      },
+    }
+    writeFileSync(path.join(tmpHome, ".config", "opencode", "agent-variants.jsonc"), JSON.stringify(sidecar), "utf8")
+    const realProfile = process.env.USERPROFILE
+    const realHome = process.env.HOME
+    process.env.USERPROFILE = tmpHome
+    process.env.HOME = tmpHome
+    try {
+      const sessions = new Map([
+        ["ses_parent", { id: "ses_parent", model: { providerID: "closedrouter", modelID: "glm-5.3" } }],
+        ["ses_seek_child", { id: "ses_seek_child", parentID: "ses_parent" }],
+        ["ses_metaless_child", { id: "ses_metaless_child", parentID: "ses_parent" }],
+      ])
+      const partsByChild = new Map([
+        ["ses_seek_child", { id: "prt_seek", type: "tool", tool: "task", callID: "call_seek", state: { status: "completed", input: { subagent_type: "explore-seek" }, metadata: { sessionId: "ses_seek_child", agentVariants: { alias: "explore-seek" } } } }],
+        ["ses_metaless_child", { id: "prt_metaless", type: "tool", tool: "task", state: { status: "completed", input: { subagent_type: "explore" }, metadata: { sessionId: "ses_metaless_child" } } }],
+      ])
+      const fakeClient = {
+        tui: { showToast: async () => true },
+        session: {
+          get: async ({ path }) => ({ data: sessions.get(path.id) }),
+          messages: async () => ({ data: [{ parts: [...partsByChild.values()] }] }),
+        },
+      }
+      const hooks = await __testInternals.createHooks({ client: fakeClient, directory: "C:/x" }, sidecar)
+      await hooks.config({ agent: { explore: { hidden: true }, general: { hidden: true } } })
+
+      const expectRejection = async (label, regex, call) => {
+        let rejected
+        try {
+          await hooks["tool.execute.before"](call[0], call[1])
+          rejected = undefined
+        } catch (error) {
+          rejected = error
+        }
+        assert(rejected && regex.test(String(rejected?.message)), `${label} (got ${rejected?.message ?? "no error"})`)
+      }
+      const call = (callID, args) => [{ tool: "task", sessionID: "ses_parent", callID }, { args }]
+
+      // Same-key parent flip: explore-seek child resumed as general-seek - allowed.
+      await hooks["tool.execute.before"](...call("f1", { subagent_type: "general-seek", prompt: "x", task_id: "ses_seek_child" }))
+      // Same alias resume: allowed.
+      await hooks["tool.execute.before"](...call("f2", { subagent_type: "explore-seek", prompt: "x", task_id: "ses_seek_child" }))
+      // Key mismatch: rejected with the counterpart hint.
+      await expectRejection(
+        "cross-key variant resume is rejected",
+        /Task ses_seek_child ran variant "explore-seek" \(variant "seek"\) - resume it with "explore-seek" or its counterpart "general-seek", not "general-light" \(variant "light"\)/,
+        call("f3", { subagent_type: "general-light", prompt: "x", task_id: "ses_seek_child" }),
+      )
+      // Base resume of a variant child: offers the same-key counterpart of the requested parent.
+      await expectRejection(
+        "base resume offers the same-key counterpart",
+        /Task ses_seek_child belongs to variant "explore-seek" - resume it with "explore-seek", or its counterpart "general-seek" \(variant "seek" of "general"\), instead of the disabled base "general"/,
+        call("f4", { subagent_type: "general", prompt: "x", task_id: "ses_seek_child" }),
+      )
+      // Metadata-less children fail open for both variant and base resumes.
+      await hooks["tool.execute.before"](...call("f5", { subagent_type: "general-light", prompt: "x", task_id: "ses_metaless_child" }))
+      await hooks["tool.execute.before"](...call("f6", { subagent_type: "general", prompt: "x", task_id: "ses_metaless_child" }))
+    } finally {
+      process.env.USERPROFILE = realProfile
+      process.env.HOME = realHome
+      rmSync(tmpHome, { recursive: true, force: true })
+    }
+  }
+
+  // --- v2 assembly: variant-key resume matching (parent flipping) ---
+  {
+    const editor = stubV2Editor({
+      explore: { id: "explore", name: "explore", model: { providerID: "zai", id: "glm-5.3" }, request: { settings: {}, headers: {}, body: {} }, mode: "subagent", description: "Explore.", permissions: [] },
+      general: { id: "general", name: "general", model: { providerID: "zai", id: "glm-5.3" }, request: { settings: {}, headers: {}, body: {} }, mode: "subagent", description: "General.", permissions: [] },
+    })
+    const sidecar = emptyConfig()
+    sidecar.agents = {
+      explore: { parent: {}, variants: { seek: { temperature: 0.2 } } },
+      general: { parent: {}, variants: { seek: { temperature: 0.2 }, light: { temperature: 0.3 } } },
+    }
+    const assembly = assembleV2Agents(editor, sidecar)
+    assert(assembly.aliases.has("explore-seek") && assembly.aliases.has("general-seek") && assembly.aliases.has("general-light"), "v2 flip fixture aliases registered")
+    assert(!v2ResumeViolation("t1", "general-seek", "explore-seek", assembly), "v2: same-key parent flip allowed")
+    assert(!v2ResumeViolation("t2", "explore-seek", "explore-seek", assembly), "v2: same-alias resume allowed")
+    const mismatch = v2ResumeViolation("t3", "general-light", "explore-seek", assembly)
+    assert(
+      mismatch && /Task t3 ran variant "explore-seek" \(variant "seek"\) - resume it with "explore-seek" or its counterpart "general-seek", not "general-light" \(variant "light"\)/.test(mismatch),
+      `v2: cross-key resume rejected with counterpart hint (got ${mismatch})`,
+    )
+    assert(!v2ResumeViolation("t4", "general-light", undefined, assembly), "v2: base children fail open")
+    assert(!v2ResumeViolation("t5", "general-light", "historian", assembly), "v2: non-AV agents fail open")
+    assert(v2CounterpartAlias("general", "seek", assembly) === "general-seek", "v2: counterpart alias resolves for base-resume hints")
+    assert(v2CounterpartAlias("general", "seek", assembly) !== "explore-seek", "v2: counterpart stays within the requested parent")
   }
 
   // --- v2 assembly: unification - hidden parent definition base-disables ---
@@ -1246,8 +1350,10 @@ async function testCorrelationV2() {
   const hooks = await createHooks({ client: fakeClient, directory: "C:/x" }, sidecar)
   await hooks.config({ agent: { explore: {} } })
 
-  // 1) Continuation: route pre-registered from call args, applies with ZERO
-  //    parent-history fetches.
+  // 1) Continuation: route pre-registered from call args, applies with no
+  //    correlation fetches. The variant-key resume guard performs exactly
+  //    ONE bounded tail fetch to read the child's recorded variant (this
+  //    fixture's part belongs to another child -> fail open).
   await hooks["tool.execute.before"](
     { tool: "task", sessionID: "ses_parent", callID: "call_cont" },
     { args: { subagent_type: "explore-light", prompt: "x", description: "d", sessionID: "ses_child1" } },
@@ -1255,7 +1361,7 @@ async function testCorrelationV2() {
   const cont = { message: { model: { providerID: "closedrouter", modelID: "glm-5.3" } }, parts: [] }
   await hooks["chat.message"]({ sessionID: "ses_child1", agent: "explore" }, cont)
   assert(cont.message.model.providerID === "opencode", "continuation applies the variant model")
-  assert(messagesCalls.length === 0, `continuation must not fetch parent history (got ${messagesCalls.length})`)
+  assert(messagesCalls.length === 1 && Number.isFinite(messagesCalls[0].query?.limit) && messagesCalls[0].query.limit > 0, `continuation performs only the resume guard's bounded fetch (got ${JSON.stringify(messagesCalls)})`)
 
   // 2) The call completes -> bindings released; a manual/automated message to
   //    the same child afterwards must NOT reapply the stale route.
@@ -1320,8 +1426,9 @@ async function testCorrelationV2() {
   assert(debugLogText.includes("[always] diagnostic queued"), "queued warning diagnostics are captured unconditionally")
 
   // 7) v1 task_id resume: the model resumes a prior round's child via the
-  //    `task_id` arg (v1's actual resume key). Must pre-register (zero parent
-  //    fetches) and must NOT warn.
+  //    `task_id` arg (v1's actual resume key). Must pre-register (no
+  //    correlation fetches) and must NOT warn. The resume guard still makes
+  //    its single bounded validation fetch.
   const fetchesBeforeResume = messagesCalls.length
   await hooks["tool.execute.before"](
     { tool: "task", sessionID: "ses_parent", callID: "call_resume" },
@@ -1330,7 +1437,7 @@ async function testCorrelationV2() {
   const resumeOut = { message: { model: { providerID: "closedrouter", modelID: "glm-5.3" } }, parts: [] }
   await hooks["chat.message"]({ sessionID: "ses_child1", agent: "explore" }, resumeOut)
   assert(resumeOut.message.model.providerID === "opencode", "task_id resume applies the variant model")
-  assert(messagesCalls.length === fetchesBeforeResume, "task_id resume correlates without parent fetches")
+  assert(messagesCalls.length === fetchesBeforeResume + 1, `task_id resume adds only the resume guard's bounded fetch (delta ${messagesCalls.length - fetchesBeforeResume})`)
   await hooks["tool.execute.after"](
     { tool: "task", sessionID: "ses_parent", callID: "call_resume", args: { subagent_type: "explore" } },
     { title: "t", output: "ok", metadata: {} },

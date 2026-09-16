@@ -1400,17 +1400,58 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
         if (info.parentID && info.parentID !== hookInput.sessionID) {
           throw new Error(`Task ${continuation} belongs to a different parent session - start a new task instead.`)
         }
+        // Variant-key resume matching: a continuation may switch the parent
+        // agent (explore -> general) only when the variant KEY matches
+        // (seek <-> seek). The child's recorded variant comes from the
+        // parent task-part metadata (tail-windowed); without reachable
+        // metadata the check fails OPEN - the historical exemption.
+        const resumeGuardApplies = staticRoute !== undefined || hiddenBaseParents.has(args.subagent_type)
+        if (resumeGuardApplies) {
+          const part = await findParentTaskPartForChild(
+            input.client,
+            input.directory,
+            hookInput.sessionID,
+            continuation,
+            CLIENT_CALL_TIMEOUT,
+            PARENT_TAIL_WINDOW_WIDE,
+          )
+          const recordedAlias = metadataAlias(part?.state?.metadata, virtualRoutes)
+          const recordedKey = recordedAlias ? virtualRoutes.get(recordedAlias)?.key : undefined
+          if (recordedAlias && recordedKey !== undefined) {
+            if (staticRoute) {
+              if (staticRoute.key !== recordedKey) {
+                const flips = [...virtualRoutes.values()]
+                  .filter((route) => route.key === recordedKey && route.alias !== recordedAlias)
+                  .map((route) => route.alias)
+                throw new Error(
+                  `Task ${continuation} ran variant "${recordedAlias}" (variant "${recordedKey}") - resume it with "${recordedAlias}"${flips.length > 0 ? ` or its counterpart "${flips.join('", "')}"` : ""}, not "${staticRoute.alias}" (variant "${staticRoute.key}").`,
+                )
+              }
+              // Same variant key under another parent: the flip is allowed -
+              // the child re-routes onto the requested parent's variant.
+            } else {
+              // Base resume of a variant child: offer the same-key variant of
+              // the requested parent as the flip target when it exists (and
+              // is a different alias - not the recorded variant itself).
+              const counterpart = [...virtualRoutes.values()].find(
+                (route) => route.parent === args.subagent_type && route.key === recordedKey && route.alias !== recordedAlias,
+              )
+              throw new Error(
+                counterpart
+                  ? `Task ${continuation} belongs to variant "${recordedAlias}" - resume it with "${recordedAlias}", or its counterpart "${counterpart.alias}" (variant "${recordedKey}" of "${args.subagent_type}"), instead of the disabled base "${args.subagent_type}".`
+                  : `Task ${continuation} belongs to variant "${recordedAlias}" - resume it with "${recordedAlias}" instead of the disabled base "${args.subagent_type}".`,
+              )
+            }
+          }
+        }
       }
       if (!staticRoute) {
         // Base-only disable (sidecar disable_base OR config agent.<parent>.hidden):
         // fresh direct calls to the parent are rejected with the enabled-variant
         // list (v1 runs before-hooks uncaught, so this throw surfaces as the
         // tool's error - same class as OpenCode's own "Unknown agent type"
-        // failures). Continuation calls may only resume tasks that actually
-        // ran the base: v1 variant children carry the AV alias in their task
-        // part metadata (session.agent is always the parent). The lookup is
-        // tail-windowed, so deep/old tasks without reachable metadata fail
-        // OPEN - which is exactly the historical-base-task exemption.
+        // failures). Continuation resumes are matched by variant key in the
+        // continuation block above.
         if (hiddenBaseParents.has(args.subagent_type)) {
           const baseEntry = sidecar.agents[args.subagent_type]
           const variants = Object.entries(baseEntry?.variants ?? {})
@@ -1422,12 +1463,9 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
                 ? `Agent "${args.subagent_type}" is disabled - use one of its variants: ${variants.join(", ")}`
                 : `Agent "${args.subagent_type}" is disabled and has no enabled variants - re-enable it or a variant in agent-variants`,
             )
+          // Fresh direct calls are rejected with the variant list; continuation
+          // resumes are matched by variant key in the continuation block above.
           if (!continuation) throw variantListError()
-          const part = await findParentTaskPartForChild(input.client, input.directory, hookInput.sessionID, continuation)
-          const alias = metadataAlias(part?.state?.metadata, virtualRoutes)
-          if (alias) {
-            throw new Error(`Task ${continuation} belongs to variant "${alias}" - resume it with ${alias} instead of the disabled base "${args.subagent_type}".`)
-          }
         }
         return
       }

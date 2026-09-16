@@ -690,6 +690,34 @@ export function applyContextOverrides(
 // Plugin setup
 // ---------------------------------------------------------------------------
 
+/** The same-key variant of `baseAgent` (the flip target for a base resume),
+ * when that parent has one and it is not the recorded alias itself. */
+export function v2CounterpartAlias(baseAgent: string, variantKey: string, assembly: V2Assembly, excludeAlias?: string): string | undefined {
+  for (const route of assembly.aliases.values()) {
+    if (route.parent === baseAgent && route.key === variantKey && route.alias !== excludeAlias) return route.alias
+  }
+  return undefined
+}
+
+/** Variant-key resume matching (v1 parity): a continuation may switch the
+ * parent agent only when the variant KEY matches (seek <-> seek). Returns
+ * the rejection message on a key mismatch; same-key flips and unknown
+ * agents (base children, non-AV agents) fail open. */
+export function v2ResumeViolation(
+  continuation: string,
+  requestedAgent: string,
+  childAgent: string | undefined,
+  assembly: V2Assembly,
+): string | undefined {
+  const requested = assembly.aliases.get(requestedAgent)
+  const child = assembly.aliases.get(childAgent ?? "")
+  if (!requested || !child || requested.key === child.key) return undefined
+  const flips = [...assembly.aliases.values()]
+    .filter((route) => route.key === child.key && route.alias !== child.alias)
+    .map((route) => route.alias)
+  return `Task ${continuation} ran variant "${child.alias}" (variant "${child.key}") - resume it with "${child.alias}"${flips.length > 0 ? ` or its counterpart "${flips.join('", "')}"` : ""}, not "${requested.alias}" (variant "${requested.key}").`
+}
+
 export function createV2ServerSetup(): V2ServerSetup {
   return async (context: V2PluginContext) => {
     let assembly: V2Assembly = emptyAssembly()
@@ -763,8 +791,18 @@ export function createV2ServerSetup(): V2ServerSetup {
         // child's agent on mismatch - so a base resume of a variant child
         // would convert it. Reject unless the session's agent IS the base.
         if (hiddenBase && directAgent && child.agent !== undefined && child.agent !== directAgent) {
-          throw new Error(`Task ${continuation} belongs to agent "${child.agent}" - resume it with that agent instead of the disabled base "${directAgent}".`)
+          const recorded = assembly.aliases.get(child.agent)
+          const counterpart = recorded ? v2CounterpartAlias(directAgent, recorded.key, assembly, recorded.alias) : undefined
+          throw new Error(
+            counterpart && recorded
+              ? `Task ${continuation} belongs to agent "${child.agent}" - resume it with "${child.agent}", or its counterpart "${counterpart}" (variant "${recorded.key}" of "${directAgent}"), instead of the disabled base "${directAgent}".`
+              : `Task ${continuation} belongs to agent "${child.agent}" - resume it with that agent instead of the disabled base "${directAgent}".`,
+          )
         }
+        // Variant-key resume matching: same-key parent flips allowed,
+        // different-key variant resumes rejected with the counterpart hint.
+        const violation = v2ResumeViolation(continuation, args.agent, child.agent, assembly)
+        if (violation) throw new Error(violation)
       }
       let profile: { name: string } | undefined
       try {
