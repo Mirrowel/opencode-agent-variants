@@ -38,6 +38,8 @@ import {
   isSubagentCapableMode,
   loadBackupJournal,
   loadSidecar,
+  PARENT_MODE_LABELS,
+  parentTuiMode,
   patchHasValue,
   propagationEnabled,
   reconstructPatchBackup,
@@ -51,6 +53,7 @@ import {
   type BackupJournal,
   type ModelShortcut,
   type FullBackupEntry,
+  type ParentTuiMode,
   type SidecarConfig,
   type VariantConfig,
   type ProfilePatch,
@@ -62,6 +65,7 @@ import {
   profileVariantPatch,
   setProfileFieldIn,
 } from "./config.js"
+import { readAgentFlags, writeAgentFlags } from "./configflags.js"
 
 // Types for sidecar entries.
 
@@ -2019,32 +2023,155 @@ async function editVariant(api: TuiPluginApi, config: SidecarConfig, settings: W
   return editVariantFor(api, config, settings, agent, key, lens)
 }
 
+/** The unified "task-list & calling" picker for ONE parent. Five modes over
+ * flags in their native homes: hidden/disable in opencode.json (written via
+ * `writeConfigFlags` - standalone edits the global config directly, the
+ * studio stages through its config queue), disable_base/default_variant in
+ * the sidecar (returned config, caller saves). Shared by the standalone
+ * wizard, the studio's integrated agent detail, and the own-menu layout. */
+export async function parentModePicker(
+  api: TuiPluginApi,
+  config: SidecarConfig,
+  settings: WizardSettings,
+  agent: string,
+  opts?: {
+    currentFlags?: { hidden?: boolean; disable?: boolean }
+    writeConfigFlags?: (agent: string, flags: { hidden?: boolean; disable?: boolean }) => Promise<string | undefined>
+    lens?: string
+  },
+): Promise<SidecarConfig> {
+  const entry = config.agents[agent] as AgentEntry | undefined
+  const flags = opts?.currentFlags ?? readAgentFlags(agent)
+  const current = parentTuiMode({ hidden: flags.hidden, disable: flags.disable, entry })
+  const enabledVariants = Object.entries(entry?.variants ?? {}).filter(([, variant]) => (variant as VariantConfig).disable !== true)
+
+  const modeDescriptions: Record<ParentTuiMode, string> = {
+    normal: "parent visible in the task list, direct calls run the parent agent",
+    "just-hide": "hidden from the task list, but still callable when named directly",
+    "hide-disable": "hidden; fresh direct calls are rejected with the enabled-variant list",
+    "hide-disable-fallback": "hidden; fresh direct calls are rewritten to the default variant",
+    "full-disable": "parent and every variant removed from the task list entirely",
+  }
+  const modes: ParentTuiMode[] = ["normal", "just-hide", "hide-disable", "hide-disable-fallback", "full-disable"]
+  const picked = await showMenu<ParentTuiMode | "__back__">(api, {
+    title: lensTitle(`${agent} - task-list & calling`, opts?.lens),
+    options: [
+      ...modes.map((mode) => ({
+        title: `${PARENT_MODE_LABELS[mode]}${mode === current ? " (current)" : ""}`,
+        value: mode,
+        description: modeDescriptions[mode] ?? "",
+        danger: mode === "full-disable" && current !== "full-disable",
+        help:
+          mode === "just-hide"
+            ? "Just hide: the OpenCode hidden flag alone. The model does not see the parent, but a direct call still works - no rejection, no reroute."
+            : mode === "hide-disable"
+              ? "Hide & disable: hidden flag + disable_base. Fresh direct calls are rejected with the enabled-variant list; variants must be used."
+              : mode === "hide-disable-fallback"
+                ? "Hide & disable + fallback: like hide & disable, but fresh direct calls are REWRITTEN to the default variant as if the model had called it directly (next step picks the variant)."
+                : mode === "full-disable"
+                  ? "Fully disabled: the OpenCode disable flag (agent.<name>.disable) removes the parent and every variant everywhere. Sidecar disable flags are cleared."
+                  : "Normal: the parent stays visible and directly callable; every hide/disable flag is cleared.",
+      })),
+      { title: "< Back", value: "__back__", description: "" },
+    ],
+  })
+  if (!picked || picked === "__back__") return config
+
+  let defaultVariant: string | undefined
+  if (picked === "hide-disable-fallback") {
+    if (enabledVariants.length === 0) {
+      await showAlert(api.ui, { title: "No enabled variants", message: `Add or enable a variant of ${agent} first - the fallback needs a target.` })
+      return config
+    }
+    const variantPick = await showMenu(api, {
+      title: lensTitle(`Reroute direct ${agent} calls to`, opts?.lens),
+      options: [
+        ...enabledVariants.map(([key, variant]) => ({
+          title: `${variantName(agent, key, variant as VariantConfig)}${entry?.default_variant === key ? " (current)" : ""}`,
+          value: key,
+          description: "fresh direct calls are rewritten to this variant",
+        })),
+        { title: "< Back", value: "__back__", description: "" },
+      ],
+    })
+    if (!variantPick || variantPick === "__back__") return config
+    defaultVariant = variantPick
+  }
+
+  // Config flags per mode (undefined = leave unchanged).
+  const configFlags: { hidden?: boolean; disable?: boolean } =
+    picked === "normal"
+      ? { hidden: false, disable: false }
+      : picked === "just-hide"
+        ? { hidden: true, disable: false }
+        : picked === "hide-disable" || picked === "hide-disable-fallback"
+          ? { hidden: true, disable: false }
+          : { hidden: false, disable: true }
+
+  const writeError = opts?.writeConfigFlags
+    ? await opts.writeConfigFlags(agent, configFlags)
+    : writeAgentFlags(agent, configFlags)
+  if (writeError) {
+    await showAlert(api.ui, { title: "Config write failed", message: `Could not write the ${agent} flags to the global config: ${writeError}. The sidecar part was not changed.` })
+    return config
+  }
+
+  const next = structuredClone(config)
+  const nextEntry = ((next.agents[agent] ??= { parent: {}, variants: {} }) as AgentEntry)
+  if (picked === "normal") {
+    delete nextEntry.disable
+    delete nextEntry.disable_base
+    delete nextEntry.default_variant
+  } else if (picked === "just-hide") {
+    delete nextEntry.disable
+    nextEntry.disable_base = false
+    delete nextEntry.default_variant
+  } else if (picked === "hide-disable") {
+    delete nextEntry.disable
+    nextEntry.disable_base = true
+    delete nextEntry.default_variant
+  } else if (picked === "hide-disable-fallback") {
+    delete nextEntry.disable
+    nextEntry.disable_base = true
+    nextEntry.default_variant = defaultVariant
+  } else {
+    delete nextEntry.disable
+    delete nextEntry.disable_base
+    delete nextEntry.default_variant
+  }
+  const label = PARENT_MODE_LABELS[picked].split(" - ")[0] ?? picked
+  markRestart(settings, `${agent}: ${label} requires restart.`)
+  await warnRestartField(api, "Task-list & calling", `${agent}: ${PARENT_MODE_LABELS[picked]}; restart OpenCode to apply.`)
+  return next
+}
+
 async function toggleDisable(api: TuiPluginApi, config: SidecarConfig, settings: WizardSettings): Promise<SidecarConfig> {
   const items: WizardSelectOption<{ agent: string; variant?: string }>[] = []
 
   for (const [agent, raw] of agentEntries(config)) {
     const entry = raw as AgentEntry
-    const parentDisabled = entry.disable === true
-    const baseDisabled = !parentDisabled && entry.disable_base === true
+    const flags = readAgentFlags(agent)
+    const mode = parentTuiMode({ hidden: flags.hidden, disable: flags.disable, entry })
     const enabledVariantCount = Object.values(entry.variants).filter((variant) => (variant as VariantConfig).disable !== true).length
     items.push({
-      title: `${parentDisabled ? "x" : baseDisabled ? "base-off" : "ok"} ${agent} (parent)`,
+      title: `${mode === "full-disable" ? "x" : mode === "normal" ? "ok" : "base-off"} ${agent} (parent)`,
       value: { agent },
-      description: parentDisabled
-        ? "Disabled - no variants active"
-        : baseDisabled
-          ? enabledVariantCount > 0
-            ? `Base disabled - variants only (${enabledVariantCount})${entry.default_variant !== undefined ? ` - reroutes to ${entry.default_variant}` : ""}`
-            : "Base disabled - UNREACHABLE (no enabled variants)"
-          : "Enabled",
+      description:
+        mode === "full-disable"
+          ? "Fully disabled - no variants active"
+          : mode === "hide-disable-fallback"
+            ? `Hidden & disabled - reroutes to ${entry.default_variant}${enabledVariantCount > 0 ? ` (${enabledVariantCount} variant(s))` : ""}`
+            : mode === "hide-disable"
+              ? enabledVariantCount > 0
+                ? `Hidden & disabled - variants only (${enabledVariantCount})`
+                : "Hidden & disabled - UNREACHABLE (no enabled variants)"
+              : mode === "just-hide"
+                ? "Just hidden - still callable when named"
+                : "Normal - visible & callable",
       category: "Parents",
       color: parentColor(api, config, agent),
-      danger: parentDisabled || (baseDisabled && enabledVariantCount === 0),
-      help: parentDisabled
-        ? "Fully disabled: the parent and every variant are removed from the task list. Pick to re-enable or switch to base-only disable."
-        : baseDisabled
-          ? `Base-only disable: the parent is hidden from the task list; fresh direct calls are ${entry.default_variant !== undefined ? `rewritten to the default variant (${entry.default_variant})` : "rejected with the variant list"}. Pick to change the behavior or fallback.`
-          : "Enabled. Pick for disable options: full (parent + variants), or base-only with an optional reroute fallback.",
+      danger: mode === "full-disable" || (mode === "hide-disable" && enabledVariantCount === 0),
+      help: `Unified task-list & calling mode (currently: ${PARENT_MODE_LABELS[mode]}). Pick to change - one picker edits the OpenCode hidden/disable flags and the sidecar base-disable/fallback together.`,
     })
     for (const [key, rawVar] of variantEntries(entry)) {
       const variant = rawVar as VariantConfig
@@ -2071,128 +2198,22 @@ async function toggleDisable(api: TuiPluginApi, config: SidecarConfig, settings:
     description: "Return to main menu",
   })
 
-  const picked = await showMenu(api, { title: "Toggle disable", options: items })
+  const picked = await showMenu(api, { title: "Task-list & calling", options: items })
   if (!picked || picked.agent === "__back__") return config
 
-  const next = structuredClone(config)
-
   if (!picked.variant) {
-    if (!next.agents[picked.agent]) {
-      next.agents[picked.agent] = { parent: {}, variants: {} }
-    }
-    const entry = next.agents[picked.agent] as AgentEntry
-    const enabledVariants = Object.entries(entry.variants).filter(([, variant]) => (variant as VariantConfig).disable !== true)
-    const baseDisabled = entry.disable_base === true && entry.disable !== true
-    // Step 1: base behavior - Normal / Full disable / Base disabled (then
-    // the fallback choice). Direct calls to a base-disabled parent either
-    // get rejected with the variant list or are REWRITTEN to the default
-    // variant, as if the model had called it directly.
-    const behavior = await showMenu(api, {
-      title: `${picked.agent} base behavior`,
-      options: [
-        {
-          title: !entry.disable && !entry.disable_base ? "Normal - parent callable (current)" : "Normal - parent callable",
-          value: "normal",
-          description: entry.disable || entry.disable_base ? "re-enables the base; direct calls run the parent agent" : "the parent stays in the task list",
-          help: "Normal: the base parent stays visible and directly callable (clears full disable, base disable, and the fallback).",
-        },
-        {
-          title: `${entry.disable ? "Full disable - parent + variants (current)" : "Full disable - parent + variants"}`,
-          value: "full",
-          description: entry.disable ? "currently: fully disabled - pick Normal to re-enable" : "removes the parent and all variants from the task list",
-          danger: !entry.disable,
-          help: "Full disable: the parent and every variant disappear from the task list entirely (existing sidecar entry.disable).",
-        },
-        {
-          title: `${baseDisabled ? "Base disabled - variants must be used (current)" : "Base disabled - variants must be used"}`,
-          value: "base",
-          description: baseDisabled
-            ? enabledVariants.length > 0
-              ? `currently: base disabled, ${enabledVariants.length} variant(s) active - pick to change the fallback`
-              : "currently: base disabled with NO enabled variants - agent unreachable"
-            : "hides the parent; variants stay callable",
-          danger: !entry.disable && !entry.disable_base && enabledVariants.length === 0,
-          help:
-            "Base-only disable: the parent is hidden from the task list; fresh direct calls either get rejected with the variant list or are rewritten to a default variant (next step). Requires restart to apply.",
-        },
-        { title: "< Back", value: "__back__", description: "" },
-      ],
-    })
-    if (!behavior || behavior === "__back__") return config
-    if (behavior === "normal") {
-      entry.disable = false
-      entry.disable_base = false
-      entry.default_variant = undefined
-      markRestart(settings, `${picked.agent}: parent enabled requires restart.`)
-      await warnRestartField(api, "Parent enable", `Parent enabled; restart OpenCode to update task-list visibility.`)
-    } else if (behavior === "full") {
-      entry.disable = true
-      entry.disable_base = false
-      entry.default_variant = undefined
-      markRestart(settings, `${picked.agent}: parent disabled requires restart.`)
-      await warnRestartField(api, "Parent disable", `Parent disabled; restart OpenCode to update task-list visibility.`)
-    } else {
-      // Step 2: the fallback choice for direct calls to the hidden base.
-      const currentFallback = baseDisabled && entry.default_variant !== undefined ? entry.default_variant : undefined
-      const fallbackChoice = await showMenu(api, {
-        title: `Direct calls to ${picked.agent} (base disabled)`,
-        options: [
-          {
-            title: `${baseDisabled && currentFallback === undefined ? "No fallback - reject with the variant list (current)" : "No fallback - reject with the variant list"}`,
-            value: "reject",
-            description: "fresh direct calls fail with the enabled-variant list; the model has to pick a variant",
-            help: "The default behavior of base-disable: direct calls are rejected with an error listing the enabled variants.",
-          },
-          {
-            title: "Fallback - reroute to a variant",
-            value: "fallback",
-            description: currentFallback !== undefined ? `currently: rerouted to "${currentFallback}"` : "direct calls are rewritten to a default variant, as if it was called directly",
-            help: "Bugfix fallback: when the model calls the hidden base anyway (from memory), the call is rewritten to the default variant - persisted input, replay, routing, and annotation all read as the variant call.",
-          },
-          { title: "< Back", value: "__back__", description: "" },
-        ],
-      })
-      if (!fallbackChoice || fallbackChoice === "__back__") return config
-      entry.disable = false
-      entry.disable_base = true
-      if (fallbackChoice === "reject") {
-        entry.default_variant = undefined
-        markRestart(settings, `${picked.agent}: base disabled (reject) requires restart.`)
-        await warnRestartField(api, "Base disable", `Base disabled - direct calls are rejected with the variant list; restart OpenCode to apply.`)
-      } else {
-        if (enabledVariants.length === 0) {
-          await showAlert(api.ui, { title: "No enabled variants", message: `Add or enable a variant of ${picked.agent} first - the fallback needs a target.` })
-          return config
-        }
-        // Step 3: which variant becomes the default.
-        const variantPick = await showMenu(api, {
-          title: `Reroute direct ${picked.agent} calls to`,
-          options: [
-            ...enabledVariants.map(([key, variant]) => ({
-              title: `${variantName(picked.agent, key, variant as VariantConfig)}${currentFallback === key ? " (current)" : ""}`,
-              value: key,
-              description: "fresh direct calls are rewritten to this variant",
-            })),
-            { title: "< Back", value: "__back__", description: "" },
-          ],
-        })
-        if (!variantPick || variantPick === "__back__") return config
-        entry.default_variant = variantPick
-        markRestart(settings, `${picked.agent}: base disabled (fallback -> ${variantPick}) requires restart.`)
-        await warnRestartField(api, "Base disable", `Base disabled - direct calls reroute to "${variantPick}"; restart OpenCode to apply.`)
-      }
-    }
-  } else {
-    const entry = next.agents[picked.agent] as AgentEntry | undefined
-    const variant = entry?.variants[picked.variant] as VariantConfig | undefined
-    if (variant) {
-      variant.disable = !variant.disable
-      const state = variant.disable ? "disabled" : "enabled"
-      markRestart(settings, `${variantName(picked.agent, picked.variant, variant)}: variant ${state} requires restart.`)
-      await warnRestartField(api, "Variant disable", `Variant ${state}; restart OpenCode to update task-list visibility.`)
-    }
+    return parentModePicker(api, config, settings, picked.agent)
   }
 
+  const next = structuredClone(config)
+  const entry = next.agents[picked.agent] as AgentEntry | undefined
+  const variant = entry?.variants[picked.variant] as VariantConfig | undefined
+  if (variant) {
+    variant.disable = !variant.disable
+    const state = variant.disable ? "disabled" : "enabled"
+    markRestart(settings, `${variantName(picked.agent, picked.variant, variant)}: variant ${state} requires restart.`)
+    await warnRestartField(api, "Variant disable", `Variant ${state}; restart OpenCode to update task-list visibility.`)
+  }
   return next
 }
 

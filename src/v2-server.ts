@@ -37,6 +37,7 @@ import {
   applyModelPresetPatch,
   applyPromptPatch,
   applyTextPatch,
+  baseDisabledUnderDrift,
   buildUnknownTaskIdMessage,
   defaultConfigDir,
   defaultSidecarPath,
@@ -46,12 +47,14 @@ import {
   generatedParentDescription,
   generatedVariantDescription,
   hasPromptPatch,
+  healSidecarBaseFlags,
   loadSidecar,
   overlayProfilePatch,
   profileParentPatch,
   profileVariantPatch,
   resolveActiveProfile,
   resolveModel,
+  saveSidecar as saveSidecarConfig,
   splitModelRef,
   templateContext,
   validateModelShape,
@@ -318,7 +321,7 @@ export function assembleV2Agents(editor: V2AgentEditor, sidecar: SidecarConfig):
   for (const parent of parentKeys) {
     const entry = sidecar.agents[parent]
     if (entry?.disable) {
-      assembly.diagnostics.push({ level: "info", agent: parent, message: `Parent "${parent}" is disabled in sidecar config.` })
+      assembly.diagnostics.push({ level: "warning", agent: parent, message: `Parent "${parent}" is disabled via the sidecar flag - deprecated. Use the OpenCode config flag (agent.${parent}.disable, "Fully disabled" in the picker) instead; the sidecar flag keeps working.` })
       continue
     }
     const parentInfo = editor.get(parent)
@@ -347,15 +350,24 @@ export function assembleV2Agents(editor: V2AgentEditor, sidecar: SidecarConfig):
     }
 
     const parentPromptRuntime = parentInfo.system === undefined && hasPromptPatch(parentPatch)
-    // Base-only disable: hide the parent from the subagent list (v2 filters
-    // hidden agents) while keeping it registered; the before-hook rejects
-    // fresh direct calls with the enabled-variant list. A config-hidden
-    // parent definition behaves the same automatically - gated on at least
-    // one enabled variant so the agent stays reachable and unrelated hidden
+    // Base-disable drift rules (v1 parity): explicit disable_base, or hidden
+    // with disable_base ABSENT (legacy state, treated as hide-&disable until
+    // the sidecar self-heals); disable_base EXPLICITLY false = deliberate
+    // just-hide - hidden but callable, never rejected. Gated on at least one
+    // enabled variant so the agent stays reachable and unrelated hidden
     // agents are never touched.
-    const disableBase = entry?.disable_base === true && entry?.disable !== true
-    const configHiddenBase = !disableBase && entry && entry.disable !== true && parentInfo.hidden === true && enabledVariants.length > 0
-    if (disableBase || configHiddenBase) assembly.hiddenBaseParents.add(parent)
+    const disableBase =
+      entry?.disable !== true &&
+      enabledVariants.length > 0 &&
+      baseDisabledUnderDrift({ hidden: parentInfo.hidden, disable_base: entry?.disable_base })
+    if (disableBase) {
+      assembly.hiddenBaseParents.add(parent)
+      if (entry?.disable_base === undefined) {
+        assembly.diagnostics.push({ level: "info", agent: parent, message: `Parent "${parent}" is hidden with no disable_base key (legacy state) - treated as base-only disable; the sidecar self-heals disable_base=true.` })
+      } else if (parentInfo.hidden !== true) {
+        assembly.diagnostics.push({ level: "info", agent: parent, message: `Parent "${parent}" base-disable is missing the config hidden flag - hidden forced in-memory; pick "Hide & disable" in the picker to persist both flags.` })
+      }
+    }
     if (Object.keys(parentPatch).length > 0 || disableBase) {
       const tctx = templateContext(parent, undefined, {}, sidecar)
       editor.update(parent, (agent) => {
@@ -738,8 +750,34 @@ export function createV2ServerSetup(): V2ServerSetup {
     }
 
     const agentRegistration = await context.agent.transform((editor) => {
-      assembly = assembleV2Agents(editor, safeSidecar())
+      const sidecar = safeSidecar()
+      assembly = assembleV2Agents(editor, sidecar)
       logDiagnostics(assembly.diagnostics)
+      // Legacy drift self-heal (v1 parity): parents hidden in their agent
+      // definitions without a disable_base key get the sidecar flag pinned.
+      const healed = healSidecarBaseFlags(
+        sidecar,
+        Object.entries(sidecar.agents).map(([name, entry]) => ({
+          name,
+          hidden: editor.get(name)?.hidden === true,
+          hasEnabledVariant: Object.values(entry.variants).some((variant) => variant.disable !== true),
+        })),
+      )
+      if (healed.length > 0) {
+        let healError: string | undefined
+        try {
+          saveSidecarConfig(sidecar, defaultSidecarPath(), { backup: true })
+        } catch (error) {
+          healError = error instanceof Error ? error.message : String(error)
+        }
+        for (const item of healed) {
+          debugLog(
+            healError
+              ? `[heal] disable_base self-heal could not be persisted for ${item.agent}: ${healError} (treated as base-disable in-memory)`
+              : `[heal] hidden without a disable_base key (legacy state) - disable_base=true pinned for ${item.agent}`,
+          )
+        }
+      }
     })
 
     const beforeRegistration = await context.tool.hook("execute.before", async (event: V2ExecuteBeforeEvent) => {

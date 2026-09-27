@@ -6,6 +6,7 @@ import {
   applyPromptPatch,
   applyModelPresetPatch,
   applyTextPatch,
+  baseDisabledUnderDrift,
   buildUnknownTaskIdMessage,
   BUILTIN_AGENT_MODES,
   BUILTIN_AGENT_DESCRIPTIONS,
@@ -17,11 +18,13 @@ import {
   generatedParentDescription,
   hasPromptPatch,
   hasRequestPatch,
+  healSidecarBaseFlags,
   loadSidecar,
   modelCatalogFromProviders,
   overlayProfilePatch,
   resolveActiveProfile,
   resolveModel,
+  saveSidecar,
   splitModelRef,
   templateContext,
   validateModel,
@@ -392,23 +395,34 @@ export function __testAssembleAgents(cfg: Record<string, any>, sidecar: SidecarC
   for (const [parent, entry] of Object.entries(sidecar.agents)) {
     const parentConfig = cfg.agent[parent] as AgentConfig | undefined
     if (entry.disable) {
-      diagnostics.push({ level: "info", agent: parent, message: `Parent "${parent}" is disabled in sidecar config.` })
+      diagnostics.push({ level: "warning", agent: parent, message: `Parent "${parent}" is disabled via the sidecar flag - deprecated. Use the OpenCode config flag (agent.${parent}.disable, "Fully disabled" in the picker) instead; the sidecar flag keeps working.` })
       continue
-    }
-    if (!entry.disable_base && parentConfig?.hidden === true) {
-      // Config-hidden AV parents behave as base-only disable automatically -
-      // but ONLY when the parent actually has an enabled variant to fall
-      // back on, so the agent can never become unreachable and unrelated
-      // hidden agents (plugin agents like historians) are never touched.
-      const hasEnabledVariant = Object.values(entry.variants).some((variant) => variant.disable !== true)
-      if (hasEnabledVariant) {
-        hiddenBaseParents.add(parent)
-        diagnostics.push({ level: "info", agent: parent, message: `Parent "${parent}" is hidden via OpenCode config - treated as base-only disable (variants only); fresh direct calls are rejected.` })
-      }
     }
     if (parentConfig?.disable === true) {
       diagnostics.push({ level: "info", agent: parent, message: `Parent "${parent}" is disabled in OpenCode config; variants skipped.` })
       continue
+    }
+    // Unified hide/base-disable drift rules (one "task-list & calling" mode
+    // behind two flags in their native homes):
+    // - disable_base === true -> hide & disable (hidden forced in-memory when
+    //   the config lacks it).
+    // - hidden === true + disable_base ABSENT (legacy unified hiding) ->
+    //   treated as hide & disable; the startup self-heal pins
+    //   disable_base=true on disk so the state converges.
+    // - hidden === true + disable_base EXPLICITLY false -> deliberate
+    //   just-hide: hidden but callable, NEVER rejected.
+    // Gated on >=1 enabled variant so an agent can never become silently
+    // unreachable, and hidden agents without sidecar entries (plugin
+    // background agents) are never touched.
+    const hasEnabledVariant = Object.values(entry.variants).some((variant) => variant.disable !== true)
+    const baseDisabled = hasEnabledVariant && baseDisabledUnderDrift({ hidden: parentConfig?.hidden, disable_base: entry.disable_base })
+    if (baseDisabled) {
+      hiddenBaseParents.add(parent)
+      if (entry.disable_base === undefined) {
+        diagnostics.push({ level: "info", agent: parent, message: `Parent "${parent}" is hidden via OpenCode config with no disable_base key (legacy state) - treated as base-only disable; the sidecar self-heals disable_base=true.` })
+      } else if (parentConfig?.hidden !== true) {
+        diagnostics.push({ level: "info", agent: parent, message: `Parent "${parent}" base-disable is missing the config hidden flag - hidden forced in-memory; pick "Hide & disable" in the picker to persist both flags.` })
+      }
     }
 
     const enabledVariants = Object.entries(entry.variants).filter(([, variant]) => variant.disable !== true)
@@ -429,13 +443,14 @@ export function __testAssembleAgents(cfg: Record<string, any>, sidecar: SidecarC
       diagnostics.push({ level: "warning", agent: parent, message: `${issue}; model fields skipped for parent override.` })
     }
     cfg.agent[parent] = applyConfigPatch({ ...(parentConfig ?? {}) }, parentPatch, sidecar, base, isBuiltin, templateContext(parent, undefined, {}, sidecar))
-    // Base-only disable: hide the parent from the model's task list while
-    // keeping it registered (AV's variant routing executes it internally).
-    // The before-hook additionally rejects fresh direct calls with the
-    // enabled-variant list; resumes (task_id) stay allowed.
-    if (entry.disable_base === true) {
+    // Base-disable (any variant): hide the parent from the model's task list
+    // while keeping it registered (AV's variant routing executes it
+    // internally). Idempotent for parents already hidden in config; this is
+    // also the in-memory correction when disable_base is set without hidden.
+    // The before-hook rejects (or reroutes, with a default_variant) fresh
+    // direct calls; resumes (task_id) stay allowed.
+    if (baseDisabled) {
       ;(cfg.agent[parent] as AgentConfig).hidden = true
-      hiddenBaseParents.add(parent)
     }
     if (isBuiltin && hasPromptPatch(parentPatch)) parentPromptPatches.set(parent, parentPatch)
     if (isBuiltin && hasRequestPatch(parentPatch)) parentRequestPatches.set(parent, parentPatch)
@@ -1366,6 +1381,37 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
       parentPromptPatches = assembled.parentPromptPatches
       parentRequestPatches = assembled.parentRequestPatches
       queueDiagnostics(assembled.diagnostics)
+      // Legacy drift self-heal: parents hidden in the config without a
+      // disable_base key (the pre-unification state) get the sidecar flag
+      // pinned so the two-flag state converges on disk. In-memory behavior
+      // is identical before and after; this only persists it.
+      const healed = healSidecarBaseFlags(
+        sidecar,
+        Object.entries(sidecar.agents).map(([name, entry]) => ({
+          name,
+          hidden: (cfg.agent?.[name] as AgentConfig | undefined)?.hidden === true,
+          hasEnabledVariant: Object.values(entry.variants).some((variant) => variant.disable !== true),
+        })),
+      )
+      if (healed.length > 0) {
+        let healError: string | undefined
+        try {
+          saveSidecar(sidecar, defaultSidecarPath(), { backup: true })
+        } catch (error) {
+          healError = error instanceof Error ? error.message : String(error)
+        }
+        for (const item of healed) {
+          queueDiagnostics([
+            {
+              level: healError ? "warning" : "info",
+              agent: item.agent,
+              message: healError
+                ? `Parent "${item.agent}": disable_base self-heal could not be persisted (${healError}) - treated as base-disable in-memory.`
+                : `Parent "${item.agent}": hidden without a disable_base key (legacy state) - disable_base=true pinned to the sidecar.`,
+            },
+          ])
+        }
+      }
       void refreshMergedCatalog().catch((error) => {
         debugLog(debugEnabled(), "Agent variant provider catalog error", error instanceof Error ? error.message : String(error))
       })

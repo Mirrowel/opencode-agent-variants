@@ -469,6 +469,67 @@ export function defaultConfigDir() {
   return join(homedir(), ".config", "opencode")
 }
 
+/** The unified "task-list & calling" modes for an AV parent. One picker in
+ * every TUI (AV standalone, CS integrated, CS own-menu via AV's native TUI)
+ * edits this mode; the underlying flags split across their native homes:
+ * hidden/disable in opencode.json, disable_base/default_variant sidecar. */
+export type ParentTuiMode = "normal" | "just-hide" | "hide-disable" | "hide-disable-fallback" | "full-disable"
+
+/** Resolves whether a parent's base is disabled under the drift rules:
+ * explicit disable_base, or hidden with disable_base ABSENT (the legacy
+ * unified-hiding state, treated as hide-&disable until the startup self-heal
+ * pins it). Explicit `disable_base: false` = deliberate just-hide. */
+export function baseDisabledUnderDrift(input: { hidden?: unknown; disable_base?: unknown }): boolean {
+  return input.disable_base === true || (input.disable_base === undefined && input.hidden === true)
+}
+
+/** Computes the unified mode from the effective flag state. */
+export function parentTuiMode(input: {
+  hidden?: unknown
+  disable?: unknown
+  entry?: { disable?: unknown; disable_base?: unknown; default_variant?: unknown } | null
+}): ParentTuiMode {
+  if (input.disable === true || input.entry?.disable === true) return "full-disable"
+  const baseDisabled = baseDisabledUnderDrift({ hidden: input.hidden, disable_base: input.entry?.disable_base })
+  if (baseDisabled) return input.entry?.default_variant !== undefined ? "hide-disable-fallback" : "hide-disable"
+  if (input.hidden === true) return "just-hide"
+  return "normal"
+}
+
+export const PARENT_MODE_LABELS: Record<ParentTuiMode, string> = {
+  normal: "Normal - visible & callable",
+  "just-hide": "Just hidden - hidden but callable when named",
+  "hide-disable": "Hidden & disabled - variants must be used",
+  "hide-disable-fallback": "Hidden & disabled + fallback - direct calls reroute",
+  "full-disable": "Fully disabled - agent & variants removed",
+}
+
+/** One drift correction applied at startup: legacy hidden-without-disable_base
+ * entries get disable_base pinned to true (journaled sidecar self-heal) so
+ * the two-flag state converges on disk. */
+export type ParentFlagHeal = { agent: string }
+
+/** Self-heals legacy drift in a loaded sidecar: for every parent hidden in
+ * the config with enabled variants but NO disable_base key, pin
+ * disable_base=true. Mutates the sidecar in place and returns the healed
+ * agents (caller persists + diagnoses). */
+export function healSidecarBaseFlags(
+  sidecar: SidecarConfig,
+  parents: Array<{ name: string; hidden: boolean; hasEnabledVariant: boolean }>,
+): ParentFlagHeal[] {
+  const healed: ParentFlagHeal[] = []
+  for (const parent of parents) {
+    const entry = sidecar.agents[parent.name] as { disable?: unknown; disable_base?: unknown; variants?: Record<string, unknown> } | undefined
+    if (!entry || entry.disable === true) continue
+    if (!parent.hidden || !parent.hasEnabledVariant) continue
+    if (entry.disable_base !== undefined) continue
+    entry.disable_base = true
+    healed.push({ agent: parent.name })
+  }
+  return healed
+}
+
+
 export function defaultSidecarPath(configDir = defaultConfigDir()) {
   return join(configDir, "agent-variants.jsonc")
 }

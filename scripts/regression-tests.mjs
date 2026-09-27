@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs"
 import { __testAssembleAgents, __testInternals } from "../dist/index.js"
-import { emptyConfig, inferredSelectionPreset, SELECTION_PRESETS, SidecarConfig, profileMatchesModel, resolveActiveProfile, overlayProfilePatch, profileVariantPatch, profileParentPatch, profileFieldSource, setProfileFieldIn, buildUnknownTaskIdMessage, levenshteinWithin } from "../dist/config.js"
+import { emptyConfig, inferredSelectionPreset, SELECTION_PRESETS, SidecarConfig, profileMatchesModel, resolveActiveProfile, overlayProfilePatch, profileVariantPatch, profileParentPatch, profileFieldSource, setProfileFieldIn, buildUnknownTaskIdMessage, levenshteinWithin, parentTuiMode, healSidecarBaseFlags, baseDisabledUnderDrift } from "../dist/config.js"
 import { currentPaletteCategory, declarePaletteCategory, reconcilePaletteCategories, __resetPaletteRegistry } from "../dist/palette-category.js"
 import { applyWizardUiSettings } from "../dist/wizard.js"
 import { isAgentVariantsSpec, isConfigStudioSpec, ensureTuiRegistration } from "../dist/selfwire.js"
@@ -1238,6 +1238,106 @@ async function testDisableBase() {
       // Metadata-less children fail open for both variant and base resumes.
       await hooks["tool.execute.before"](...call("f5", { subagent_type: "general-light", prompt: "x", task_id: "ses_metaless_child" }))
       await hooks["tool.execute.before"](...call("f6", { subagent_type: "general", prompt: "x", task_id: "ses_metaless_child" }))
+    } finally {
+      process.env.USERPROFILE = realProfile
+      process.env.HOME = realHome
+      rmSync(tmpHome, { recursive: true, force: true })
+    }
+  }
+
+  // --- unified task-list & calling modes: pure rules ---
+  {
+    assert(parentTuiMode({}) === "normal", "mode: no flags = normal")
+    assert(parentTuiMode({ hidden: true }) === "hide-disable", "mode: hidden alone (legacy drift) = hide & disable")
+    assert(parentTuiMode({ hidden: true, entry: { disable_base: undefined } }) === "hide-disable", "mode: hidden + absent disable_base = hide & disable")
+    assert(parentTuiMode({ hidden: true, entry: { disable_base: false } }) === "just-hide", "mode: hidden + explicit false = just hide")
+    assert(parentTuiMode({ entry: { disable_base: true } }) === "hide-disable", "mode: explicit disable_base = hide & disable")
+    assert(parentTuiMode({ hidden: true, entry: { disable_base: true, default_variant: "seek" } }) === "hide-disable-fallback", "mode: + default_variant = fallback")
+    assert(parentTuiMode({ entry: { disable_base: false, default_variant: "seek" } }) === "normal", "mode: fallback key without base-disable is inert")
+    assert(parentTuiMode({ disable: true }) === "full-disable", "mode: config disable wins")
+    assert(parentTuiMode({ entry: { disable: true, disable_base: true } }) === "full-disable", "mode: sidecar disable wins over base flags")
+    assert(baseDisabledUnderDrift({ hidden: true }) === true, "drift: hidden + absent = base disabled")
+    assert(baseDisabledUnderDrift({ hidden: true, disable_base: false }) === false, "drift: explicit false = not base disabled")
+    assert(baseDisabledUnderDrift({ disable_base: true }) === true, "drift: explicit true = base disabled")
+    assert(baseDisabledUnderDrift({}) === false, "drift: nothing set = not base disabled")
+  }
+
+  // --- unified modes: sidecar drift self-heal ---
+  {
+    const sidecar = emptyConfig()
+    sidecar.agents = {
+      explore: { parent: {}, variants: { seek: { model: "opencode/muse-spark-1.3-contributor-free" } } },
+      general: { parent: {}, disable_base: false, variants: { light: {} } },
+      plan: { parent: {}, disable: true, variants: {} },
+      build: { parent: {}, variants: {} },
+    }
+    const healed = healSidecarBaseFlags(sidecar, [
+      { name: "explore", hidden: true, hasEnabledVariant: true },
+      { name: "general", hidden: true, hasEnabledVariant: true },
+      { name: "plan", hidden: true, hasEnabledVariant: false },
+      { name: "build", hidden: true, hasEnabledVariant: false },
+    ])
+    assert(healed.length === 1 && healed[0].agent === "explore", `heal: only legacy hidden-with-variants parents heal (got ${JSON.stringify(healed)})`)
+    assert(sidecar.agents.explore.disable_base === true, "heal: disable_base pinned true")
+    assert(sidecar.agents.general.disable_base === false, "heal: explicit just-hide untouched")
+    assert(sidecar.agents.plan.disable_base === undefined, "heal: full-disabled parents untouched")
+  }
+
+  // --- v1 assembly: just-hide (explicit disable_base=false) is never base-disabled ---
+  {
+    const cfg = { agent: { explore: { hidden: true }, historian: { hidden: true } } }
+    const sidecar = emptyConfig()
+    sidecar.agents = {
+      explore: { parent: {}, disable_base: false, variants: { light: { name: "explore-light", model: "opencode/muse-spark-1.3-contributor-free" } } },
+      general: { parent: {}, variants: { light: { name: "general-light", model: "opencode/muse-spark-1.3-contributor-free" } } },
+    }
+    const assembled = __testAssembleAgents(cfg, sidecar)
+    assert(!assembled.hiddenBaseParents.has("explore"), "just-hide: explicit disable_base=false never rejects")
+    assert(!assembled.hiddenBaseParents.has("general") && !assembled.hiddenBaseParents.has("historian"), "unrelated parents untouched")
+  }
+
+  // --- v1 hook: just-hide stays callable; legacy hidden still rejects AND self-heals on disk ---
+  {
+    const tmpHome = mkdtempSync(path.join(tmpdir(), "av-mode-"))
+    mkdirSync(path.join(tmpHome, ".config", "opencode"), { recursive: true })
+    const sidecar = emptyConfig()
+    sidecar.agents = {
+      explore: { parent: {}, disable_base: false, variants: { light: { name: "explore-light", model: "opencode/muse-spark-1.3-contributor-free" } } },
+      general: { parent: {}, variants: { light: { name: "general-light", model: "opencode/muse-spark-1.3-contributor-free" } } },
+    }
+    writeFileSync(path.join(tmpHome, ".config", "opencode", "agent-variants.jsonc"), JSON.stringify(sidecar), "utf8")
+    const realProfile = process.env.USERPROFILE
+    const realHome = process.env.HOME
+    process.env.USERPROFILE = tmpHome
+    process.env.HOME = tmpHome
+    try {
+      const sessions = new Map([["ses_parent", { id: "ses_parent", model: { providerID: "closedrouter", modelID: "glm-5.3" } }]])
+      const fakeClient = {
+        tui: { showToast: async () => true },
+        session: {
+          get: async ({ path }) => ({ data: sessions.get(path.id) }),
+          messages: async () => ({ data: [{ parts: [] }] }),
+        },
+      }
+      const hooks = await __testInternals.createHooks({ client: fakeClient, directory: "C:/x" }, sidecar)
+      await hooks.config({ agent: { explore: { hidden: true }, general: { hidden: true } } })
+
+      // Just-hide: the hidden parent stays callable - no rejection, no rewrite.
+      const justHideArgs = { subagent_type: "explore", prompt: "x" }
+      await hooks["tool.execute.before"]({ tool: "task", sessionID: "ses_parent", callID: "m1" }, { args: justHideArgs })
+      assert(justHideArgs.subagent_type === "explore", `just-hide parent stays callable (got ${justHideArgs.subagent_type})`)
+
+      // Legacy hidden (absent disable_base): rejects AND the sidecar self-heals disable_base=true on disk.
+      let rejected
+      try {
+        await hooks["tool.execute.before"]({ tool: "task", sessionID: "ses_parent", callID: "m2" }, { args: { subagent_type: "general", prompt: "x" } })
+      } catch (error) {
+        rejected = error
+      }
+      assert(rejected && /Agent "general" is disabled - use one of its variants: general-light/.test(String(rejected?.message)), `legacy hidden still rejects (got ${rejected?.message ?? "no error"})`)
+      const healed = JSON.parse(readFileSync(path.join(tmpHome, ".config", "opencode", "agent-variants.jsonc"), "utf8"))
+      assert(healed.agents?.general?.disable_base === true, "self-heal pinned disable_base=true on disk")
+      assert(healed.agents?.explore?.disable_base === false, "self-heal left the explicit just-hide alone")
     } finally {
       process.env.USERPROFILE = realProfile
       process.env.HOME = realHome
