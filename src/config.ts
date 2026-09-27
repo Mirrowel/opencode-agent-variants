@@ -155,8 +155,8 @@ export const SidecarConfig = z.object({
   models: z.record(z.string(), ModelShortcut).default({}),
   profiles: z.record(z.string(), Profile).default({}),
   agents: z.record(
-    z.string(),
-    z.object({
+     z.string(),
+     z.object({
       disable: z.boolean().optional(),
       /**
        * Disable the BASE agent only: the parent is hidden from the model's
@@ -165,6 +165,14 @@ export const SidecarConfig = z.object({
        * removes the entire family.
        */
       disable_base: z.boolean().optional(),
+      /**
+       * Fallback variant KEY for a base-disabled parent: fresh direct calls
+       * to the hidden base are REWRITTEN to this variant's alias (as if the
+       * model had called it directly) instead of being rejected. Only
+       * meaningful together with disable_base (or unified config hiding) -
+       * on an enabled parent it is inert.
+       */
+      default_variant: z.string().optional(),
       parent: ParentPatch.default({}),
       variants: z.record(z.string(), Variant).default({}),
     }),
@@ -983,8 +991,20 @@ export function diagnoseConfig(config: SidecarConfig, input: { agents: string[];
         diagnostics.push({ level: "warning", agent, message: `Parent "${agent}" has the base disabled but no enabled variants - the agent is unreachable. Disable it fully or enable a variant.` })
       } else {
         const names = enabledVariants.map(([key, variant]) => variantName(agent, key, variant)).join(", ")
-        diagnostics.push({ level: "info", agent, message: `Parent "${agent}" base is disabled - variants only (${names}). Direct calls are rejected with the variant list.` })
+        if (entry.default_variant !== undefined) {
+          const hit = enabledVariants.find(([key]) => key === entry.default_variant)
+          if (hit) {
+            diagnostics.push({ level: "info", agent, message: `Parent "${agent}" base is disabled - variants only (${names}). Direct calls are rerouted to "${variantName(agent, hit[0], hit[1])}" instead of rejected.` })
+          } else {
+            diagnostics.push({ level: "warning", agent, message: `Parent "${agent}" default_variant "${entry.default_variant}" does not match an enabled variant - direct calls fall back to the reject-with-list behavior.` })
+          }
+        } else {
+          diagnostics.push({ level: "info", agent, message: `Parent "${agent}" base is disabled - variants only (${names}). Direct calls are rejected with the variant list.` })
+        }
       }
+    }
+    if (!entry.disable && !entry.disable_base && entry.default_variant !== undefined) {
+      diagnostics.push({ level: "info", agent, message: `Parent "${agent}" has default_variant set but the base is enabled - the fallback is inert until the base is disabled.` })
     }
     for (const key of unknownFlagKeys(entry.parent.propagate)) {
       diagnostics.push({ level: "warning", agent, message: `Parent "${agent}" has unknown propagate key "${key}".` })

@@ -1271,6 +1271,103 @@ async function testDisableBase() {
     assert(v2CounterpartAlias("general", "seek", assembly) !== "explore-seek", "v2: counterpart stays within the requested parent")
   }
 
+  // --- v1 assembly + before-hook: base-disable default_variant fallback ---
+  {
+    const cfg = {}
+    const sidecar = emptyConfig()
+    sidecar.agents = {
+      explore: {
+        parent: {},
+        disable_base: true,
+        default_variant: "seek",
+        variants: {
+          seek: { name: "explore-seek", model: "opencode/muse-spark-1.3-contributor-free" },
+          light: { name: "explore-light", model: "opencode/muse-spark-1.3-contributor-free" },
+        },
+      },
+      // Invalid default (no such enabled variant): reject behavior preserved.
+      general: { parent: {}, disable_base: true, default_variant: "gone", variants: { light: { name: "general-light", model: "opencode/muse-spark-1.3-contributor-free" } } },
+      // Enabled parent: default_variant is inert.
+      plan: { parent: {}, default_variant: "light", variants: { light: { name: "plan-light", model: "opencode/muse-spark-1.3-contributor-free" } } },
+    }
+    const assembled = __testAssembleAgents(cfg, sidecar)
+    assert(assembled.defaultReroutes.get("explore") === "explore-seek", "assembly: valid default_variant resolves to the variant alias")
+    assert(!assembled.defaultReroutes.has("general"), "assembly: invalid default_variant produces no reroute")
+    assert(assembled.diagnostics.some((d) => d.level === "warning" && d.agent === "general" && d.message.includes('default_variant "gone" does not match')), "assembly: invalid default_variant warns")
+    assert(!assembled.defaultReroutes.has("plan"), "assembly: enabled parent never reroutes (default inert)")
+    assert(assembled.hiddenBaseParents.has("explore") && assembled.hiddenBaseParents.has("general") && !assembled.hiddenBaseParents.has("plan"), "assembly: hidden-base set unchanged by fallbacks")
+
+    const tmpHome = mkdtempSync(path.join(tmpdir(), "av-fallback-"))
+    mkdirSync(path.join(tmpHome, ".config", "opencode"), { recursive: true })
+    writeFileSync(path.join(tmpHome, ".config", "opencode", "agent-variants.jsonc"), JSON.stringify(sidecar), "utf8")
+    const realProfile = process.env.USERPROFILE
+    const realHome = process.env.HOME
+    process.env.USERPROFILE = tmpHome
+    process.env.HOME = tmpHome
+    try {
+      const sessions = new Map([
+        ["ses_parent", { id: "ses_parent", model: { providerID: "closedrouter", modelID: "glm-5.3" } }],
+        ["ses_variant_child", { id: "ses_variant_child", parentID: "ses_parent" }],
+        ["ses_base_child", { id: "ses_base_child", parentID: "ses_parent" }],
+      ])
+      const partsByChild = new Map([
+        ["ses_variant_child", { id: "prt_v", type: "tool", tool: "task", callID: "call_v", state: { status: "completed", input: { subagent_type: "explore-seek" }, metadata: { sessionId: "ses_variant_child", agentVariants: { alias: "explore-seek" } } } }],
+        ["ses_base_child", { id: "prt_b", type: "tool", tool: "task", state: { status: "completed", input: { subagent_type: "explore" }, metadata: { sessionId: "ses_base_child" } } }],
+      ])
+      const fakeClient = {
+        tui: { showToast: async () => true },
+        session: {
+          get: async ({ path }) => ({ data: sessions.get(path.id) }),
+          messages: async () => ({ data: [{ parts: [...partsByChild.values()] }] }),
+        },
+      }
+      const hooks = await __testInternals.createHooks({ client: fakeClient, directory: "C:/x" }, sidecar)
+      await hooks.config({})
+
+      // Fresh base call with a valid fallback: routed as the variant, never
+      // rejected. Execution runs the parent (v1 virtual-agent design), the
+      // description is annotated as the variant, and the after-hook restores
+      // the alias on the persisted input - it reads as the variant call.
+      const reroutedArgs = { subagent_type: "explore", prompt: "x", description: "probe" }
+      await hooks["tool.execute.before"]({ tool: "task", sessionID: "ses_parent", callID: "fb1" }, { args: reroutedArgs })
+      assert(reroutedArgs.description.includes("(@explore-seek variant)"), `rerouted call is annotated as the variant (got ${reroutedArgs.description})`)
+      assert(reroutedArgs.subagent_type === "explore", `execution agent is the parent, like a direct variant call (got ${reroutedArgs.subagent_type})`)
+      await hooks["tool.execute.after"]({ tool: "task", sessionID: "ses_parent", callID: "fb1", args: reroutedArgs }, { title: "t", output: "ok" })
+      assert(reroutedArgs.subagent_type === "explore-seek", `persisted input reads as the default variant call (got ${reroutedArgs.subagent_type})`)
+
+      // Invalid fallback: reject-with-list behavior preserved.
+      let rejected
+      try {
+        await hooks["tool.execute.before"]({ tool: "task", sessionID: "ses_parent", callID: "fb2" }, { args: { subagent_type: "general", prompt: "x" } })
+      } catch (error) {
+        rejected = error
+      }
+      assert(rejected && /Agent "general" is disabled - use one of its variants: general-light/.test(String(rejected?.message)), `invalid fallback keeps the reject behavior (got ${rejected?.message ?? "no error"})`)
+
+      // Enabled parent: no rewrite, no rejection - the base runs as itself.
+      const planArgs = { subagent_type: "plan", prompt: "x" }
+      await hooks["tool.execute.before"]({ tool: "task", sessionID: "ses_parent", callID: "fb3" }, { args: planArgs })
+      assert(planArgs.subagent_type === "plan", "enabled parent with default_variant is never rewritten")
+
+      // Continuations are untouched by the fallback: variant-child base
+      // resumes still get the counterpart hint, base-child resumes run base.
+      let resumeRejected
+      try {
+        await hooks["tool.execute.before"]({ tool: "task", sessionID: "ses_parent", callID: "fb4" }, { args: { subagent_type: "explore", prompt: "x", task_id: "ses_variant_child" } })
+      } catch (error) {
+        resumeRejected = error
+      }
+      assert(resumeRejected && /belongs to variant "explore-seek"/.test(String(resumeRejected?.message)), "base resume of a variant child keeps the counterpart rejection")
+      const resumeArgs = { subagent_type: "explore", prompt: "x", task_id: "ses_base_child" }
+      await hooks["tool.execute.before"]({ tool: "task", sessionID: "ses_parent", callID: "fb5" }, { args: resumeArgs })
+      assert(resumeArgs.subagent_type === "explore", "base resume of a base child is never rewritten")
+    } finally {
+      process.env.USERPROFILE = realProfile
+      process.env.HOME = realHome
+      rmSync(tmpHome, { recursive: true, force: true })
+    }
+  }
+
   // --- v2 assembly: unification - hidden parent definition base-disables ---
   {
     const editor = stubV2Editor({

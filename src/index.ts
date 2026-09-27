@@ -380,6 +380,11 @@ export function __testAssembleAgents(cfg: Record<string, any>, sidecar: SidecarC
   // must use a variant. Fresh direct calls are rejected by the before-hook;
   // task_id resumes stay allowed.
   const hiddenBaseParents = new Set<string>()
+  // Base-disable FALLBACK: parent -> variant alias. When default_variant
+  // names an enabled, registered variant, fresh direct calls to the hidden
+  // base are REWRITTEN to that alias (as if the model had called the
+  // variant) instead of being rejected.
+  const defaultReroutes = new Map<string, string>()
   const diagnostics: Diagnostic[] = []
   const originalAgents = new Set([...Object.keys(cfg.agent), ...Object.keys(BUILTIN_AGENT_DESCRIPTIONS)])
   const generatedAliases = new Map<string, string>()
@@ -506,9 +511,21 @@ export function __testAssembleAgents(cfg: Record<string, any>, sidecar: SidecarC
         description: generatedParentDescription(current?.description ?? base?.description, parent, parentAliases),
       }
     }
+    // Resolve the base-disable fallback only after variants registered, so
+    // default_variant must name an alias that actually exists.
+    if (entry.default_variant !== undefined && hiddenBaseParents.has(parent)) {
+      const hit = enabledVariants.find(([key]) => key === entry.default_variant)
+      const alias = hit ? variantName(parent, hit[0], hit[1]) : undefined
+      if (hit && alias && virtualRoutes.has(alias)) {
+        defaultReroutes.set(parent, alias)
+        diagnostics.push({ level: "info", agent: parent, message: `Parent "${parent}" direct calls are rerouted to "${alias}" (default variant).` })
+      } else {
+        diagnostics.push({ level: "warning", agent: parent, message: `Parent "${parent}" default_variant "${entry.default_variant}" does not match an enabled variant - direct calls keep the reject-with-list behavior.` })
+      }
+    }
   }
 
-  return { virtualRoutes, parentPromptPatches, parentRequestPatches, hiddenBaseParents, diagnostics }
+  return { virtualRoutes, parentPromptPatches, parentRequestPatches, hiddenBaseParents, defaultReroutes, diagnostics }
 }
 
 function takeMarkerRoute(parts: any[], routes: Map<string, RuntimeRoute>) {
@@ -1257,6 +1274,7 @@ type V1HookSet = Awaited<ReturnType<Plugin>>
 async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig): Promise<V1HookSet> {
   let virtualRoutes = new Map<string, RuntimeRoute>()
   let hiddenBaseParents = new Set<string>()
+  let defaultReroutes = new Map<string, string>()
   let parentPromptPatches = new Map<string, AgentPatch>()
   let parentRequestPatches = new Map<string, AgentPatch>()
   let catalog: ModelCatalog | undefined
@@ -1344,6 +1362,7 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
       const assembled = __testAssembleAgents(cfg as Record<string, any>, sidecar)
       virtualRoutes = assembled.virtualRoutes
       hiddenBaseParents = assembled.hiddenBaseParents
+      defaultReroutes = assembled.defaultReroutes
       parentPromptPatches = assembled.parentPromptPatches
       parentRequestPatches = assembled.parentRequestPatches
       queueDiagnostics(assembled.diagnostics)
@@ -1361,7 +1380,20 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
         task_id?: string
       }
       if (!args?.subagent_type || !args.prompt) return
-      const staticRoute = virtualRoutes.get(args.subagent_type)
+      const continuationArg = args.task_id ?? args.sessionID
+      const continuation = typeof continuationArg === "string" && continuationArg ? continuationArg : undefined
+      let staticRoute = virtualRoutes.get(args.subagent_type)
+      // Base-disable FALLBACK rewrite: fresh direct calls to a hidden base
+      // with a default variant are rewritten to that variant's alias - the
+      // persisted input and replay then read as if the model had called the
+      // variant directly (no "base was desired" signal anywhere). Fresh
+      // calls only: continuations keep the resume rules.
+      if (!staticRoute && !continuation && defaultReroutes.has(args.subagent_type)) {
+        const rerouted = defaultReroutes.get(args.subagent_type)!
+        debugLog(debugEnabled(), "AGENT-VARIANTS reroute (default variant)", `${args.subagent_type} -> ${rerouted}`)
+        args.subagent_type = rerouted
+        staticRoute = virtualRoutes.get(rerouted)
+      }
       // Continuation calls (input.sessionID) address an existing child: clear
       // any stale route state for it up front. For base (non-variant) calls
       // this prevents a previous round's session-keyed route from leaking
@@ -1369,8 +1401,6 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
       // v1's task tool resumes via `task_id` (a prior task's child session
       // id); the v2 port's subagent tool uses `sessionID`. Both identify the
       // child session up front - accept either.
-      const continuationArg = args.task_id ?? args.sessionID
-      const continuation = typeof continuationArg === "string" && continuationArg ? continuationArg : undefined
       if (continuation && !staticRoute) bySession.delete(continuation)
       // Task-id validation: v1's task tool silently degrades unresolvable
       // ids to a fresh session (task.ts: sessions.get(id).catchCause(() =>

@@ -2034,7 +2034,7 @@ async function toggleDisable(api: TuiPluginApi, config: SidecarConfig, settings:
         ? "Disabled - no variants active"
         : baseDisabled
           ? enabledVariantCount > 0
-            ? `Base disabled - variants only (${enabledVariantCount})`
+            ? `Base disabled - variants only (${enabledVariantCount})${entry.default_variant !== undefined ? ` - reroutes to ${entry.default_variant}` : ""}`
             : "Base disabled - UNREACHABLE (no enabled variants)"
           : "Enabled",
       category: "Parents",
@@ -2043,8 +2043,8 @@ async function toggleDisable(api: TuiPluginApi, config: SidecarConfig, settings:
       help: parentDisabled
         ? "Fully disabled: the parent and every variant are removed from the task list. Pick to re-enable or switch to base-only disable."
         : baseDisabled
-          ? "Base-only disable: the parent is hidden from the task list and fresh direct calls are rejected with the variant list, while every variant stays callable. Resumes of old base tasks still work. Pick for the full-disable submenu."
-          : "Enabled. Pick for disable options: full (parent + variants) or base-only (variants must be used).",
+          ? `Base-only disable: the parent is hidden from the task list; fresh direct calls are ${entry.default_variant !== undefined ? `rewritten to the default variant (${entry.default_variant})` : "rejected with the variant list"}. Pick to change the behavior or fallback.`
+          : "Enabled. Pick for disable options: full (parent + variants), or base-only with an optional reroute fallback.",
     })
     for (const [key, rawVar] of variantEntries(entry)) {
       const variant = rawVar as VariantConfig
@@ -2081,46 +2081,106 @@ async function toggleDisable(api: TuiPluginApi, config: SidecarConfig, settings:
       next.agents[picked.agent] = { parent: {}, variants: {} }
     }
     const entry = next.agents[picked.agent] as AgentEntry
-    const variantCount = Object.values(entry.variants).filter((variant) => (variant as VariantConfig).disable !== true).length
-    const choice = await showMenu(api, {
-      title: `${picked.agent} disable`,
+    const enabledVariants = Object.entries(entry.variants).filter(([, variant]) => (variant as VariantConfig).disable !== true)
+    const baseDisabled = entry.disable_base === true && entry.disable !== true
+    // Step 1: base behavior - Normal / Full disable / Base disabled (then
+    // the fallback choice). Direct calls to a base-disabled parent either
+    // get rejected with the variant list or are REWRITTEN to the default
+    // variant, as if the model had called it directly.
+    const behavior = await showMenu(api, {
+      title: `${picked.agent} base behavior`,
       options: [
         {
-          title: `${entry.disable ? "Disable parent + variants (current)" : "Disable parent + variants"}`,
+          title: !entry.disable && !entry.disable_base ? "Normal - parent callable (current)" : "Normal - parent callable",
+          value: "normal",
+          description: entry.disable || entry.disable_base ? "re-enables the base; direct calls run the parent agent" : "the parent stays in the task list",
+          help: "Normal: the base parent stays visible and directly callable (clears full disable, base disable, and the fallback).",
+        },
+        {
+          title: `${entry.disable ? "Full disable - parent + variants (current)" : "Full disable - parent + variants"}`,
           value: "full",
-          description: entry.disable ? "currently: fully disabled - pick to re-enable" : "removes the parent and all variants from the task list",
+          description: entry.disable ? "currently: fully disabled - pick Normal to re-enable" : "removes the parent and all variants from the task list",
           danger: !entry.disable,
           help: "Full disable: the parent and every variant disappear from the task list entirely (existing sidecar entry.disable).",
         },
         {
-          title: `${!entry.disable && entry.disable_base ? "Disable base only - variants must be used (current)" : "Disable base only - variants must be used"}`,
+          title: `${baseDisabled ? "Base disabled - variants must be used (current)" : "Base disabled - variants must be used"}`,
           value: "base",
-          description:
-            entry.disable_base && !entry.disable
-              ? variantCount > 0
-                ? `currently: base disabled, ${variantCount} variant(s) active - pick to re-enable the base`
-                : "currently: base disabled with NO enabled variants - agent unreachable"
-              : "hides the parent from the task list; variants stay callable",
-          danger: !entry.disable && !entry.disable_base && variantCount === 0,
+          description: baseDisabled
+            ? enabledVariants.length > 0
+              ? `currently: base disabled, ${enabledVariants.length} variant(s) active - pick to change the fallback`
+              : "currently: base disabled with NO enabled variants - agent unreachable"
+            : "hides the parent; variants stay callable",
+          danger: !entry.disable && !entry.disable_base && enabledVariants.length === 0,
           help:
-            "Base-only disable: the parent is hidden from the task list and fresh direct calls fail with the enabled-variant list (the model has to use a variant). Existing variant calls and task_id resumes of old base tasks keep working. Requires restart to apply.",
+            "Base-only disable: the parent is hidden from the task list; fresh direct calls either get rejected with the variant list or are rewritten to a default variant (next step). Requires restart to apply.",
         },
         { title: "< Back", value: "__back__", description: "" },
       ],
     })
-    if (!choice || choice === "__back__") return config
-    if (choice === "full") {
-      entry.disable = !entry.disable
-      if (entry.disable) entry.disable_base = false
-      const state = entry.disable ? "disabled" : "enabled"
-      markRestart(settings, `${picked.agent}: parent ${state} requires restart.`)
-      await warnRestartField(api, "Parent disable", `Parent ${state}; restart OpenCode to update task-list visibility.`)
+    if (!behavior || behavior === "__back__") return config
+    if (behavior === "normal") {
+      entry.disable = false
+      entry.disable_base = false
+      entry.default_variant = undefined
+      markRestart(settings, `${picked.agent}: parent enabled requires restart.`)
+      await warnRestartField(api, "Parent enable", `Parent enabled; restart OpenCode to update task-list visibility.`)
+    } else if (behavior === "full") {
+      entry.disable = true
+      entry.disable_base = false
+      entry.default_variant = undefined
+      markRestart(settings, `${picked.agent}: parent disabled requires restart.`)
+      await warnRestartField(api, "Parent disable", `Parent disabled; restart OpenCode to update task-list visibility.`)
     } else {
-      entry.disable_base = entry.disable_base !== true
-      if (entry.disable_base) entry.disable = false
-      const state = entry.disable_base ? "base disabled - variants only" : "base enabled"
-      markRestart(settings, `${picked.agent}: ${state} requires restart.`)
-      await warnRestartField(api, "Base disable", `Base ${state}; restart OpenCode to update task-list visibility.`)
+      // Step 2: the fallback choice for direct calls to the hidden base.
+      const currentFallback = baseDisabled && entry.default_variant !== undefined ? entry.default_variant : undefined
+      const fallbackChoice = await showMenu(api, {
+        title: `Direct calls to ${picked.agent} (base disabled)`,
+        options: [
+          {
+            title: `${baseDisabled && currentFallback === undefined ? "No fallback - reject with the variant list (current)" : "No fallback - reject with the variant list"}`,
+            value: "reject",
+            description: "fresh direct calls fail with the enabled-variant list; the model has to pick a variant",
+            help: "The default behavior of base-disable: direct calls are rejected with an error listing the enabled variants.",
+          },
+          {
+            title: "Fallback - reroute to a variant",
+            value: "fallback",
+            description: currentFallback !== undefined ? `currently: rerouted to "${currentFallback}"` : "direct calls are rewritten to a default variant, as if it was called directly",
+            help: "Bugfix fallback: when the model calls the hidden base anyway (from memory), the call is rewritten to the default variant - persisted input, replay, routing, and annotation all read as the variant call.",
+          },
+          { title: "< Back", value: "__back__", description: "" },
+        ],
+      })
+      if (!fallbackChoice || fallbackChoice === "__back__") return config
+      entry.disable = false
+      entry.disable_base = true
+      if (fallbackChoice === "reject") {
+        entry.default_variant = undefined
+        markRestart(settings, `${picked.agent}: base disabled (reject) requires restart.`)
+        await warnRestartField(api, "Base disable", `Base disabled - direct calls are rejected with the variant list; restart OpenCode to apply.`)
+      } else {
+        if (enabledVariants.length === 0) {
+          await showAlert(api.ui, { title: "No enabled variants", message: `Add or enable a variant of ${picked.agent} first - the fallback needs a target.` })
+          return config
+        }
+        // Step 3: which variant becomes the default.
+        const variantPick = await showMenu(api, {
+          title: `Reroute direct ${picked.agent} calls to`,
+          options: [
+            ...enabledVariants.map(([key, variant]) => ({
+              title: `${variantName(picked.agent, key, variant as VariantConfig)}${currentFallback === key ? " (current)" : ""}`,
+              value: key,
+              description: "fresh direct calls are rewritten to this variant",
+            })),
+            { title: "< Back", value: "__back__", description: "" },
+          ],
+        })
+        if (!variantPick || variantPick === "__back__") return config
+        entry.default_variant = variantPick
+        markRestart(settings, `${picked.agent}: base disabled (fallback -> ${variantPick}) requires restart.`)
+        await warnRestartField(api, "Base disable", `Base disabled - direct calls reroute to "${variantPick}"; restart OpenCode to apply.`)
+      }
     }
   } else {
     const entry = next.agents[picked.agent] as AgentEntry | undefined
