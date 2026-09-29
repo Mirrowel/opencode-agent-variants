@@ -1874,8 +1874,95 @@ function testUnknownTaskIdSuggestions() {
     if (!message.includes("(or use one of its variants)")) throw new Error("variants hint respected")
     if (message.includes("No close match found")) throw new Error("no-candidate case skips the no-match note")
   }
+  // Variant attribution: candidate.variant replaces the parent agent; the
+  // title annotation is only a fallback source when the caller could not
+  // attribute (metadata or model inference set .variant).
+  {
+    const attributed = [{ id: "ses_attr_child", title: "Pass-2 black-box REconstruction of the routing map", agent: "general", variant: "general-seek", updated: Date.now() - 420_000 }]
+    const message = buildUnknownTaskIdMessage("ses_attr_childX", attributed, { typoDistance: 3, suggestLimit: 10 })
+    if (!message.includes(`"Pass-2 black-box REconstruction of the…" - general-seek - 7m ago`)) throw new Error(`attributed variant replaces parent agent (got ${message})`)
+    if (message.includes("- general -") || message.includes("(last model:")) throw new Error("parent/model dropped when variant known")
+  }
+  // Unattributed with a model: parent + last model fallback (the model
+  // disambiguates same-parent variants when inference is impossible).
+  {
+    const unattributed = [{ id: "ses_model_child", title: "Pentest wave", agent: "general", model: "closedrouter/glm-5.3", updated: Date.now() - 3_600_000 }]
+    const message = buildUnknownTaskIdMessage("ses_model_childX", unattributed, { typoDistance: 3, suggestLimit: 10 })
+    if (!message.includes(`"Pentest wave" - general (last model: closedrouter/glm-5.3) - 1h ago`)) throw new Error(`unattributed fallback shows parent + model (got ${message})`)
+  }
+  // Title annotation alone (caller attributed nothing, title carries it).
+  {
+    const annotated = [{ id: "ses_annot_child", title: "Probe (@general-seek variant)", agent: "general", updated: Date.now() - 60_000 }]
+    const message = buildUnknownTaskIdMessage("ses_annot_childX", annotated, { typoDistance: 3, suggestLimit: 10 })
+    if (!message.includes(`"Probe" - general-seek - 1m ago`)) throw new Error(`annotation alias still works without .variant (got ${message})`)
+  }
 }
 
 testUnknownTaskIdSuggestions()
+
+// --- unknown-task-id: variant attribution wiring (metadata + inference) ---
+async function testCandidateAttribution() {
+  // attributeCandidates: metadata alias wins; (parent, model) inference fills
+  // the rest; ambiguous/shared models and model-less variants never infer.
+  {
+    const sidecar = emptyConfig()
+    sidecar.agents = {
+      general: {
+        parent: {},
+        variants: {
+          seek: { model: "closedrouter/muse-spark-1.3-contributor-free" },
+          light: { model: "closedrouter/muse-spark" },
+          heavy: { model: "closedrouter/muse-spark" },
+          bare: {},
+        },
+      },
+    }
+    const modelIndex = __testInternals.variantModelNames(sidecar)
+    const byModel = modelIndex.get("general")
+    if (byModel?.get("closedrouter/muse-spark-1.3-contributor-free") !== "general-seek") throw new Error("unique model infers its variant")
+    if (byModel?.has("closedrouter/muse-spark")) throw new Error("model shared by light+heavy never infers")
+    if (byModel?.size !== 1) throw new Error(`only unique explicit models participate (got ${[...(byModel?.keys() ?? [])].join(",")})`)
+
+    const candidates = [
+      { id: "ses_meta", agent: "general", title: "Meta run", model: "closedrouter/glm-5.3" },
+      { id: "ses_infer", agent: "general", title: "Infer run", model: "closedrouter/muse-spark-1.3-contributor-free" },
+      { id: "ses_ambig", agent: "general", title: "Ambiguous run", model: "closedrouter/muse-spark" },
+      { id: "ses_bare", agent: "general", title: "Bare run" },
+      { id: "ses_other", agent: "explore", title: "Other parent", model: "closedrouter/muse-spark-1.3-contributor-free" },
+    ]
+    __testInternals.attributeCandidates(candidates, new Map([["ses_meta", "general-seek"]]), modelIndex)
+    if (candidates[0].variant !== "general-seek") throw new Error("metadata alias wins")
+    if (candidates[1].variant !== "general-seek") throw new Error("unique model inference fills unattributed")
+    if (candidates[2].variant !== undefined) throw new Error("shared model stays unattributed")
+    if (candidates[3].variant !== undefined) throw new Error("model-less candidate stays unattributed")
+    if (candidates[4].variant !== undefined) throw new Error("inference only matches within the candidate's parent")
+  }
+  // collectTaskAliases: paginates via the before cursor (5 pages max) and
+  // reads the task-part metadata (sessionId + agentVariants.alias).
+  {
+    const calls = []
+    const pages = [
+      Array.from({ length: 100 }, (_, i) => ({ info: { id: `m${i}` }, parts: i < 2 ? [{ type: "tool", tool: "task", state: { metadata: { sessionId: `ses_p1_${i}`, agentVariants: { alias: i === 0 ? "general-seek" : "explore-light" } } } }] : [] })),
+      Array.from({ length: 40 }, (_, i) => ({ info: { id: `n${i}` }, parts: i === 3 ? [{ type: "tool", tool: "task", state: { metadata: { sessionId: "ses_p2_3", agentVariants: { alias: "general-flash" } } } }] : [] })),
+    ]
+    const fakeClient = {
+      session: {
+        messages: async (input) => {
+          calls.push(input)
+          const before = input?.query?.before
+          const page = before === undefined ? pages[0] : pages[1]
+          return { data: page }
+        },
+      },
+    }
+    const aliases = await __testInternals.collectTaskAliases(fakeClient, "C:/x", "ses_parent")
+    if (calls.length !== 2) throw new Error(`pagination stops after a short page (got ${calls.length} calls)`)
+    if (calls[1]?.query?.before !== "m99") throw new Error("before cursor is the last message id of the previous page")
+    if (aliases.get("ses_p1_0") !== "general-seek" || aliases.get("ses_p1_1") !== "explore-light" || aliases.get("ses_p2_3") !== "general-flash") throw new Error("aliases collected across pages")
+    if (aliases.size !== 3) throw new Error(`only task parts with aliases contribute (got ${aliases.size})`)
+  }
+}
+
+await testCandidateAttribution()
 console.log("regression tests passed")
 process.exit(0)

@@ -272,6 +272,9 @@ export const __testInternals = {
   scrubTaskOutput,
   repairLiveTaskPart,
   persistCleanedParts,
+  attributeCandidates,
+  collectTaskAliases,
+  variantModelNames,
   LIVE_REPAIR_DELAYS,
   createHooks,
 }
@@ -668,10 +671,18 @@ async function fetchTaskCandidates(client: any, directory: string | undefined, p
       const agent =
         typeof agentRaw === "string" ? agentRaw : typeof agentRaw?.id === "string" ? agentRaw.id : undefined
       const time = raw.time && typeof raw.time === "object" ? raw.time : {}
+      const modelRaw = raw.model
+      const model =
+        typeof modelRaw === "string"
+          ? modelRaw
+          : modelRaw && typeof modelRaw === "object" && typeof modelRaw.providerID === "string" && typeof modelRaw.id === "string"
+            ? `${modelRaw.providerID}/${modelRaw.id}`
+            : undefined
       candidates.push({
         id: raw.id,
         title: typeof raw.title === "string" && raw.title !== "" ? raw.title : undefined,
         agent,
+        model,
         created: typeof time.created === "number" ? time.created : typeof raw.time_created === "number" ? raw.time_created : undefined,
         updated: typeof time.updated === "number" ? time.updated : typeof raw.time_updated === "number" ? raw.time_updated : undefined,
       })
@@ -679,6 +690,93 @@ async function fetchTaskCandidates(client: any, directory: string | undefined, p
     return candidates
   }
   return []
+}
+
+/** childID -> variant alias, built from the parent session's task parts
+ * (state.metadata.sessionId + agentVariants.alias - the same source the
+ * correlation uses). Bounded pagination via the `before` cursor so children
+ * whose task part sits deep in the parent's history still attribute
+ * (a child resumed hours later sorts to the top by update time while its
+ * part may be pages back). Fail-soft: errors -> empty map. */
+async function collectTaskAliases(client: any, directory: string | undefined, parentSessionID: string): Promise<Map<string, string>> {
+  const map = new Map<string, string>()
+  const namespace = client?.session
+  if (typeof namespace?.messages !== "function" || !directory) return map
+  const PAGE_SIZE = 100
+  const MAX_PAGES = 5
+  let before: string | undefined
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const query: Record<string, unknown> = before === undefined ? { directory, limit: PAGE_SIZE } : { directory, limit: PAGE_SIZE, before }
+    const result = getData(
+      await safeClientCall(() => (namespace as any).messages({ path: { id: parentSessionID }, query }), CLIENT_CALL_TIMEOUT),
+    )
+    if (!Array.isArray(result) || result.length === 0) break
+    for (const message of result as Record<string, any>[]) {
+      for (const part of (message?.parts ?? []) as Record<string, any>[]) {
+        if (part?.type !== "tool" || part?.tool !== "task") continue
+        const metadata = part?.state?.metadata
+        const child = typeof metadata?.sessionId === "string" ? metadata.sessionId : undefined
+        const alias = metadata?.agentVariants?.alias
+        if (typeof child === "string" && typeof alias === "string" && alias !== "" && !map.has(child)) map.set(child, alias)
+      }
+    }
+    if (result.length < PAGE_SIZE) break
+    const last = result[result.length - 1] as Record<string, any>
+    const nextBefore = typeof last?.info?.id === "string" ? last.info.id : typeof last?.id === "string" ? last.id : undefined
+    if (!nextBefore || nextBefore === before) break
+    before = nextBefore
+  }
+  return map
+}
+
+/** parent -> (resolved model string -> variant display name) for variants
+ * that EXPLICITLY set a model. Only unique mappings participate: when two
+ * enabled variants share a model, the model cannot name the variant and the
+ * candidate falls back to parent + model. Variants without their own model
+ * inherit at call time, so they never participate either. */
+function variantModelNames(sidecar: SidecarConfig): Map<string, Map<string, string>> {
+  const index = new Map<string, Map<string, string>>()
+  for (const [parent, entry] of Object.entries(sidecar.agents)) {
+    if (entry?.disable === true) continue
+    const counts = new Map<string, string[]>()
+    for (const [key, variant] of Object.entries(entry.variants ?? {})) {
+      if ((variant as VariantConfig)?.disable === true) continue
+      const model = (variant as VariantConfig)?.model
+      if (typeof model !== "string" || model === "") continue
+      const resolved = resolveModel(model, sidecar)
+      if (!resolved) continue
+      const list = counts.get(resolved) ?? []
+      list.push(variantName(parent, key, variant as VariantConfig))
+      counts.set(resolved, list)
+    }
+    for (const [model, names] of counts) {
+      if (names.length !== 1) continue
+      let byParent = index.get(parent)
+      if (!byParent) {
+        byParent = new Map()
+        index.set(parent, byParent)
+      }
+      byParent.set(model, names[0]!)
+    }
+  }
+  return index
+}
+
+/** Attaches the variant to each candidate: task metadata first (exact
+ * alias), then (parent, last model) inference for unattributed children,
+ * leaving the model in place for the ambiguous fallback display. */
+function attributeCandidates(candidates: TaskCandidate[], aliases: Map<string, string>, modelIndex: Map<string, Map<string, string>>): void {
+  for (const candidate of candidates) {
+    const metadataAlias = aliases.get(candidate.id)
+    if (metadataAlias) {
+      candidate.variant = metadataAlias
+      continue
+    }
+    if (candidate.model && candidate.agent) {
+      const inferred = modelIndex.get(candidate.agent)?.get(candidate.model)
+      if (inferred) candidate.variant = inferred
+    }
+  }
 }
 
 /** Short-TTL cache of a session's current model (primary-model profile matching). */
@@ -1463,8 +1561,15 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
         if (!info || typeof (info as { id?: unknown }).id !== "string") {
           // Enriched rejection: propose the typo-corrected id (tiered fuzzy
           // match) plus the recent subagent sessions of this session, so the
-          // model can self-correct instead of spawning a stray task.
-          const candidates = await fetchTaskCandidates(input.client, input.directory, hookInput.sessionID)
+          // model can self-correct instead of spawning a stray task. Each
+          // row carries the VARIANT that ran (task metadata first, then
+          // (parent, last model) inference) - the parent agent alone is
+          // exactly how the model guesses wrong.
+          const [candidates, aliases] = await Promise.all([
+            fetchTaskCandidates(input.client, input.directory, hookInput.sessionID),
+            collectTaskAliases(input.client, input.directory, hookInput.sessionID),
+          ])
+          attributeCandidates(candidates, aliases, variantModelNames(sidecar))
           throw new Error(
             buildUnknownTaskIdMessage(continuation, candidates, {
               typoDistance: sidecar.taskValidation.typoDistance,

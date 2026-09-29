@@ -551,10 +551,19 @@ async function fetchV2TaskCandidates(context: V2PluginContext, parentSessionID: 
       if (!raw || typeof raw !== "object" || typeof raw.id !== "string") continue
       if (raw.parentID !== parentSessionID) continue
       const time = raw.time && typeof raw.time === "object" ? raw.time : {}
+      const modelRaw = raw.model
       candidates.push({
         id: raw.id,
         title: typeof raw.title === "string" && raw.title !== "" ? raw.title : undefined,
+        // v2 children run as real clone agents, so agent already IS the
+        // variant alias when one ran; base children carry the parent here.
         agent: typeof raw.agent === "string" ? raw.agent : typeof raw.agent?.id === "string" ? raw.agent.id : undefined,
+        model:
+          typeof modelRaw === "string"
+            ? modelRaw
+            : modelRaw && typeof modelRaw === "object" && typeof modelRaw.providerID === "string" && typeof modelRaw.id === "string"
+              ? `${modelRaw.providerID}/${modelRaw.id}`
+              : undefined,
         created: typeof time.created === "number" ? time.created : undefined,
         updated: typeof time.updated === "number" ? time.updated : undefined,
       })

@@ -1121,6 +1121,12 @@ export type TaskCandidate = {
   id: string
   title?: string
   agent?: string
+  /** The variant alias that actually ran (task metadata or model inference),
+   * e.g. "general-seek" - displayed instead of the parent agent. */
+  variant?: string
+  /** The session's last-used model ("provider/model"), shown when the
+   * variant cannot be determined. */
+  model?: string
   updated?: number
   created?: number
 }
@@ -1184,11 +1190,19 @@ function describeCandidate(candidate: TaskCandidate): string {
     const shown = title.length > 40 ? truncateTitleWordBoundary(title) : title
     if (shown) parts.push(`"${shown}"`)
     // The alias embeds the parent name (explore-seek), so the parent agent
-    // is dropped when the alias is known - never both.
-    const agent = alias ?? candidate.agent
-    if (agent) parts.push(agent)
+    // is dropped when the variant is known - never both. The variant comes
+    // from task metadata or (parent, model) inference; the title annotation
+    // is a last source when the caller could not attribute.
+    const variant = candidate.variant ?? alias
+    if (variant) {
+      parts.push(variant)
+    } else if (candidate.agent) {
+      parts.push(candidate.model ? `${candidate.agent} (last model: ${candidate.model})` : candidate.agent)
+    }
+  } else if (candidate.variant) {
+    parts.push(candidate.variant)
   } else if (candidate.agent) {
-    parts.push(candidate.agent)
+    parts.push(candidate.model ? `${candidate.agent} (last model: ${candidate.model})` : candidate.agent)
   }
   const age = describeCandidateAge(candidate)
   if (age) parts.push(age)
