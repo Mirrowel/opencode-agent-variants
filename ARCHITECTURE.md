@@ -15,13 +15,16 @@
 - Two-phase model validation: shape (`provider/model` format) checks run synchronously at startup; provider/model existence checks run asynchronously once OpenCode's merged provider catalog is available, with diagnostic toasts delivered through a retry-capable queue
 - Automatic config backups with patch-chain reversal on every save
 - Internal-only routing metadata: route state stays in memory and task `state.metadata`; legacy markers and residual artifacts are stripped from model-visible output; stored task parts are auto-repaired when needed, but a repair only ever rewrites a completed snapshot — a running or unknown-status part is never reverted
+- Base-only parent disable: a sidecar `disable_base` flag (or a config-hidden parent that has at least one enabled variant) hides the parent from the task list while keeping it registered so variants stay callable; fresh direct calls fail with the enabled-variant list, resumes may only continue tasks that ran the base, and variant copies strip any inherited `hidden`
+- Continuation task-id validation: `task_id` (v1) and `sessionID` (v2) resumes are validated before routing — an unresolvable id is a hard error carrying a typo-corrected id (tiered fuzzy/prefix-aligned match) and the session's recent subagent list instead of silently degrading to a fresh task, and a session owned by a different parent is rejected too (v2 core's bare bogus-id error is pre-empted)
+- Variant-key resume matching: a guarded continuation may flip the parent agent only when the variant key matches (`explore-seek` <-> `general-seek`); cross-key resumes are rejected with the counterpart alias, a base resume of a variant child offers the requested parent's same-key variant, and children without reachable metadata fail open
 
 ## Layers
 
 **Server Plugin (Hook Layer):**
 - Purpose: Intercepts OpenCode lifecycle hooks to inject agent variants into the task tool and route model/parameter overrides
 - Location: `src/index.ts`
-- Contains: Plugin factory, route assembly, metadata/optional-marker session correlation, request patching, chat history sanitization
+- Contains: Plugin factory, route assembly, metadata/optional-marker session correlation, task-id validation with typo/prefix suggestions, variant-key resume matching, base-only disable rejection, request patching, chat history sanitization
 - Depends on: `src/config.ts` for config loading, validation, and model resolution
 - Used by: OpenCode runtime via `src/server.ts` entry point
 
@@ -35,7 +38,7 @@
 **OpenCode v2 Server Layer:**
 - Purpose: Same routing semantics on OpenCode v2, mapped onto its replayable agent transforms and request hooks
 - Location: `src/v2-server.ts` (setup) and `src/v2-types.ts` (hand-written minimal context types — the v2 SDK is beta and v2 modules must not import `@opencode-ai/plugin` at runtime)
-- Contains: `assembleV2Agents()` registers every variant alias as a REAL agent (a full copy of its parent — model/variant, composed system prompt for static-system parents, description guidance, inherited permissions/steps/request block); profiles get hidden per-model clones (`av:<alias>@<profile>` / `av:<parent>@<profile>`) selected by a `tool.execute.before` `input.agent` rewrite keyed on the active profile (manual pin, else the root primary session's model via `ctx.session.get` parentID walk); request parameters (temperature/top_p/provider options) are applied per request through the `session.context` hook (v2's `agent.request` is currently inert on the wire) keyed by the executing agent id; `tool.execute.after` stamps `agentVariants` metadata; a parent-directory file watcher triggers a debounced `ctx.agent.reload()` so sidecar edits apply live
+- Contains: `assembleV2Agents()` registers every variant alias as a REAL agent (a full copy of its parent — model/variant, composed system prompt for static-system parents, description guidance, inherited permissions/steps/request block); profiles get hidden per-model clones (`av:<alias>@<profile>` / `av:<parent>@<profile>`) selected by a `tool.execute.before` `input.agent` rewrite keyed on the active profile (manual pin, else the root primary session's model via `ctx.session.get` parentID walk); request parameters (temperature/top_p/provider options) are applied per request through the `session.context` hook (v2's `agent.request` is currently inert on the wire) keyed by the executing agent id; `tool.execute.after` stamps `agentVariants` metadata; hidden-base parents are hidden and their fresh direct calls are rejected in the same before-hook with the enabled-variant list, unknown-id continuations are pre-empted with the enriched suggestion message, and variant-key resume matching flips or rejects the parent (`v2ResumeViolation()` / `v2CounterpartAlias()`) before v2 core's bare bogus-id error can surface; a parent-directory file watcher triggers a debounced `ctx.agent.reload()` so sidecar edits apply live
 - Depends on: `src/config.ts` (shared pure helpers; v1 parity via `composeVariantPatch` = the v1 `liveRoute` overlay order)
 - Used by: `src/server.ts` (v2 `setup` export) and Config Studio's embedded v2 composition
 
@@ -49,14 +52,14 @@
 **Config & Schema Layer:**
 - Purpose: Defines Zod schemas for sidecar config, backup journal, and patches; loads/saves JSONC config; validates model references
 - Location: `src/config.ts`
-- Contains: Zod schemas (`SidecarConfig`, `Patch`, `Variant`, `ModelShortcut`, `Profile`, `ProfilePatch`, `BackupJournal`), config I/O, model catalog builder, diagnostics engine, template rendering, selection presets, profile overlay resolution and lens helpers
+- Contains: Zod schemas (`SidecarConfig` with per-agent `disable` / `disable_base` flags and the `taskValidation` tuning block, `Patch`, `Variant`, `ModelShortcut`, `Profile`, `ProfilePatch`, `BackupJournal`), config I/O, model catalog builder, diagnostics engine (including base-only disable reachability warnings), template rendering, selection presets, profile overlay resolution and lens helpers, and the unknown-task-id suggestion builder (`buildUnknownTaskIdMessage()`, `levenshteinWithin()`)
 - Depends on: `zod`, `comment-json`, `node:crypto`, `node:fs`, `node:path`, `node:os`
 - Used by: `src/index.ts`, `src/v2-server.ts`, `src/v2-tui.ts`, `src/tui.tsx`, and `src/wizard.tsx`
 
 **TUI Plugin (Wizard UI):**
 - Purpose: Interactive terminal UI for creating, editing, and managing agent variants, model presets, and profiles
 - Location: `src/tui.tsx` (thin plugin entry) and `src/wizard.tsx` (wizard library)
-- Contains: `tui.tsx` registers the palette/slash command and bootstraps the wizard with standalone save behavior; `wizard.tsx` holds every dialog, flow, and screen (menus, field editors, profile editing lens, backup browser, diagnostics viewer, selection preset picker) plus embed-facing exports (`mainMenu`, `WizardHost`, `FieldListDialog`, `THEME_COLORS`, `agentMode`, `generatedAliasSet`); `src/palette-category.ts` provides a process-wide palette category registry so sibling Mirrowel plugins render one combined palette section
+- Contains: `tui.tsx` registers the palette/slash command and bootstraps the wizard with standalone save behavior; `wizard.tsx` holds every dialog, flow, and screen (menus, field editors, profile editing lens, backup browser, diagnostics viewer, selection preset picker, parent disable submenu with full vs base-only choice, task-id suggestion settings screen) plus embed-facing exports (`mainMenu`, `WizardHost`, `FieldListDialog`, `THEME_COLORS`, `agentMode`, `generatedAliasSet`); `src/palette-category.ts` provides a process-wide palette category registry so sibling Mirrowel plugins render one combined palette section
 - Depends on: `src/config.ts`, `src/palette-category.ts`, `@opencode-ai/plugin/tui`, `@opentui/solid`, `solid-js`
 - Used by: OpenCode TUI runtime via the compiled `dist/tui.js` target of the `"tui"` export in `package.json`; the `"wizard"` export (`dist/wizard.js`) is consumed by embedding hosts (e.g. Config Studio) that drive the flows with their own `TuiPluginApi` and stage saves through `WizardHost`
 
@@ -77,23 +80,26 @@
 4. `assembleAgents()` merges parent patches, variant patches, model presets, and auto-inferred selection-guidance descriptions into `cfg.agent` entries — `src/index.ts`, `src/config.ts`
 5. Parent descriptions get appended variant alias list and selection guidance via `generatedParentDescription()` when variants exist — `src/index.ts`, `src/config.ts`
 6. Generated aliases are registered as virtual routes with metadata-based routing (built-ins) or cloned agents (custom agents) — `src/index.ts`
-7. Shape diagnostics (malformed `provider/model` references, conflicts, alias collisions, disabled entries) are emitted immediately; patches with shape errors have their model fields stripped — `src/index.ts`, `src/config.ts`
-8. `refreshMergedCatalog()` asynchronously fetches OpenCode's merged provider catalog via `client.provider.list` (falling back to `client.config.providers`) with retry backoff, then runs existence validation against it — `src/index.ts`
-9. `flushDiagnosticQueue()` delivers deferred diagnostics as warning toasts with retry support (toasts can be undeliverable before the TUI is ready) — `src/index.ts`
+7. Parents with `disable_base`, and config-hidden parents that have at least one enabled variant, are marked `hidden` and collected in `hiddenBaseParents`; variant copies have any inherited `hidden` stripped so only the base leaves the task list — `src/index.ts`
+8. Shape diagnostics (malformed `provider/model` references, conflicts, alias collisions, disabled entries, base-only disable reachability) are emitted immediately; patches with shape errors have their model fields stripped — `src/index.ts`, `src/config.ts`
+9. `refreshMergedCatalog()` asynchronously fetches OpenCode's merged provider catalog via `client.provider.list` (falling back to `client.config.providers`) with retry backoff, then runs existence validation against it — `src/index.ts`
+10. `flushDiagnosticQueue()` delivers deferred diagnostics as warning toasts with retry support (toasts can be undeliverable before the TUI is ready) — `src/index.ts`
 
 **Variant Call Routing (Runtime):**
 
 1. `tool.execute.before` hook intercepts `task` tool calls targeting a variant alias — `src/index.ts`
-2. `liveRoute()` re-validates the variant against current sidecar config (hot reload): the active profile is resolved from the primary session's current model (or manual pin) and its parent/variant overlays are stacked on the global default before computing the effective patch; shape validation always runs; existence validation runs only when the merged provider catalog is available — `src/index.ts`
-3. A pending route is stored by task call ID; when `routing.prompt_markers` is enabled, a legacy HTML marker token is also injected as fallback — `src/index.ts`
-4. `subagent_type` is rewritten to the parent agent so OpenCode routes to the correct agent — `src/index.ts`
-5. `chat.message` correlates child session → parent task part via `correlateTaskRoute()`, which looks up the route by parent task call ID (`byCall`), pending entry, or metadata alias, with retry-delayed parent-context discovery (`findParentTaskContext()`); correlation is fail-closed — a miss returns an authoritative-miss and does not fall back to prompt heuristics; legacy marker extraction (`takeMarkerRoute`) remains as an opt-in fallback when `routing.prompt_markers` is enabled — `src/index.ts`
-6. `applyMessageModel()` sets the provider/model/variant on the response message — `src/index.ts`
-7. When no variant route matched but the child is a provable base task call (parent task part exists, no variant alias in metadata), `applyProfileBaseParent()` resolves the active profile and applies its parent model patch to the child message so non-variant children still honor profile overrides — `src/index.ts`
-8. `chat.params` hook patches temperature, top_p, and options on API requests — `src/index.ts`
-9. `experimental.chat.system.transform` hook patches the system prompt with variant prepend/append — `src/index.ts`
-10. `tool.execute.after` hook stores minimal internal metadata (`agentVariants.alias`, `agentVariants.routedAgent`), scrubs all routing artifacts from task output, and clears the route's session bindings so later continuations resolve their own model — `src/index.ts`
-11. `experimental.chat.messages.transform` strips route markers and routing metadata from replayed chat history before any model sees it; when stored task parts contain residual artifacts, they are repaired via the session message API with read-back verification, and only completed task parts are ever rewritten (a running or unknown-status part is left untouched and retried) — `src/index.ts`
+2. Continuation ids are validated before routing: `task_id` (v1) / `sessionID` (v2) must resolve to an existing session owned by the calling session (v1 shape-checks the payload because a missing session can surface as an error envelope without `data`, which reads as truthy); an unresolvable id throws `buildUnknownTaskIdMessage()` — a tiered fuzzy/prefix-aligned match against the calling session's children that proposes a corrected id and appends the recent subagent list — instead of silently degrading to a fresh task, and foreign-parent sessions are rejected too — `src/index.ts`, `src/config.ts`
+3. Variant-key resume matching runs for guarded continuations (a resolved variant route or a hidden-base target): the child's recorded variant alias is read from tail-windowed task-part metadata and the parent may only flip when the variant key matches (`explore-seek` <-> `general-seek`); a cross-key resume throws with the recorded alias and its counterpart, a base resume of a variant child offers the requested parent's same-key variant, and a child without reachable metadata fails open — `src/index.ts`
+4. `liveRoute()` re-validates the variant against current sidecar config (hot reload): the active profile is resolved from the primary session's current model (or manual pin) and its parent/variant overlays are stacked on the global default before computing the effective patch; shape validation always runs; existence validation runs only when the merged provider catalog is available — `src/index.ts`
+5. A pending route is stored by task call ID; when `routing.prompt_markers` is enabled, a legacy HTML marker token is also injected as fallback — `src/index.ts`
+6. `subagent_type` is rewritten to the parent agent so OpenCode routes to the correct agent — `src/index.ts`
+7. `chat.message` correlates child session → parent task part via `correlateTaskRoute()`, which looks up the route by parent task call ID (`byCall`), pending entry, or metadata alias, with retry-delayed parent-context discovery (`findParentTaskContext()`); correlation is fail-closed — a miss returns an authoritative-miss and does not fall back to prompt heuristics; legacy marker extraction (`takeMarkerRoute`) remains as an opt-in fallback when `routing.prompt_markers` is enabled — `src/index.ts`
+8. `applyMessageModel()` sets the provider/model/variant on the response message — `src/index.ts`
+9. When no variant route matched but the child is a provable base task call (parent task part exists, no variant alias in metadata), `applyProfileBaseParent()` resolves the active profile and applies its parent model patch to the child message so non-variant children still honor profile overrides — `src/index.ts`
+10. `chat.params` hook patches temperature, top_p, and options on API requests — `src/index.ts`
+11. `experimental.chat.system.transform` hook patches the system prompt with variant prepend/append — `src/index.ts`
+12. `tool.execute.after` hook stores minimal internal metadata (`agentVariants.alias`, `agentVariants.routedAgent`), scrubs all routing artifacts from task output, and clears the route's session bindings so later continuations resolve their own model — `src/index.ts`
+13. `experimental.chat.messages.transform` strips route markers and routing metadata from replayed chat history before any model sees it; when stored task parts contain residual artifacts, they are repaired via the session message API with read-back verification, and only completed task parts are ever rewritten (a running or unknown-status part is left untouched and retried) — `src/index.ts`
 
 **Wizard Config Editing:**
 
@@ -120,8 +126,18 @@
 - Location: `src/index.ts`
 - Pattern: In-memory lookup object stored in `virtualRoutes`, `pending`, `bySession`, and `byCall` maps; session bindings are tracked on the route (`boundSessions`) and cleared in `tool.execute.after` so post-call messages to a subagent session never inherit a stale route
 
+**HiddenBaseParents:**
+- Purpose: The set of sidecar-managed parents whose base is hidden so only their variants are directly callable
+- Location: `src/index.ts` (`__testAssembleAgents()` return) and `src/v2-server.ts` (`V2Assembly.hiddenBaseParents`)
+- Pattern: Populated from the agent entry's `disable_base` or from a config-hidden parent that has at least one enabled variant (so an agent can never become unreachable and unmanaged hidden agents are never touched); v1 additionally sets `hidden` on the parent definition and deletes inherited `hidden` from variant copies, while v2 sets `hidden` on the parent clone; the before-hook rejects fresh direct calls with the enabled-variant list and permits only resumes whose recorded variant key matches the request (v1 reads the AV alias from tail-windowed task-part metadata, v2 compares the child session's `agent`), offering the requested parent's same-key counterpart and failing open when the child's metadata is unreachable
+
+**TaskCandidate:**
+- Purpose: A subagent session of the calling session surfaced in the enriched unknown-task-id rejection
+- Location: `src/config.ts` (type `TaskCandidate`; `buildUnknownTaskIdMessage()`, `levenshteinWithin()`); collected by `fetchTaskCandidates()` in `src/index.ts` and `fetchV2TaskCandidates()` in `src/v2-server.ts`
+- Pattern: `buildUnknownTaskIdMessage()` tiers candidates — a prefix-aligned id (strict truncation or hallucinated tail) is confident within the whole configured distance, within `min(2, typoDistance)` edits is confident, within `typoDistance` is a hedged "verify the title"; it always appends the newest-first recent-session list capped at `suggestLimit`, and either feature turns off at 0
+
 **SidecarConfig:**
-- Purpose: The top-level configuration schema for the plugin, containing agents, model presets, profiles, UI settings, and debug flag
+- Purpose: The top-level configuration schema for the plugin, containing agents, model presets, profiles, UI settings, task-id suggestion tuning, and debug flag
 - Location: `src/config.ts` (Zod `SidecarConfig` schema)
 - Pattern: Zod-validated JSONC config loaded from `~/.config/opencode/agent-variants.jsonc`; a JSON Schema (`schema.json`) is generated from the Zod schema for editor validation/autocomplete
 
@@ -178,6 +194,8 @@
 
 - Malformed model references (shape errors) are stripped from patches at assembly time and the variant is skipped with an immediate warning toast; provider/model existence errors are reported asynchronously after the merged provider catalog is available, and invalid hot-reloaded variants fail before execution once the catalog is ready
 - Alias conflicts (duplicate names, parent name collision) skip the variant with an error toast
+- Unresolvable `task_id` continuations throw the enriched `Unknown task id "<id>"` message: a tiered fuzzy/prefix-aligned match proposes the corrected id (or reports the full id when the given one looks truncated) and appends the calling session's recent subagent sessions, because v1's task tool would otherwise silently create a fresh session and make a hallucinated id indistinguishable from a resume; continuations whose session belongs to a different parent are rejected too
+- Fresh direct calls to a base-disabled parent fail with the enabled-variant list. A continuation whose recorded variant key differs from the requested variant is rejected with the recorded alias and its same-key counterpart (v1 matches the AV alias in tail-windowed task-part metadata; v2 compares the child session's `agent`), and a base resume of a variant child is redirected to that variant's alias or the requested parent's same-key counterpart
 - Hot-reload validation (`liveRoute()`) throws errors that surface as task call failures
 - All host client interactions (session lookups, toast delivery, provider catalog fetches) run through `safeClientCall()` with an enforced timeout (3s) and swallowed errors so the plugin never blocks the host
 - Debug log writes are wrapped in try/catch to prevent I/O errors from affecting routing
@@ -187,7 +205,7 @@
 
 **Logging:** Debug mode writes to `~/.config/opencode/agent-variants.debug.log` and shows toast notifications only while enabled. Controlled by `sidecar.debug` flag or runtime toggle in wizard, and hot-read by server hooks. User-visible warnings and errors are additionally captured to the same log unconditionally via `alwaysLog()` so anomaly evidence never depends on the debug switch.
 
-**Caching:** OpenCode caches the task list at startup. Structural changes (add/delete/disable variant, description, color) require restart. Runtime fields (model, prompt, temperature, top_p, options) hot-reload per call. Profile overlays apply per task call with no restart.
+**Caching:** OpenCode caches the task list at startup. Structural changes (add/delete/disable variant, description, color, base-only disable) require restart. Runtime fields (model, prompt, temperature, top_p, options) hot-reload per call. Profile overlays apply per task call with no restart.
 
 **Palette Category:** Sibling Mirrowel plugins loaded in the same session share one combined palette section via the process-wide registry in `src/palette-category.ts`. Each plugin declares its label at TUI activation; a delayed reconciler joins all labels (alphabetical, deterministic) and stamps both `category` (v1 command objects) and `group` (v2 keymap commands) on every registered command.
 
