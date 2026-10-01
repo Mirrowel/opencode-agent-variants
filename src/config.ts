@@ -1167,21 +1167,58 @@ function describeCandidateAge(candidate: TaskCandidate): string {
 /** Strips AV's trailing " (@alias variant)" title annotation, returning the
  * clean title and the alias (when the complete annotation is present). */
 function splitTitleAnnotation(title: string): { title: string; alias?: string } {
-  const alias = parseVariantAnnotation(title)
-  if (!alias) return { title }
-  return { title: title.slice(0, title.length - ` (@${alias} variant)`.length), alias }
+  const parsed = parseVariantAnnotation(title)
+  if (!parsed) return { title }
+  return { title: stripVariantNotes(title), alias: parsed.alias }
 }
 
-/** Extracts the alias from a trailing " (@alias variant)" annotation - the
- * marker AV's hooks append to task descriptions (before-hook, persists
- * through aborts) and titles (after-hook repair). Read-side source for
- * candidate attribution and the variant-key resume guard: aborted parts
- * never receive their agentVariants metadata (the repair only writes
- * terminal parts), but the annotation survives. */
-export function parseVariantAnnotation(text: string | undefined): string | undefined {
-  const match = typeof text === "string" ? text.match(/\s+\(@(\S+) variant\)$/) : undefined
-  return match ? match[1] : undefined
+/** One annotation token in any historical form:
+ *   legacy  " (@general-light variant)"
+ *   terse   " (@general-light)"
+ *   switch  " (@general-light ← general-seek)"
+ * Aliases may contain spaces (custom variant names); a token always opens
+ * with "(@", so ordinary parentheticals never match. */
+const ANNOTATION_TOKEN = /\(@\s*([^()@←]*?)\s*(?:\s+variant)?\s*(?:\s*←\s*([^()@←]*?))?\s*\)/g
+
+export type VariantAnnotation = { alias: string; switchedFrom?: string }
+
+/** Extracts the variant annotation from a text - the LAST token wins (with
+ * parroted stacks the newest append is ours). Reads every historical form;
+ * titles may carry none. */
+export function parseVariantAnnotation(text: string | undefined): VariantAnnotation | undefined {
+  if (typeof text !== "string") return undefined
+  let last: VariantAnnotation | undefined
+  for (const match of text.matchAll(ANNOTATION_TOKEN)) {
+    const alias = (match[1] ?? "").trim()
+    if (alias === "") continue
+    const switchedFrom = (match[2] ?? "").trim()
+    last = switchedFrom === "" ? { alias } : { alias, switchedFrom }
+  }
+  return last
 }
+
+/** Removes EVERY annotation token (all forms, any position). Models learn
+ * the suffix from our appends and parrot it themselves; the writer strips
+ * the whole stack and appends one canonical token, so titles can never grow
+ * "(@x) (@x variant) (@x variant)" loops. */
+export function stripVariantNotes(text: string | undefined): string {
+  if (typeof text !== "string") return ""
+  return text
+    .replace(ANNOTATION_TOKEN, "")
+    .replace(/\s{2,}/g, " ")
+    .trim()
+}
+
+/** The canonical annotation the hooks append - terse by design (the legacy
+ * "variant" wording taught models to parrot it). */
+export function formatVariantNote(alias: string, switchedFrom?: string): string {
+  return switchedFrom === undefined || switchedFrom === "" ? `(@${alias})` : `(@${alias} ← ${switchedFrom})`
+}
+
+/** Teaching line appended to cross-variant resume rejections: the explicit
+ * opt-in that unlocks a deliberate switch. The flag is model-authored, never
+ * consumed and never scrubbed - its replay is the model's own evidence. */
+export const SWITCH_VARIANT_HINT = ` To switch variants deliberately, retry with "switch_variant": true.`
 
 /** Word-boundary truncation: never cuts mid-token, and drops a dangling
  * incomplete "(@..." fragment when the cut lands inside an annotation. */

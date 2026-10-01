@@ -39,6 +39,7 @@ import {
   applyTextPatch,
   baseDisabledUnderDrift,
   buildUnknownTaskIdMessage,
+  SWITCH_VARIANT_HINT,
   defaultConfigDir,
   defaultSidecarPath,
   debugLogPath,
@@ -736,7 +737,7 @@ export function v2ResumeViolation(
   const flips = [...assembly.aliases.values()]
     .filter((route) => route.key === child.key && route.alias !== child.alias)
     .map((route) => route.alias)
-  return `Task ${continuation} ran variant "${child.alias}" (variant "${child.key}") - resume it with "${child.alias}"${flips.length > 0 ? ` or its counterpart "${flips.join('", "')}"` : ""}, not "${requested.alias}" (variant "${requested.key}").`
+  return `Task ${continuation} ran variant "${child.alias}" (variant "${child.key}") - resume it with "${child.alias}"${flips.length > 0 ? ` or its counterpart "${flips.join('", "')}"` : ""}, not "${requested.alias}" (variant "${requested.key}").${SWITCH_VARIANT_HINT}`
 }
 
 export function createV2ServerSetup(): V2ServerSetup {
@@ -848,7 +849,11 @@ export function createV2ServerSetup(): V2ServerSetup {
         }
         // Variant-key resume matching: same-key parent flips allowed,
         // different-key variant resumes rejected with the counterpart hint.
-        const violation = v2ResumeViolation(continuation, args.agent, child.agent, assembly)
+        // The switch_variant opt-in unlocks a deliberate cross-key switch;
+        // the flag is left in the input untouched (v2 persists the raw
+        // pre-hook input, so the model's replay keeps its own evidence).
+        const switchOptIn = (args as { switch_variant?: unknown }).switch_variant === true || (args as { switch_variant?: unknown }).switch_variant === "true"
+        const violation = switchOptIn ? undefined : v2ResumeViolation(continuation, args.agent, child.agent, assembly)
         if (violation) throw new Error(violation)
       }
       let profile: { name: string } | undefined

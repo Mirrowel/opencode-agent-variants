@@ -1298,6 +1298,40 @@ async function testDisableBase() {
       )
       await hooks["tool.execute.before"](...call("f8", { subagent_type: "general-bunny", prompt: "x", task_id: "ses_aborted_child" }))
       await hooks["tool.execute.before"](...call("f9", { subagent_type: "explore-bunny", prompt: "x", task_id: "ses_aborted_child" }))
+      // Deliberate switch opt-in: cross-key + switch_variant is ALLOWED, the
+      // flag survives in the args (never consumed), and the description
+      // carries the terse switch note.
+      {
+        const switchArgs = { subagent_type: "general-light", prompt: "x", description: "Continue the review", task_id: "ses_seek_child", switch_variant: true }
+        await hooks["tool.execute.before"](...call("f10", switchArgs))
+        assert(switchArgs.switch_variant === true, "switch_variant is never consumed from the args")
+        assert(switchArgs.description === "Continue the review (@general-light ← explore-seek)", `deliberate switch annotates terse switch note (got ${switchArgs.description})`)
+        assert(switchArgs.subagent_type === "general", "execution continues as the parent (v1 virtual-agent design)")
+      }
+      // Without the flag the rejection now teaches the opt-in.
+      {
+        let message
+        try {
+          await hooks["tool.execute.before"](...call("f11", { subagent_type: "general-light", prompt: "x", task_id: "ses_seek_child" }))
+          message = ""
+        } catch (error) {
+          message = String(error?.message)
+        }
+        assert(message.includes(`retry with "switch_variant": true`), `cross-key rejection teaches the opt-in (got ${message})`)
+      }
+      // The opt-in never unlocks a BASE resume of a variant child.
+      await expectRejection(
+        "switch_variant does not unlock base resumes",
+        /belongs to variant "explore-seek"/,
+        call("f12", { subagent_type: "general", prompt: "x", task_id: "ses_seek_child", switch_variant: true }),
+      )
+      // Parrot-proof description: a model-learned stack collapses to exactly
+      // one canonical terse note.
+      {
+        const parrotArgs = { subagent_type: "general-light", prompt: "x", description: "Review again (@general-light) (@general-light variant)" }
+        await hooks["tool.execute.before"](...call("f13", parrotArgs))
+        assert(parrotArgs.description === "Review again (@general-light)", `parrot stack collapses to one note (got ${parrotArgs.description})`)
+      }
     } finally {
       process.env.USERPROFILE = realProfile
       process.env.HOME = realHome
@@ -1422,8 +1456,8 @@ async function testDisableBase() {
     assert(!v2ResumeViolation("t2", "explore-seek", "explore-seek", assembly), "v2: same-alias resume allowed")
     const mismatch = v2ResumeViolation("t3", "general-light", "explore-seek", assembly)
     assert(
-      mismatch && /Task t3 ran variant "explore-seek" \(variant "seek"\) - resume it with "explore-seek" or its counterpart "general-seek", not "general-light" \(variant "light"\)/.test(mismatch),
-      `v2: cross-key resume rejected with counterpart hint (got ${mismatch})`,
+      mismatch && /Task t3 ran variant "explore-seek" \(variant "seek"\) - resume it with "explore-seek" or its counterpart "general-seek", not "general-light" \(variant "light"\)\. To switch variants deliberately, retry with "switch_variant": true\.$/.test(mismatch),
+      `v2: cross-key resume rejected with counterpart hint + switch opt-in teaching (got ${mismatch})`,
     )
     assert(!v2ResumeViolation("t4", "general-light", undefined, assembly), "v2: base children fail open")
     assert(!v2ResumeViolation("t5", "general-light", "historian", assembly), "v2: non-AV agents fail open")
@@ -1490,7 +1524,7 @@ async function testDisableBase() {
       // the alias on the persisted input - it reads as the variant call.
       const reroutedArgs = { subagent_type: "explore", prompt: "x", description: "probe" }
       await hooks["tool.execute.before"]({ tool: "task", sessionID: "ses_parent", callID: "fb1" }, { args: reroutedArgs })
-      assert(reroutedArgs.description.includes("(@explore-seek variant)"), `rerouted call is annotated as the variant (got ${reroutedArgs.description})`)
+      assert(reroutedArgs.description.includes("(@explore-seek)"), `rerouted call is annotated as the variant (got ${reroutedArgs.description})`)
       assert(reroutedArgs.subagent_type === "explore", `execution agent is the parent, like a direct variant call (got ${reroutedArgs.subagent_type})`)
       await hooks["tool.execute.after"]({ tool: "task", sessionID: "ses_parent", callID: "fb1", args: reroutedArgs }, { title: "t", output: "ok" })
       assert(reroutedArgs.subagent_type === "explore-seek", `persisted input reads as the default variant call (got ${reroutedArgs.subagent_type})`)
@@ -2051,14 +2085,27 @@ async function testCandidateAttribution() {
     const aliases = await __testInternals.collectTaskAliases(fakeClient, "C:/x", "ses_parent")
     if (aliases.get("ses_f098cfccdffeAY8MUiLwdTc5Gv") !== "general-bunny") throw new Error(`aborted part attributes via its description annotation (got ${[...aliases.entries()].map(([k, v]) => `${k}=${v}`).join(", ")})`)
   }
-  // parseVariantAnnotation: only a COMPLETE trailing annotation matches -
-  // partial "(@..." fragments (title truncation) never attribute.
+  // parseVariantAnnotation: all historical forms, last token wins, complete
+  // tokens only - partial "(@..." fragments (title truncation) never parse.
   {
-    const { parseVariantAnnotation } = await import("../dist/config.js")
-    if (parseVariantAnnotation("Run (@general-seek variant)") !== "general-seek") throw new Error("complete annotation parses")
-    if (parseVariantAnnotation("Run (@general-se…") !== undefined) throw new Error("partial annotation never parses")
-    if (parseVariantAnnotation("no annotation") !== undefined) throw new Error("plain descriptions never parse")
-    if (parseVariantAnnotation(undefined) !== undefined) throw new Error("undefined tolerated")
+    const { parseVariantAnnotation, stripVariantNotes, formatVariantNote } = await import("../dist/config.js")
+    assert(parseVariantAnnotation("Run (@general-seek variant)")?.alias === "general-seek", "legacy form parses")
+    assert(parseVariantAnnotation("Run (@general-seek)")?.alias === "general-seek", "terse form parses")
+    const sw = parseVariantAnnotation("Run (@general-light ← general-seek)")
+    assert(sw?.alias === "general-light" && sw?.switchedFrom === "general-seek", "switch form parses with switchedFrom")
+    assert(parseVariantAnnotation("Custom name (@Deep Research variant)")?.alias === "Deep Research", "spaced alias parses")
+    const stack = parseVariantAnnotation("Run (@general-light) (@explore-seek variant)")
+    assert(stack?.alias === "explore-seek", "last token wins on parroted stacks")
+    assert(parseVariantAnnotation("Run (@general-se…") === undefined, "partial token never parses")
+    assert(parseVariantAnnotation("no annotation") === undefined, "plain text never parses")
+    assert(parseVariantAnnotation(undefined) === undefined, "undefined tolerated")
+    assert(stripVariantNotes("Run (@a) (@b variant) (@c ← d) end") === "Run end", "strip removes every form incl. stacks")
+    assert(stripVariantNotes("Email me(@home) now") === "Email me now", "strip collapses spacing after mid-text tokens")
+    assert(formatVariantNote("general-light") === "(@general-light)", "terse note format")
+    assert(formatVariantNote("general-light", "general-seek") === "(@general-light ← general-seek)", "switch note format")
+    const once = `${stripVariantNotes("Review (@general-light) (@general-light variant)")} ${formatVariantNote("general-light")}`
+    const twice = `${stripVariantNotes(once)} ${formatVariantNote("general-light")}`
+    assert(once === twice && once === "Review (@general-light)", "writer is idempotent (parrot stack collapses to one note)")
   }
 }
 

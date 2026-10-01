@@ -27,6 +27,9 @@ import {
   resolveModel,
   saveSidecar,
   splitModelRef,
+  stripVariantNotes,
+  formatVariantNote,
+  SWITCH_VARIANT_HINT,
   templateContext,
   validateModel,
   validateModelShape,
@@ -51,6 +54,9 @@ type RuntimeRoute = {
   model?: string
   variant?: string
   base?: AgentPatch
+  /** Recorded alias a deliberate switch_variant resume switched FROM - the
+   * title/description note renders "(@alias ← switchedFrom)". */
+  switchedFrom?: string
   /** Name of the profile whose overlay shaped this route, if any. */
   profile?: string
   /** Count of child messages this route's model override was applied to. */
@@ -81,6 +87,9 @@ const ROUTE_MARKER_RE = /<!--\s*agent-variants-route([\s\S]*?)-->/g
 const ROUTE_ATTR_RE = /\s+(?:agent_variant|routed_agent|parent_agent|effective_model|model_variant)="[^"]*"/g
 const ROUTE_STANDALONE_RE = /\n?\s*<agent_variant\b[^>]*\/?>\s*\n?/g
 const ROUTE_ARG_FRAGMENT_RE = /\s*(?:selected_alias|agent_variant|routed_agent|parent_agent|effective_model|model_variant)=(?:"[^"]*"|\\"[^\\]*\\")/g
+// NEVER add "switch_variant" here: it is model-authored (the deliberate
+// variant-switch opt-in) and must survive scrubbing so the model's replay
+// keeps the evidence it asked for the switch.
 const PLUGIN_ARG_KEYS = ["selected_alias", "agent_variant", "routed_agent", "parent_agent", "effective_model", "model_variant"] as const
 const LIVE_REPAIR_DELAYS = [0, 100, 400, 1500, 3000, 4000]
 const TOAST_TIMEOUT = 1500
@@ -151,7 +160,7 @@ function metadataAlias(metadata: unknown, routes?: Map<string, RuntimeRoute>) {
 function partAlias(part: unknown, routes?: Map<string, RuntimeRoute>) {
   return (
     metadataAlias((part as { state?: { metadata?: unknown } })?.state?.metadata, routes) ??
-    validAlias(parseVariantAnnotation((part as { state?: { input?: { description?: string } } })?.state?.input?.description), routes)
+    validAlias(parseVariantAnnotation((part as { state?: { input?: { description?: string } } })?.state?.input?.description)?.alias, routes)
   )
 }
 
@@ -710,7 +719,7 @@ async function fetchTaskCandidates(client: any, directory: string | undefined, p
  * whose task part sits deep in the parent's history still attribute
  * (a child resumed hours later sorts to the top by update time while its
  * part may be pages back). Fail-soft: errors -> empty map. */
-async function collectTaskAliases(client: any, directory: string | undefined, parentSessionID: string): Promise<Map<string, string>> {
+async function collectTaskAliases(client: any, directory: string | undefined, parentSessionID: string, validAliases?: Set<string>): Promise<Map<string, string>> {
   const map = new Map<string, string>()
   const namespace = client?.session
   if (typeof namespace?.messages !== "function" || !directory) return map
@@ -730,12 +739,21 @@ async function collectTaskAliases(client: any, directory: string | undefined, pa
         const child = typeof metadata?.sessionId === "string" ? metadata.sessionId : undefined
         if (typeof child !== "string" || child === "") continue
         if (map.has(child)) continue
-        // Two alias sources: the after-hook metadata stamp (completed parts)
-        // and the before-hook description annotation - the annotation
-        // persists at call time, so ABORTED/error parts (which the repair
-        // never stamps) still attribute.
-        const alias = typeof metadata?.agentVariants?.alias === "string" ? metadata.agentVariants.alias : parseVariantAnnotation(part?.state?.input?.description)
-        if (typeof alias === "string" && alias !== "") map.set(child, alias)
+        // Two alias sources: the after-hook metadata stamp (completed parts,
+        // always trusted) and the before-hook description annotation - the
+        // annotation persists at call time, so ABORTED/error parts (which
+        // the repair never stamps) still attribute. Description-parsed
+        // aliases are validated against the live route map when provided: a
+        // user-authored "(@x)" inside a prompt must never mis-attribute.
+        const stamped = metadata?.agentVariants?.alias
+        let alias: string | undefined
+        if (typeof stamped === "string" && stamped !== "") {
+          alias = stamped
+        } else {
+          const parsed = parseVariantAnnotation(part?.state?.input?.description)?.alias
+          alias = parsed !== undefined && (validAliases === undefined || validAliases.has(parsed)) ? parsed : undefined
+        }
+        if (alias !== undefined) map.set(child, alias)
       }
     }
     if (result.length < PAGE_SIZE) break
@@ -1542,6 +1560,10 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
         description?: string
         sessionID?: string
         task_id?: string
+        /** Model-authored opt-in for a deliberate cross-variant resume
+         * (taught by the rejection message). Unknown to the tool schema;
+         * never consumed, never scrubbed. */
+        switch_variant?: boolean | string
       }
       if (!args?.subagent_type || !args.prompt) return
       const continuationArg = args.task_id ?? args.sessionID
@@ -1572,6 +1594,9 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
       // indistinguishable from a resume. Reject instead: the id must address
       // an existing child of the calling session. v2's subagent tool
       // enforces this natively (not-found + parent check).
+      // Set when a deliberate cross-variant switch passes the guard: the
+      // route's title/description note becomes "(@new ← old)".
+      let deliberateSwitchFrom: string | undefined
       if (continuation) {
         const info = await getSession(input.client, continuation)
         // Shape-validate: a missing session surfaces either as an SDK throw
@@ -1587,7 +1612,7 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
           // exactly how the model guesses wrong.
           const [candidates, aliases] = await Promise.all([
             fetchTaskCandidates(input.client, input.directory, hookInput.sessionID),
-            collectTaskAliases(input.client, input.directory, hookInput.sessionID),
+            collectTaskAliases(input.client, input.directory, hookInput.sessionID, new Set(virtualRoutes.keys())),
           ])
           attributeCandidates(candidates, aliases, variantModelNames(sidecar))
           throw new Error(
@@ -1621,12 +1646,22 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
           if (recordedAlias && recordedKey !== undefined) {
             if (staticRoute) {
               if (staticRoute.key !== recordedKey) {
-                const flips = [...virtualRoutes.values()]
-                  .filter((route) => route.key === recordedKey && route.alias !== recordedAlias)
-                  .map((route) => route.alias)
-                throw new Error(
-                  `Task ${continuation} ran variant "${recordedAlias}" (variant "${recordedKey}") - resume it with "${recordedAlias}"${flips.length > 0 ? ` or its counterpart "${flips.join('", "')}"` : ""}, not "${staticRoute.alias}" (variant "${staticRoute.key}").`,
-                )
+                // Deliberate switch opt-in: the model passed switch_variant
+                // after being taught by the rejection below. The flag is
+                // model-authored, so it is NEVER consumed or scrubged - its
+                // replay is the model's own evidence that the switch was
+                // requested (and the title note marks it for skimmers).
+                if (args.switch_variant === true || args.switch_variant === "true") {
+                  deliberateSwitchFrom = recordedAlias
+                  debugLog(debugEnabled(), "Agent variant deliberate switch", `${continuation}: ${recordedAlias} -> ${staticRoute.alias} (switch_variant opt-in)`)
+                } else {
+                  const flips = [...virtualRoutes.values()]
+                    .filter((route) => route.key === recordedKey && route.alias !== recordedAlias)
+                    .map((route) => route.alias)
+                  throw new Error(
+                    `Task ${continuation} ran variant "${recordedAlias}" (variant "${recordedKey}") - resume it with "${recordedAlias}"${flips.length > 0 ? ` or its counterpart "${flips.join('", "')}"` : ""}, not "${staticRoute.alias}" (variant "${staticRoute.key}").${SWITCH_VARIANT_HINT}`,
+                  )
+                }
               }
               // Same variant key under another parent: the flip is allowed -
               // the child re-routes onto the requested parent's variant.
@@ -1692,8 +1727,13 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
       // zero parent-history fetches (deterministic regardless of size).
       if (continuation) bindSessionRoute(bySession, continuation, route)
       pending.push(callRoute as PendingRoute)
-      if (args.description && !args.description.includes(`@${route.alias} variant`)) {
-        args.description = `${args.description} (@${route.alias} variant)`
+      if (deliberateSwitchFrom !== undefined) (route as RuntimeRoute).switchedFrom = deliberateSwitchFrom
+      if (args.description) {
+        // Canonical annotation: strip every existing token (models parrot
+        // the suffix they learned from earlier appends - the strip keeps
+        // stacks from growing) and append exactly one terse note.
+        const clean = stripVariantNotes(args.description)
+        args.description = clean === "" ? formatVariantNote(route.alias, route.switchedFrom) : `${clean} ${formatVariantNote(route.alias, route.switchedFrom)}`
       }
       if (token) args.prompt = `${args.prompt}\n\n${marker(token, route)}`
       args.subagent_type = route.targetAgent
@@ -1739,9 +1779,11 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
         args.subagent_type = route.alias
       }
       const cleanedArgs = scrubTaskInput(hookInput.args, { routes: virtualRoutes }, route.alias)
-      const variantSuffix = ` (@${route.alias} variant)`
-      if (typeof output.title === "string" && !output.title.endsWith(variantSuffix)) {
-        output.title = `${output.title}${variantSuffix}`
+      if (typeof output.title === "string") {
+        // Same canonical rule as the description: strip the whole parrot
+        // stack (any historical form), append one terse note.
+        const clean = stripVariantNotes(output.title)
+        output.title = clean === "" ? formatVariantNote(route.alias, route.switchedFrom) : `${clean} ${formatVariantNote(route.alias, route.switchedFrom)}`
       }
       output.metadata = {
         ...output.metadata,
