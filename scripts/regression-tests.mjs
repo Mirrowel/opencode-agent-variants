@@ -1308,7 +1308,8 @@ async function testDisableBase() {
         assert(switchArgs.description === "Continue the review (@general-light ← explore-seek)", `deliberate switch annotates terse switch note (got ${switchArgs.description})`)
         assert(switchArgs.subagent_type === "general", "execution continues as the parent (v1 virtual-agent design)")
       }
-      // Without the flag the rejection now teaches the opt-in.
+      // Without the opt-in the rejection teaches the tag (the description is
+      // the channel that survives tool-call validation).
       {
         let message
         try {
@@ -1317,7 +1318,16 @@ async function testDisableBase() {
         } catch (error) {
           message = String(error?.message)
         }
-        assert(message.includes(`retry with "switch_variant": true`), `cross-key rejection teaches the opt-in (got ${message})`)
+        assert(message.includes(`retry with "[switch]" in the description`), `cross-key rejection teaches the description tag (got ${message})`)
+      }
+      // The "[switch]" description tag unlocks the deliberate switch - this
+      // is the channel that actually reaches the hook on real hosts (the
+      // validation layer strips non-schema args like switch_variant).
+      {
+        const tagArgs = { subagent_type: "general-light", prompt: "x", description: "Continue [switch]", task_id: "ses_seek_child" }
+        await hooks["tool.execute.before"](...call("f11b", tagArgs))
+        assert(tagArgs.description.includes("(@general-light ← explore-seek)"), `[switch] tag produces the switch note (got ${tagArgs.description})`)
+        assert(tagArgs.description.includes("[switch]"), "the tag is never consumed - replay keeps the evidence")
       }
       // The opt-in never unlocks a BASE resume of a variant child.
       await expectRejection(
@@ -1456,8 +1466,8 @@ async function testDisableBase() {
     assert(!v2ResumeViolation("t2", "explore-seek", "explore-seek", assembly), "v2: same-alias resume allowed")
     const mismatch = v2ResumeViolation("t3", "general-light", "explore-seek", assembly)
     assert(
-      mismatch && /Task t3 ran variant "explore-seek" \(variant "seek"\) - resume it with "explore-seek" or its counterpart "general-seek", not "general-light" \(variant "light"\)\. To switch variants deliberately, retry with "switch_variant": true\.$/.test(mismatch),
-      `v2: cross-key resume rejected with counterpart hint + switch opt-in teaching (got ${mismatch})`,
+      mismatch && /Task t3 ran variant "explore-seek" \(variant "seek"\) - resume it with "explore-seek" or its counterpart "general-seek", not "general-light" \(variant "light"\)\. To switch variants deliberately, retry with "\[switch\]" in the description\.$/.test(mismatch),
+      `v2: cross-key resume rejected with counterpart hint + switch tag teaching (got ${mismatch})`,
     )
     assert(!v2ResumeViolation("t4", "general-light", undefined, assembly), "v2: base children fail open")
     assert(!v2ResumeViolation("t5", "general-light", "historian", assembly), "v2: non-AV agents fail open")

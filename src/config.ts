@@ -1216,9 +1216,12 @@ export function formatVariantNote(alias: string, switchedFrom?: string): string 
 }
 
 /** Teaching line appended to cross-variant resume rejections: the explicit
- * opt-in that unlocks a deliberate switch. The flag is model-authored, never
- * consumed and never scrubbed - its replay is the model's own evidence. */
-export const SWITCH_VARIANT_HINT = ` To switch variants deliberately, retry with "switch_variant": true.`
+ * opt-in that unlocks a deliberate switch. The tag rides the DESCRIPTION
+ * (schema'd, so it survives the tool-call validation layer that strips
+ * unknown args before any hook runs) and is never consumed - its replay is
+ * the model's own evidence. */
+export const SWITCH_TAG_RE = /\[switch\]/i
+export const SWITCH_VARIANT_HINT = ` To switch variants deliberately, retry with "[switch]" in the description.`
 
 /** Word-boundary truncation: never cuts mid-token, and drops a dangling
  * incomplete "(@..." fragment when the cut lands inside an annotation. */

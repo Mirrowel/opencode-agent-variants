@@ -29,6 +29,7 @@ import {
   splitModelRef,
   stripVariantNotes,
   formatVariantNote,
+  SWITCH_TAG_RE,
   SWITCH_VARIANT_HINT,
   templateContext,
   validateModel,
@@ -1646,14 +1647,20 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
           if (recordedAlias && recordedKey !== undefined) {
             if (staticRoute) {
               if (staticRoute.key !== recordedKey) {
-                // Deliberate switch opt-in: the model passed switch_variant
-                // after being taught by the rejection below. The flag is
-                // model-authored, so it is NEVER consumed or scrubged - its
-                // replay is the model's own evidence that the switch was
-                // requested (and the title note marks it for skimmers).
-                if (args.switch_variant === true || args.switch_variant === "true") {
+                // Deliberate switch opt-in. The tool-call validation layer
+                // strips non-schema args before any hook runs, so the flag
+                // lives in the DESCRIPTION as a terse "[switch]" tag - the
+                // description provably reaches the hook (every annotation
+                // feature rides it). The raw arg form is honored too for
+                // hosts that do pass extras. Neither is consumed: the
+                // model's replay keeps its own evidence of the request.
+                const switchOptIn =
+                  args.switch_variant === true ||
+                  args.switch_variant === "true" ||
+                  SWITCH_TAG_RE.test(args.description ?? "")
+                if (switchOptIn) {
                   deliberateSwitchFrom = recordedAlias
-                  debugLog(debugEnabled(), "Agent variant deliberate switch", `${continuation}: ${recordedAlias} -> ${staticRoute.alias} (switch_variant opt-in)`)
+                  debugLog(debugEnabled(), "Agent variant deliberate switch", `${continuation}: ${recordedAlias} -> ${staticRoute.alias} ([switch] opt-in)`)
                 } else {
                   const flips = [...virtualRoutes.values()]
                     .filter((route) => route.key === recordedKey && route.alias !== recordedAlias)

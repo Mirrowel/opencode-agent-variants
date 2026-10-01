@@ -39,6 +39,7 @@ import {
   applyTextPatch,
   baseDisabledUnderDrift,
   buildUnknownTaskIdMessage,
+  SWITCH_TAG_RE,
   SWITCH_VARIANT_HINT,
   defaultConfigDir,
   defaultSidecarPath,
@@ -794,7 +795,7 @@ export function createV2ServerSetup(): V2ServerSetup {
       if (event.tool !== "subagent") return
       const input = event.input
       if (!input || typeof input !== "object") return
-      const args = input as { agent?: unknown; prompt?: unknown; sessionID?: unknown }
+      const args = input as { agent?: unknown; prompt?: unknown; sessionID?: unknown; description?: unknown }
       if (typeof args.prompt === "string" && args.prompt.includes("agent-variants-route")) {
         args.prompt = stripLegacyMarkers(args.prompt)
       }
@@ -849,10 +850,12 @@ export function createV2ServerSetup(): V2ServerSetup {
         }
         // Variant-key resume matching: same-key parent flips allowed,
         // different-key variant resumes rejected with the counterpart hint.
-        // The switch_variant opt-in unlocks a deliberate cross-key switch;
-        // the flag is left in the input untouched (v2 persists the raw
-        // pre-hook input, so the model's replay keeps its own evidence).
-        const switchOptIn = (args as { switch_variant?: unknown }).switch_variant === true || (args as { switch_variant?: unknown }).switch_variant === "true"
+        // The deliberate-switch opt-in is a "[switch]" tag in the
+        // description (schema'd field - survives tool-call validation that
+        // strips unknown args); the raw arg form is honored too. Nothing is
+        // consumed: the model's replay keeps its own evidence.
+        const rawSwitch = (args as { switch_variant?: unknown }).switch_variant
+        const switchOptIn = rawSwitch === true || rawSwitch === "true" || SWITCH_TAG_RE.test(typeof args.description === "string" ? args.description : "")
         const violation = switchOptIn ? undefined : v2ResumeViolation(continuation, args.agent, child.agent, assembly)
         if (violation) throw new Error(violation)
       }
