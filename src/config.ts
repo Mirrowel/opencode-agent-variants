@@ -1167,9 +1167,20 @@ function describeCandidateAge(candidate: TaskCandidate): string {
 /** Strips AV's trailing " (@alias variant)" title annotation, returning the
  * clean title and the alias (when the complete annotation is present). */
 function splitTitleAnnotation(title: string): { title: string; alias?: string } {
-  const match = title.match(/\s+\(@(\S+) variant\)$/)
-  if (!match) return { title }
-  return { title: title.slice(0, match.index), alias: match[1] }
+  const alias = parseVariantAnnotation(title)
+  if (!alias) return { title }
+  return { title: title.slice(0, title.length - ` (@${alias} variant)`.length), alias }
+}
+
+/** Extracts the alias from a trailing " (@alias variant)" annotation - the
+ * marker AV's hooks append to task descriptions (before-hook, persists
+ * through aborts) and titles (after-hook repair). Read-side source for
+ * candidate attribution and the variant-key resume guard: aborted parts
+ * never receive their agentVariants metadata (the repair only writes
+ * terminal parts), but the annotation survives. */
+export function parseVariantAnnotation(text: string | undefined): string | undefined {
+  const match = typeof text === "string" ? text.match(/\s+\(@(\S+) variant\)$/) : undefined
+  return match ? match[1] : undefined
 }
 
 /** Word-boundary truncation: never cuts mid-token, and drops a dangling

@@ -788,7 +788,7 @@ async function testLiveRepairNeverRevertsRunningParts() {
   // Fake client: reads return the CURRENT store clone; PATCHes apply
   // last-write-wins (like the real DB + event bridge). `completeAfterMs`
   // simulates OpenCode's processor completing the part AFTER the tool hook.
-  const makeClient = ({ completeAfterMs }) => {
+  const makeClient = ({ completeAfterMs, errorAfterMs }) => {
     const store = { part: makePart() }
     const patches = []
     const client = {
@@ -822,6 +822,20 @@ async function testLiveRepairNeverRevertsRunningParts() {
           },
         }
       }, completeAfterMs)
+    }
+    if (errorAfterMs !== undefined) {
+      setTimeout(() => {
+        // Mirrors a manually aborted task: the part lands in the terminal
+        // `error` state WITHOUT the after-hook's metadata stamp.
+        store.part = {
+          ...store.part,
+          state: {
+            ...store.part.state,
+            status: "error",
+            error: "aborted by user",
+          },
+        }
+      }, errorAfterMs)
     }
     return client
   }
@@ -873,6 +887,31 @@ async function testLiveRepairNeverRevertsRunningParts() {
       for (const value of original) LIVE_REPAIR_DELAYS.push(value)
       throw error
     }
+  }
+
+  // 3. A manually aborted task lands in the TERMINAL error state without the
+  //    metadata stamp - the repair must admit it (same no-later-writer
+  //    guarantee as completed) so aborted parts get the alias metadata.
+  {
+    const client = makeClient({ errorAfterMs: 60 })
+    const repaired = repairLiveTaskPart({
+      client,
+      directory: "dir",
+      sessionID: "ses_race1",
+      callID: "call_race1",
+      route,
+      routes,
+      debug: false,
+    })
+    const finished = await Promise.race([
+      repaired.then(() => true),
+      new Promise((resolve) => setTimeout(() => resolve(false), 15000)),
+    ])
+    if (!finished) throw new Error("error-state live repair did not settle within the ladder")
+    if (client.__patches.length === 0) throw new Error("live repair should repair an aborted (error) task part")
+    const final = client.__patches.at(-1)
+    if (final.state?.status !== "error") throw new Error(`error-part repair must keep the error status (got ${final.state?.status})`)
+    if (final.state.metadata?.agentVariants?.alias !== "explore-light") throw new Error("error-part repair must stamp agentVariants metadata")
   }
 }
 
@@ -1173,12 +1212,19 @@ async function testDisableBase() {
     mkdirSync(path.join(tmpHome, ".config", "opencode"), { recursive: true })
     const sidecar = emptyConfig()
     sidecar.agents = {
-      explore: { parent: {}, variants: { seek: { name: "explore-seek", model: "opencode/muse-spark-1.3-contributor-free" } } },
+      explore: {
+        parent: {},
+        variants: {
+          seek: { name: "explore-seek", model: "opencode/muse-spark-1.3-contributor-free" },
+          bunny: { name: "explore-bunny", model: "zai-coding-plan/glm-5.3" },
+        },
+      },
       general: {
         parent: {},
         variants: {
           seek: { name: "general-seek", model: "opencode/muse-spark-1.3-contributor-free" },
           light: { name: "general-light", model: "opencode/muse-spark-1.3-contributor-free" },
+          bunny: { name: "general-bunny", model: "zai-coding-plan/glm-5.3" },
         },
       },
     }
@@ -1192,10 +1238,14 @@ async function testDisableBase() {
         ["ses_parent", { id: "ses_parent", model: { providerID: "closedrouter", modelID: "glm-5.3" } }],
         ["ses_seek_child", { id: "ses_seek_child", parentID: "ses_parent" }],
         ["ses_metaless_child", { id: "ses_metaless_child", parentID: "ses_parent" }],
+        ["ses_aborted_child", { id: "ses_aborted_child", parentID: "ses_parent" }],
       ])
       const partsByChild = new Map([
         ["ses_seek_child", { id: "prt_seek", type: "tool", tool: "task", callID: "call_seek", state: { status: "completed", input: { subagent_type: "explore-seek" }, metadata: { sessionId: "ses_seek_child", agentVariants: { alias: "explore-seek" } } } }],
         ["ses_metaless_child", { id: "prt_metaless", type: "tool", tool: "task", state: { status: "completed", input: { subagent_type: "explore" }, metadata: { sessionId: "ses_metaless_child" } } }],
+        // The user's real aborted part: terminal error state, NO agentVariants
+        // metadata, but the before-hook's description annotation persisted.
+        ["ses_aborted_child", { id: "prt_aborted", type: "tool", tool: "task", state: { status: "error", input: { subagent_type: "general", description: "M4 round-11 review (fresh bunny) (@general-bunny variant)" }, metadata: { sessionId: "ses_aborted_child", model: { modelID: "glm-5.3", providerID: "zai-coding-plan" } } } }],
       ])
       const fakeClient = {
         tui: { showToast: async () => true },
@@ -1238,6 +1288,16 @@ async function testDisableBase() {
       // Metadata-less children fail open for both variant and base resumes.
       await hooks["tool.execute.before"](...call("f5", { subagent_type: "general-light", prompt: "x", task_id: "ses_metaless_child" }))
       await hooks["tool.execute.before"](...call("f6", { subagent_type: "general", prompt: "x", task_id: "ses_metaless_child" }))
+      // Aborted variant child: the description annotation is the guard's
+      // source when metadata is absent - cross-key resumes are REJECTED
+      // (previously failed open), same-variant and same-key flips allowed.
+      await expectRejection(
+        "aborted variant child cross-key resume is rejected via the description annotation",
+        /Task ses_aborted_child ran variant "general-bunny" \(variant "bunny"\) - resume it with "general-bunny" or its counterpart "explore-bunny", not "general-light" \(variant "light"\)/,
+        call("f7", { subagent_type: "general-light", prompt: "x", task_id: "ses_aborted_child" }),
+      )
+      await hooks["tool.execute.before"](...call("f8", { subagent_type: "general-bunny", prompt: "x", task_id: "ses_aborted_child" }))
+      await hooks["tool.execute.before"](...call("f9", { subagent_type: "explore-bunny", prompt: "x", task_id: "ses_aborted_child" }))
     } finally {
       process.env.USERPROFILE = realProfile
       process.env.HOME = realHome
@@ -1960,6 +2020,45 @@ async function testCandidateAttribution() {
     if (calls[1]?.query?.before !== "m99") throw new Error("before cursor is the last message id of the previous page")
     if (aliases.get("ses_p1_0") !== "general-seek" || aliases.get("ses_p1_1") !== "explore-light" || aliases.get("ses_p2_3") !== "general-flash") throw new Error("aliases collected across pages")
     if (aliases.size !== 3) throw new Error(`only task parts with aliases contribute (got ${aliases.size})`)
+  }
+  // Description-annotation source: aborted/error parts never receive the
+  // agentVariants metadata stamp, but the before-hook's "(@alias variant)"
+  // description annotation persists at call time - attribution must read it.
+  // Fixture mirrors the user's real aborted bunny part verbatim.
+  {
+    const fakeClient = {
+      session: {
+        messages: async () => ({
+          data: [
+            {
+              info: { id: "m0" },
+              parts: [
+                {
+                  type: "tool",
+                  tool: "task",
+                  state: {
+                    status: "error",
+                    input: { description: "M4 round-11 review (fresh bunny) (@general-bunny variant)", prompt: "x", subagent_type: "general" },
+                    metadata: { parentSessionId: "ses_parent", sessionId: "ses_f098cfccdffeAY8MUiLwdTc5Gv", model: { modelID: "glm-5.3", providerID: "zai-coding-plan" } },
+                  },
+                },
+              ],
+            },
+          ],
+        }),
+      },
+    }
+    const aliases = await __testInternals.collectTaskAliases(fakeClient, "C:/x", "ses_parent")
+    if (aliases.get("ses_f098cfccdffeAY8MUiLwdTc5Gv") !== "general-bunny") throw new Error(`aborted part attributes via its description annotation (got ${[...aliases.entries()].map(([k, v]) => `${k}=${v}`).join(", ")})`)
+  }
+  // parseVariantAnnotation: only a COMPLETE trailing annotation matches -
+  // partial "(@..." fragments (title truncation) never attribute.
+  {
+    const { parseVariantAnnotation } = await import("../dist/config.js")
+    if (parseVariantAnnotation("Run (@general-seek variant)") !== "general-seek") throw new Error("complete annotation parses")
+    if (parseVariantAnnotation("Run (@general-se…") !== undefined) throw new Error("partial annotation never parses")
+    if (parseVariantAnnotation("no annotation") !== undefined) throw new Error("plain descriptions never parse")
+    if (parseVariantAnnotation(undefined) !== undefined) throw new Error("undefined tolerated")
   }
 }
 

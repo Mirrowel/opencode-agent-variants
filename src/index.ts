@@ -22,6 +22,7 @@ import {
   loadSidecar,
   modelCatalogFromProviders,
   overlayProfilePatch,
+  parseVariantAnnotation,
   resolveActiveProfile,
   resolveModel,
   saveSidecar,
@@ -141,6 +142,17 @@ function metadataAlias(metadata: unknown, routes?: Map<string, RuntimeRoute>) {
   if (!value || typeof value !== "object") return
   const alias = (value as Record<string, unknown>).alias
   return validAlias(typeof alias === "string" ? alias : undefined, routes)
+}
+
+/** The variant alias a task part ran as: the after-hook metadata stamp
+ * first, then the before-hook description annotation (which persists at
+ * call time - aborted/error parts never receive the metadata stamp because
+ * the repair only writes terminal parts). Both validated against routes. */
+function partAlias(part: unknown, routes?: Map<string, RuntimeRoute>) {
+  return (
+    metadataAlias((part as { state?: { metadata?: unknown } })?.state?.metadata, routes) ??
+    validAlias(parseVariantAnnotation((part as { state?: { input?: { description?: string } } })?.state?.input?.description), routes)
+  )
 }
 
 function legacyOutputAlias(text: string, routes?: Map<string, RuntimeRoute>) {
@@ -716,8 +728,14 @@ async function collectTaskAliases(client: any, directory: string | undefined, pa
         if (part?.type !== "tool" || part?.tool !== "task") continue
         const metadata = part?.state?.metadata
         const child = typeof metadata?.sessionId === "string" ? metadata.sessionId : undefined
-        const alias = metadata?.agentVariants?.alias
-        if (typeof child === "string" && typeof alias === "string" && alias !== "" && !map.has(child)) map.set(child, alias)
+        if (typeof child !== "string" || child === "") continue
+        if (map.has(child)) continue
+        // Two alias sources: the after-hook metadata stamp (completed parts)
+        // and the before-hook description annotation - the annotation
+        // persists at call time, so ABORTED/error parts (which the repair
+        // never stamps) still attribute.
+        const alias = typeof metadata?.agentVariants?.alias === "string" ? metadata.agentVariants.alias : parseVariantAnnotation(part?.state?.input?.description)
+        if (typeof alias === "string" && alias !== "") map.set(child, alias)
       }
     }
     if (result.length < PAGE_SIZE) break
@@ -1117,8 +1135,8 @@ async function persistCleanedParts(client: any, directory: string, parts: Change
         continue
       }
       const freshStatus = (fresh as { state?: { status?: string } }).state?.status
-      if (freshStatus !== "completed") {
-        debugLog(debugEnabledFlag, `Agent variant ${label} repair skipped`, `${part.id}: stored status=${freshStatus ?? "unknown"}; only completed task parts are repaired`)
+      if (freshStatus !== "completed" && freshStatus !== "error") {
+        debugLog(debugEnabledFlag, `Agent variant ${label} repair skipped`, `${part.id}: stored status=${freshStatus ?? "unknown"}; only terminal (completed/error) task parts are repaired`)
         continue
       }
       const freshCopy = structuredClone(fresh)
@@ -1207,15 +1225,17 @@ async function repairLiveTaskPart(input: { client: any; directory: string; sessi
       debugLog(input.debug, "Agent variant live repair pending", `${input.callID}: stored task part not found after ${wait}ms`)
       continue
     }
-    // NEVER write a snapshot of a non-completed part. OpenCode completes the
+    // NEVER write a snapshot of a non-terminal part. OpenCode completes the
     // part shortly after the after-hook returns; a read-modify-write with a
     // pre-completion snapshot can land after that final write and silently
     // revert the part to running forever (parallel variant task calls lost
-    // their results this way). `completed` is terminal in OpenCode's
-    // processor, so once we see it there is no further writer to race.
+    // their results this way). `completed` and `error` are terminal in
+    // OpenCode's processor, so once we see either there is no further writer
+    // to race - and aborted/error tasks deserve the metadata stamp and alias
+    // restore just as much as completed ones.
     const storedStatus = (stored as { state?: { status?: string } }).state?.status
-    if (storedStatus !== "completed") {
-      debugLog(input.debug, "Agent variant live repair waiting", `${stored.id}: status=${storedStatus ?? "unknown"} after ${wait}ms; waiting for the task part to complete before repairing`)
+    if (storedStatus !== "completed" && storedStatus !== "error") {
+      debugLog(input.debug, "Agent variant live repair waiting", `${stored.id}: status=${storedStatus ?? "unknown"} after ${wait}ms; waiting for the task part to reach a terminal state before repairing`)
       continue
     }
     const cleaned = cleanTaskPartForRoute(stored, input.route, input.routes)
@@ -1596,7 +1616,7 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
             CLIENT_CALL_TIMEOUT,
             PARENT_TAIL_WINDOW_WIDE,
           )
-          const recordedAlias = metadataAlias(part?.state?.metadata, virtualRoutes)
+          const recordedAlias = partAlias(part, virtualRoutes)
           const recordedKey = recordedAlias ? virtualRoutes.get(recordedAlias)?.key : undefined
           if (recordedAlias && recordedKey !== undefined) {
             if (staticRoute) {
