@@ -1180,17 +1180,32 @@ function splitTitleAnnotation(title: string): { title: string; alias?: string } 
  * with "(@", so ordinary parentheticals never match. */
 const ANNOTATION_TOKEN = /\(@\s*([^()@←]*?)\s*(?:\s+variant)?\s*(?:\s*←\s*([^()@←]*?))?\s*\)/g
 
+/** OpenCode's own task-title suffix - task.ts appends " (@<agent> subagent)"
+ * on agent-switch resumes, always AFTER our note. Grammatically it matches
+ * the terse form (aliases allow spaces), so it must be excluded explicitly:
+ * a single-word agent followed by the literal " subagent" is never ours. */
+const NATIVE_TITLE_SUFFIX = /^[^\s]+ subagent$/
+
+/** True when the parsed token is OpenCode's native title suffix, not a
+ * variant annotation. Such tokens are never alias evidence; stripVariantNotes
+ * still removes them for clean display (OpenCode re-appends on every
+ * agent-switch resume, so nothing is lost). */
+function isNativeTitleSuffix(alias: string): boolean {
+  return NATIVE_TITLE_SUFFIX.test(alias)
+}
+
 export type VariantAnnotation = { alias: string; switchedFrom?: string }
 
-/** Extracts the variant annotation from a text - the LAST token wins (with
- * parroted stacks the newest append is ours). Reads every historical form;
- * titles may carry none. */
+/** Extracts the variant annotation from a text - the LAST VALID token wins
+ * (with parroted stacks the newest append is ours). Reads every historical
+ * form; OpenCode's native " (@agent subagent)" title suffix is never
+ * evidence; titles may carry none. */
 export function parseVariantAnnotation(text: string | undefined): VariantAnnotation | undefined {
   if (typeof text !== "string") return undefined
   let last: VariantAnnotation | undefined
   for (const match of text.matchAll(ANNOTATION_TOKEN)) {
     const alias = (match[1] ?? "").trim()
-    if (alias === "") continue
+    if (alias === "" || isNativeTitleSuffix(alias)) continue
     const switchedFrom = (match[2] ?? "").trim()
     last = switchedFrom === "" ? { alias } : { alias, switchedFrom }
   }
@@ -1234,17 +1249,20 @@ function truncateTitleWordBoundary(title: string, maxLength = 40): string {
   return cut.length > 0 ? `${cut}…` : `${title.slice(0, maxLength - 1)}…`
 }
 
-function describeCandidate(candidate: TaskCandidate): string {
+/** Renders one candidate row. The variant column comes from the attribution
+ * ladder (metadata > validated title annotation > truthful model inference);
+ * the local title parse is the final fallback and is validated against the
+ * live route map when provided - an unknown token never displays. */
+function describeCandidate(candidate: TaskCandidate, validAliases?: Set<string>): string {
   const parts: string[] = []
   if (candidate.title) {
     const { title, alias } = splitTitleAnnotation(candidate.title)
     const shown = title.length > 40 ? truncateTitleWordBoundary(title) : title
     if (shown) parts.push(`"${shown}"`)
     // The alias embeds the parent name (explore-seek), so the parent agent
-    // is dropped when the variant is known - never both. The variant comes
-    // from task metadata or (parent, model) inference; the title annotation
-    // is a last source when the caller could not attribute.
-    const variant = candidate.variant ?? alias
+    // is dropped when the variant is known - never both.
+    const validated = alias !== undefined && (validAliases === undefined || validAliases.has(alias)) ? alias : undefined
+    const variant = candidate.variant ?? validated
     if (variant) {
       parts.push(variant)
     } else if (candidate.agent) {
@@ -1274,7 +1292,7 @@ function describeCandidate(candidate: TaskCandidate): string {
 export function buildUnknownTaskIdMessage(
   bogusId: string,
   candidates: TaskCandidate[],
-  options: { typoDistance: number; suggestLimit: number; variantsHint?: boolean },
+  options: { typoDistance: number; suggestLimit: number; variantsHint?: boolean; validAliases?: Set<string> },
 ): string {
   const lines: string[] = [`Unknown task id "${bogusId}" - no such session.`]
   const sorted = [...candidates].sort(
@@ -1306,11 +1324,11 @@ export function buildUnknownTaskIdMessage(
       }
     }
     if (truncated) {
-      lines.push(`id looks truncated - full id: ${truncated.id}${describeCandidate(truncated)} - retry with that exact id.`)
+      lines.push(`id looks truncated - full id: ${truncated.id}${describeCandidate(truncated, options.validAliases)} - retry with that exact id.`)
     } else if (confident) {
-      lines.push(`Closest match: ${confident.candidate.id}${describeCandidate(confident.candidate)} - retry with that exact id.`)
+      lines.push(`Closest match: ${confident.candidate.id}${describeCandidate(confident.candidate, options.validAliases)} - retry with that exact id.`)
     } else if (fuzzy) {
-      lines.push(`Possible match (fuzzy): ${fuzzy.candidate.id}${describeCandidate(fuzzy.candidate)} - verify the title before resuming with it.`)
+      lines.push(`Possible match (fuzzy): ${fuzzy.candidate.id}${describeCandidate(fuzzy.candidate, options.validAliases)} - verify the title before resuming with it.`)
     } else {
       lines.push("No close match found among this session's subagent sessions.")
     }
@@ -1318,7 +1336,7 @@ export function buildUnknownTaskIdMessage(
   if (options.suggestLimit > 0 && sorted.length > 0) {
     lines.push("Recent subagent sessions (newest first):")
     for (const candidate of sorted.slice(0, options.suggestLimit)) {
-      lines.push(`  ${candidate.id}${describeCandidate(candidate)}`)
+      lines.push(`  ${candidate.id}${describeCandidate(candidate, options.validAliases)}`)
     }
   }
   lines.push(`Or start a new task without task_id${options.variantsHint ? " (or use one of its variants)" : ""}.`)

@@ -1239,6 +1239,17 @@ async function testDisableBase() {
         ["ses_seek_child", { id: "ses_seek_child", parentID: "ses_parent" }],
         ["ses_metaless_child", { id: "ses_metaless_child", parentID: "ses_parent" }],
         ["ses_aborted_child", { id: "ses_aborted_child", parentID: "ses_parent" }],
+        // Beyond the walk's depth: no parent part at all, but the child's own
+        // session row carries AV's call-time title annotation (+ OpenCode's
+        // native "(@general subagent)" suffix, which must never win).
+        ["ses_title_child", { id: "ses_title_child", parentID: "ses_parent", title: "Docs review: LLM onboarding (@general-seek) (@general subagent)" }],
+        // Beyond depth, no annotation anywhere: the last leg's actual model is
+        // the only evidence (glm-5.3 is unique within general -> general-bunny).
+        ["ses_model_child", { id: "ses_model_child", parentID: "ses_parent", agent: "general", title: "Untangled work" }],
+      ])
+      // Per-child message probes for the truthful-model inference.
+      const childMessages = new Map([
+        ["ses_model_child", [{ info: { role: "user", model: { providerID: "zai-coding-plan", id: "glm-5.3" } }, parts: [] }]],
       ])
       const partsByChild = new Map([
         ["ses_seek_child", { id: "prt_seek", type: "tool", tool: "task", callID: "call_seek", state: { status: "completed", input: { subagent_type: "explore-seek" }, metadata: { sessionId: "ses_seek_child", agentVariants: { alias: "explore-seek" } } } }],
@@ -1251,7 +1262,12 @@ async function testDisableBase() {
         tui: { showToast: async () => true },
         session: {
           get: async ({ path }) => ({ data: sessions.get(path.id) }),
-          messages: async () => ({ data: [{ parts: [...partsByChild.values()] }] }),
+          // Parent walks see the parent's parts; child probes (model
+          // inference) see the child's own messages.
+          messages: async ({ path }) =>
+            path?.id && childMessages.has(path.id)
+              ? { data: childMessages.get(path.id) }
+              : { data: [{ parts: [...partsByChild.values()] }] },
         },
       }
       const hooks = await __testInternals.createHooks({ client: fakeClient, directory: "C:/x" }, sidecar)
@@ -1341,6 +1357,42 @@ async function testDisableBase() {
         const parrotArgs = { subagent_type: "general-light", prompt: "x", description: "Review again (@general-light) (@general-light variant)" }
         await hooks["tool.execute.before"](...call("f13", parrotArgs))
         assert(parrotArgs.description === "Review again (@general-light)", `parrot stack collapses to one note (got ${parrotArgs.description})`)
+      }
+      // Guard fallback - TITLE annotation: child beyond the walk's depth (no
+      // parent part anywhere), but its session row (fetched anyway for
+      // task-id validation) carries AV's call-time annotation plus the
+      // native suffix. The native token must never win; the annotation
+      // guards the resume exactly like in-window metadata would.
+      await expectRejection(
+        "out-of-window child guards via its title annotation (native suffix excluded)",
+        /Task ses_title_child ran variant "general-seek" \(variant "seek"\) - resume it with "general-seek" or its counterpart "explore-seek", not "general-light" \(variant "light"\)/,
+        call("f14", { subagent_type: "general-light", prompt: "x", task_id: "ses_title_child" }),
+      )
+      await hooks["tool.execute.before"](...call("f14b", { subagent_type: "explore-seek", prompt: "x", task_id: "ses_title_child" }))
+      // Guard fallback - TRUTHFUL MODEL inference: no part, no annotation,
+      // but the child's last leg actually ran glm-5.3 - unique within general
+      // -> general-bunny. The stale session-row model is never consulted.
+      await expectRejection(
+        "out-of-window child guards via its last-leg model (unique map)",
+        /Task ses_model_child ran variant "general-bunny" \(variant "bunny"\) - resume it with "general-bunny" or its counterpart "explore-bunny", not "general-light" \(variant "light"\)/,
+        call("f15", { subagent_type: "general-light", prompt: "x", task_id: "ses_model_child" }),
+      )
+      // Attribution ladder (pure): validated title annotation beats
+      // everything; the stale row model is never inference input; the
+      // truthful per-child model both infers and replaces the display model.
+      {
+        const { attributeCandidates, variantModelNames } = __testInternals
+        const modelIndex = variantModelNames(sidecar)
+        const validAliases = new Set(["explore-seek", "explore-bunny", "general-seek", "general-light", "general-bunny"])
+        const candidates = [
+          { id: "ses_title_child", title: "Docs review: LLM onboarding (@general-seek) (@general subagent)", agent: "general", model: "zai-coding-plan/glm-5.3" },
+          { id: "ses_model_child", title: "Untangled work", agent: "general" },
+          { id: "ses_unknown_child", title: "Odd job (@not-a-variant) (@general subagent)", agent: "general" },
+        ]
+        await attributeCandidates(fakeClient, "C:/x", candidates, new Map(), modelIndex, validAliases)
+        assert(candidates[0].variant === "general-seek", `ladder: validated title annotation wins over the stale row model (got ${candidates[0].variant})`)
+        assert(candidates[1].variant === "general-bunny" && candidates[1].model === "zai-coding-plan/glm-5.3", `ladder: truthful model infers + replaces the display model (got ${candidates[1].variant}/${candidates[1].model})`)
+        assert(candidates[2].variant === undefined, "ladder: unknown annotation tokens never attribute")
       }
     } finally {
       process.env.USERPROFILE = realProfile
@@ -2029,14 +2081,28 @@ async function testCandidateAttribution() {
 
     const candidates = [
       { id: "ses_meta", agent: "general", title: "Meta run", model: "closedrouter/glm-5.3" },
-      { id: "ses_infer", agent: "general", title: "Infer run", model: "closedrouter/muse-spark-1.3-contributor-free" },
+      { id: "ses_infer", agent: "general", title: "Infer run", model: "closedrouter/glm-5.3" },
       { id: "ses_ambig", agent: "general", title: "Ambiguous run", model: "closedrouter/muse-spark" },
       { id: "ses_bare", agent: "general", title: "Bare run" },
       { id: "ses_other", agent: "explore", title: "Other parent", model: "closedrouter/muse-spark-1.3-contributor-free" },
     ]
-    __testInternals.attributeCandidates(candidates, new Map([["ses_meta", "general-seek"]]), modelIndex)
+    // The stale session-row model is NEVER inference input (live incident:
+    // rows carried the creation model after later legs and "confidently"
+    // attributed the wrong variant). Inference reads the child's last-leg
+    // model via a bounded probe - modeled here for ses_infer only.
+    const probeClient = {
+      session: {
+        messages: async ({ path }) =>
+          path?.id === "ses_infer"
+            ? { data: [{ info: { role: "user", model: { providerID: "closedrouter", id: "muse-spark-1.3-contributor-free" } }, parts: [] }] }
+            : { data: [] },
+      },
+    }
+    const validAliases = new Set(["general-seek", "general-light", "general-heavy", "general-bare"])
+    await __testInternals.attributeCandidates(probeClient, "C:/x", candidates, new Map([["ses_meta", "general-seek"]]), modelIndex, validAliases)
     if (candidates[0].variant !== "general-seek") throw new Error("metadata alias wins")
-    if (candidates[1].variant !== "general-seek") throw new Error("unique model inference fills unattributed")
+    if (candidates[1].variant !== "general-seek") throw new Error("unique last-leg model infers its variant")
+    if (candidates[1].model !== "closedrouter/muse-spark-1.3-contributor-free") throw new Error("the truthful probe model replaces the stale row model for display")
     if (candidates[2].variant !== undefined) throw new Error("shared model stays unattributed")
     if (candidates[3].variant !== undefined) throw new Error("model-less candidate stays unattributed")
     if (candidates[4].variant !== undefined) throw new Error("inference only matches within the candidate's parent")
@@ -2109,6 +2175,33 @@ async function testCandidateAttribution() {
     assert(parseVariantAnnotation("Run (@general-se…") === undefined, "partial token never parses")
     assert(parseVariantAnnotation("no annotation") === undefined, "plain text never parses")
     assert(parseVariantAnnotation(undefined) === undefined, "undefined tolerated")
+    // OpenCode's native title suffix " (@agent subagent)" (task.ts appends it
+    // on agent-switch resumes, AFTER our note) is grammatically identical to
+    // the terse form - it must never be alias evidence (live incident:
+    // candidates rendered "- general subagent" and the true (@general-seek)
+    // was discarded).
+    const native = parseVariantAnnotation("Docs review: LLM onboarding (@general-seek) (@general subagent)")
+    assert(native?.alias === "general-seek", `native suffix excluded, our note wins (got ${native?.alias})`)
+    assert(parseVariantAnnotation("Find stray repo artifacts (@general subagent)") === undefined, "native-only title never attributes")
+    const nativeSwitch = parseVariantAnnotation("Resumed (@general-light ← explore-seek) (@general subagent)")
+    assert(nativeSwitch?.alias === "general-light" && nativeSwitch?.switchedFrom === "explore-seek", "switch form survives a trailing native suffix")
+    assert(stripVariantNotes("Docs review (@general-seek) (@general subagent)") === "Docs review", "strip removes the native suffix too (clean display; OpenCode re-appends)")
+    // Rendering: with the live route map provided, an unknown token in a
+    // title never displays as a variant - the row falls back to agent+model.
+    {
+      const { buildUnknownTaskIdMessage } = await import("../dist/config.js")
+      const valid = new Set(["general-seek"])
+      const rows = buildUnknownTaskIdMessage(
+        "bogus",
+        [
+          { id: "ses_a", title: "Docs review (@general-seek) (@general subagent)", agent: "general", updated: Date.now() },
+          { id: "ses_b", title: "Odd job (@not-a-variant) (@general subagent)", agent: "general", model: "zai-coding-plan/glm-5.3", updated: Date.now() },
+        ],
+        { typoDistance: 0, suggestLimit: 5, validAliases: valid },
+      )
+      assert(rows.includes('ses_a ("Docs review" - general-seek'), `validated annotation renders in the row (got ${rows})`)
+      assert(rows.includes("ses_b (\"Odd job\" - general (last model: zai-coding-plan/glm-5.3)"), `unknown tokens fall back to agent+model, never display (got ${rows})`)
+    }
     assert(stripVariantNotes("Run (@a) (@b variant) (@c ← d) end") === "Run end", "strip removes every form incl. stacks")
     assert(stripVariantNotes("Email me(@home) now") === "Email me now", "strip collapses spacing after mid-text tokens")
     assert(formatVariantNote("general-light") === "(@general-light)", "terse note format")

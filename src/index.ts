@@ -295,7 +295,9 @@ export const __testInternals = {
   repairLiveTaskPart,
   persistCleanedParts,
   attributeCandidates,
+  childLastUserModel,
   collectTaskAliases,
+  inferChildVariantFromLastModel,
   variantModelNames,
   LIVE_REPAIR_DELAYS,
   createHooks,
@@ -799,21 +801,90 @@ function variantModelNames(sidecar: SidecarConfig): Map<string, Map<string, stri
   return index
 }
 
-/** Attaches the variant to each candidate: task metadata first (exact
- * alias), then (parent, last model) inference for unattributed children,
- * leaving the model in place for the ambiguous fallback display. */
-function attributeCandidates(candidates: TaskCandidate[], aliases: Map<string, string>, modelIndex: Map<string, Map<string, string>>): void {
+/** The child's newest user-message model - what its last leg ACTUALLY ran.
+ * The session row's `model` field is sticky/stale (proven live: a seek child
+ * showed the creation model after later legs), so inference and display use
+ * this instead. One bounded call, fail-soft. */
+async function childLastUserModel(client: any, directory: string | undefined, childID: string): Promise<string | undefined> {
+  const namespace = client?.session
+  if (typeof directory !== "string" || typeof namespace?.messages !== "function") return undefined
+  const result = getData(
+    await safeClientCall(() => (namespace as any).messages({ path: { id: childID }, query: { directory, limit: 12 } }), CLIENT_CALL_TIMEOUT),
+  )
+  if (!Array.isArray(result)) return undefined
+  for (const message of result as Record<string, any>[]) {
+    // newest first: the first user-role message is the last leg's model
+    const info = message?.info ?? message
+    if (info?.role !== "user") continue
+    const raw = info?.model
+    if (raw && typeof raw.providerID === "string" && typeof raw.id === "string") return `${raw.providerID}/${raw.id}`
+  }
+  return undefined
+}
+
+/** Attaches the variant to each candidate via the attribution ladder:
+ *   1. metadata stamp from the windowed walk (exact, depth-limited)
+ *   2. the child's TITLE annotation - AV's own call-time writing, carried
+ *      forever, immune to walk depth; validated against the live routes
+ *   3. truthful model inference - the child's newest user-message model
+ *      matched against the unique-model map (never the stale session-row
+ *      model, which confidently lies); the fetched model also replaces the
+ *      row model for the fallback display
+ * Tier 2 is bounded to AV-parent candidates and a small probe cap. */
+async function attributeCandidates(
+  client: any,
+  directory: string | undefined,
+  candidates: TaskCandidate[],
+  aliases: Map<string, string>,
+  modelIndex: Map<string, Map<string, string>>,
+  validAliases: Set<string>,
+): Promise<void> {
   for (const candidate of candidates) {
     const metadataAlias = aliases.get(candidate.id)
     if (metadataAlias) {
       candidate.variant = metadataAlias
       continue
     }
-    if (candidate.model && candidate.agent) {
-      const inferred = modelIndex.get(candidate.agent)?.get(candidate.model)
-      if (inferred) candidate.variant = inferred
+    const titleAlias = parseVariantAnnotation(candidate.title)?.alias
+    if (titleAlias !== undefined && validAliases.has(titleAlias)) {
+      candidate.variant = titleAlias
+      continue
     }
   }
+  const MAX_MODEL_PROBES = 10
+  const unattributed = candidates
+    .filter((candidate) => candidate.variant === undefined && candidate.agent !== undefined && modelIndex.has(candidate.agent))
+    .slice(0, MAX_MODEL_PROBES)
+  await Promise.all(
+    unattributed.map(async (candidate) => {
+      const model = await childLastUserModel(client, directory, candidate.id)
+      if (model === undefined) return
+      candidate.model = model
+      const inferred = modelIndex.get(candidate.agent!)?.get(model)
+      if (inferred !== undefined && validAliases.has(inferred)) candidate.variant = inferred
+    }),
+  )
+}
+
+/** Guard variant attribution via the truthful model: when neither the task
+ * part (windowed) nor the child's title annotation reaches the child's
+ * variant, the last leg's actual model names it - but only when it maps to
+ * exactly one enabled variant (shared models never guess). Rejection is an
+ * action, so the inference must be conservative by construction. */
+async function inferChildVariantFromLastModel(
+  client: any,
+  directory: string | undefined,
+  childID: string,
+  info: unknown,
+  routes: Map<string, RuntimeRoute>,
+  modelIndex: Map<string, Map<string, string>>,
+): Promise<string | undefined> {
+  const agent = (info as { agent?: unknown })?.agent
+  if (typeof agent !== "string" || !modelIndex.has(agent)) return undefined
+  const model = await childLastUserModel(client, directory, childID)
+  if (model === undefined) return undefined
+  const inferred = modelIndex.get(agent)?.get(model)
+  return inferred !== undefined ? validAlias(inferred, routes) : undefined
 }
 
 /** Short-TTL cache of a session's current model (primary-model profile matching). */
@@ -1615,12 +1686,14 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
             fetchTaskCandidates(input.client, input.directory, hookInput.sessionID),
             collectTaskAliases(input.client, input.directory, hookInput.sessionID, new Set(virtualRoutes.keys())),
           ])
-          attributeCandidates(candidates, aliases, variantModelNames(sidecar))
+          const validAliasSet = new Set(virtualRoutes.keys())
+          await attributeCandidates(input.client, input.directory, candidates, aliases, variantModelNames(sidecar), validAliasSet)
           throw new Error(
             buildUnknownTaskIdMessage(continuation, candidates, {
               typoDistance: sidecar.taskValidation.typoDistance,
               suggestLimit: sidecar.taskValidation.suggestLimit,
               variantsHint: hiddenBaseParents.has(args.subagent_type),
+              validAliases: validAliasSet,
             }),
           )
         }
@@ -1630,8 +1703,13 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
         // Variant-key resume matching: a continuation may switch the parent
         // agent (explore -> general) only when the variant KEY matches
         // (seek <-> seek). The child's recorded variant comes from the
-        // parent task-part metadata (tail-windowed); without reachable
-        // metadata the check fails OPEN - the historical exemption.
+        // parent task-part metadata (tail-windowed); when the part is out of
+        // walk depth, the attribution ladder degrades gracefully instead of
+        // failing open blindly: the child session row (already fetched for
+        // task-id validation - zero extra calls) carries AV's call-time
+        // title annotation, and as the last resort the child's last-leg
+        // model (one bounded probe) names the variant via the unique-model
+        // map - conservative by construction, shared models never guess.
         const resumeGuardApplies = staticRoute !== undefined || hiddenBaseParents.has(args.subagent_type)
         if (resumeGuardApplies) {
           const part = await findParentTaskPartForChild(
@@ -1642,7 +1720,10 @@ async function createHooks(input: Parameters<Plugin>[0], sidecar: SidecarConfig)
             CLIENT_CALL_TIMEOUT,
             PARENT_TAIL_WINDOW_WIDE,
           )
-          const recordedAlias = partAlias(part, virtualRoutes)
+          const recordedAlias =
+            partAlias(part, virtualRoutes) ??
+            validAlias(parseVariantAnnotation((info as { title?: unknown }).title as string | undefined)?.alias, virtualRoutes) ??
+            (await inferChildVariantFromLastModel(input.client, input.directory, continuation, info, virtualRoutes, variantModelNames(sidecar)))
           const recordedKey = recordedAlias ? virtualRoutes.get(recordedAlias)?.key : undefined
           if (recordedAlias && recordedKey !== undefined) {
             if (staticRoute) {
