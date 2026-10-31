@@ -52,7 +52,7 @@ agent-variants/
 **`scripts/`:**
 - Purpose: Build, release, and verification automation scripts
 - Contains: Node.js ESM scripts (`.mjs`) for release management, git hook installation, package-content verification, and regression testing, plus the Solid fixture `scripts/fixtures/tui-reactivity.tsx` compiled by the reactivity smoke test
-- Key files: `release-lib.mjs`, `set-release-intent.mjs`, `check-release-intent.mjs`, `install-git-hooks.mjs`, `build-tui.mjs`, `solid-tui-build.mjs`, `generate-schema.mjs`, `pack-dry-run.mjs`, `regression-tests.mjs`, `tui-reactivity-smoke.mjs`, `tui-package-smoke.mjs`
+- Key files: `release-lib.mjs`, `install-git-hooks.mjs`, `build-tui.mjs`, `solid-tui-build.mjs`, `generate-schema.mjs`, `pack-dry-run.mjs`, `regression-tests.mjs`, `tui-reactivity-smoke.mjs`, `tui-package-smoke.mjs`
 
 **`.github/`:**
 - Purpose: CI/CD automation
@@ -74,7 +74,7 @@ agent-variants/
 
 ## Naming Conventions
 
-**Files:** `kebab-case` for all filenames: `release-lib.mjs`, `set-release-intent.mjs`, `check-release-intent.mjs`
+**Files:** `kebab-case` for all filenames: `release-lib.mjs`, `install-git-hooks.mjs`
 **Source modules:** Singular nouns for domain modules: `config.ts`, `server.ts`, `index.ts`, `palette-category.ts`, `selfwire.ts`, `tui.tsx`, `wizard.tsx`; v2 modules prefix `v2-` (`v2-server.ts`, `v2-tui.ts`, `v2-types.ts`) and host-surface modules are descriptive (`tui-host.ts`)
 **Directories:** `kebab-case` or `camelCase` per ecosystem convention: `.github/`, `scripts/`, `docs/`
 
