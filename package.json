@@ -1,6 +1,6 @@
 {
   "name": "@mirrowel/opencode-agent-variants",
-  "version": "0.1.0",
+  "version": "0.12.0-dev.16",
   "type": "module",
   "description": "OpenCode plugin for creating and managing model variants of agents",
   "license": "MIT",
@@ -71,7 +71,8 @@
     "registry": "https://registry.npmjs.org/",
     "access": "public"
   },
-  "scripts": {    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+  "scripts": {
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc --outDir dist --declaration && npm run build:tui && node scripts/generate-schema.mjs",
     "build:tui": "bun scripts/build-tui.mjs",
     "ci": "npm run ci:package",
