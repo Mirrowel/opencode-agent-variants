@@ -71,9 +71,7 @@
     "registry": "https://registry.npmjs.org/",
     "access": "public"
   },
-  "scripts": {
-    "prepare": "node .github/scripts/install-hooks.mjs",
-    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+  "scripts": {    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
     "build": "npm run clean && tsc --outDir dist --declaration && npm run build:tui && node scripts/generate-schema.mjs",
     "build:tui": "bun scripts/build-tui.mjs",
     "ci": "npm run ci:package",
